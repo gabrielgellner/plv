@@ -25,27 +25,9 @@ impl Store {
         })
     }
 
-    pub fn scroll_down(&mut self, n: usize) -> Result<()> {
+    pub fn scroll_to_offset(&mut self, offset: usize) -> Result<()> {
         let max = self.total_rows.saturating_sub(self.viewport_rows);
-        self.row_offset = (self.row_offset + n).min(max);
-        self.current_view = Self::fetch(&self.lf, self.row_offset, self.viewport_rows)?;
-        Ok(())
-    }
-
-    pub fn scroll_up(&mut self, n: usize) -> Result<()> {
-        self.row_offset = self.row_offset.saturating_sub(n);
-        self.current_view = Self::fetch(&self.lf, self.row_offset, self.viewport_rows)?;
-        Ok(())
-    }
-
-    pub fn scroll_to_top(&mut self) -> Result<()> {
-        self.row_offset = 0;
-        self.current_view = Self::fetch(&self.lf, self.row_offset, self.viewport_rows)?;
-        Ok(())
-    }
-
-    pub fn scroll_to_bottom(&mut self) -> Result<()> {
-        self.row_offset = self.total_rows.saturating_sub(self.viewport_rows);
+        self.row_offset = offset.min(max);
         self.current_view = Self::fetch(&self.lf, self.row_offset, self.viewport_rows)?;
         Ok(())
     }

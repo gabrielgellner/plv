@@ -14,6 +14,7 @@ pub struct DataTable<'a> {
     pub df: &'a DataFrame,
     pub col_offset: usize,
     pub row_offset: usize,
+    pub cursor_row: usize,
     pub title: &'a str,
 }
 
@@ -63,9 +64,25 @@ impl Widget for DataTable<'_> {
         // Data rows
         let rows: Vec<Row> = (0..self.df.height())
             .map(|ri| {
-                let abs_row = self.row_offset + ri + 1;
+                let abs_row = self.row_offset + ri;
+                let is_cursor = abs_row == self.cursor_row;
+
+                let row_style = if is_cursor {
+                    Style::new().bg(Color::Rgb(60, 90, 150))
+                } else if ri % 2 == 1 {
+                    Style::new().bg(Color::Rgb(30, 30, 30))
+                } else {
+                    Style::default()
+                };
+
+                let num_style = if is_cursor {
+                    row_style.fg(Color::White)
+                } else {
+                    Style::new().fg(Color::DarkGray)
+                };
+
                 let mut cells =
-                    vec![Cell::new(abs_row.to_string()).style(Style::new().fg(Color::DarkGray))];
+                    vec![Cell::new((abs_row + 1).to_string()).style(num_style)];
 
                 for &ci in &vis_cols {
                     let val = match cols[ci].get(ri) {
@@ -80,12 +97,7 @@ impl Widget for DataTable<'_> {
                         }
                         Err(_) => "null".to_string(),
                     };
-                    let style = if ri % 2 == 1 {
-                        Style::new().bg(Color::Rgb(30, 30, 30))
-                    } else {
-                        Style::default()
-                    };
-                    cells.push(Cell::new(val).style(style));
+                    cells.push(Cell::new(val).style(row_style));
                 }
 
                 Row::new(cells)
