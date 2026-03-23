@@ -59,10 +59,10 @@ impl App {
 
         // Handle terminal resize
         let vp = Self::viewport_rows(area.height);
-        if let Some(s) = &mut self.store {
-            if s.viewport_rows != vp {
-                let _ = s.resize(vp);
-            }
+        if let Some(s) = &mut self.store
+            && s.viewport_rows != vp
+        {
+            let _ = s.resize(vp);
         }
 
         let [table_area, status_area] = Layout::vertical([
@@ -114,12 +114,11 @@ impl App {
     }
 
     fn handle_events(&mut self) -> io::Result<()> {
-        if let Event::Key(key) = event::read()? {
-            if key.kind == KeyEventKind::Press {
-                if let Err(e) = self.handle_key_event(key) {
-                    self.error = Some(e.to_string());
-                }
-            }
+        if let Event::Key(key) = event::read()?
+            && key.kind == KeyEventKind::Press
+            && let Err(e) = self.handle_key_event(key)
+        {
+            self.error = Some(e.to_string());
         }
         Ok(())
     }

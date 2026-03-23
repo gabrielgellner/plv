@@ -29,16 +29,15 @@ fn col_display_width(col: &Column) -> u16 {
 impl Widget for DataTable<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let cols = self.df.columns();
-        let ncols = cols.len();
 
-        let all_widths: Vec<u16> = cols.iter().map(|c| col_display_width(c)).collect();
+        let all_widths: Vec<u16> = cols.iter().map(col_display_width).collect();
 
         // Inner width = area - 2 (borders). Row-num col + separator consume ROW_NUM_WIDTH + 1.
         let available = area.width.saturating_sub(2 + ROW_NUM_WIDTH + 1) as usize;
         let mut vis_cols: Vec<usize> = Vec::new();
         let mut used = 0usize;
-        for i in self.col_offset..ncols {
-            let needed = all_widths[i] as usize + 1; // +1 for column separator
+        for (i, &w) in all_widths.iter().enumerate().skip(self.col_offset) {
+            let needed = w as usize + 1; // +1 for column separator
             if !vis_cols.is_empty() && used + needed > available {
                 break;
             }
