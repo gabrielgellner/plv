@@ -30,16 +30,20 @@ pub struct SearchState {
     /// Set to true once we've auto-jumped to the first match after the
     /// initial search results arrive.
     pub initial_jump_done: bool,
+    /// Column the search was scoped to, if any (Column/Cell selection modes).
+    /// `None` means the search covers all columns (Row mode).
+    pub col_idx: Option<usize>,
 }
 
 impl SearchState {
-    pub fn new(query: SearchQuery) -> Self {
+    pub fn new(query: SearchQuery, col_idx: Option<usize>) -> Self {
         Self {
             query,
             matching_rows: Vec::new(),
             current_idx: 0,
             status: SearchStatus::Searching,
             initial_jump_done: false,
+            col_idx,
         }
     }
 

@@ -52,27 +52,39 @@ impl Store {
     ///
     /// The caller drops `tx`'s paired `Receiver` to cancel early — the thread
     /// will notice the send failure and exit cleanly.
-    pub fn search_async(&self, pattern: String, tx: mpsc::Sender<Vec<usize>>) {
+    pub fn search_async(
+        &self,
+        pattern: String,
+        col_name: Option<String>,
+        tx: mpsc::Sender<Vec<usize>>,
+    ) {
         let lf = self.lf.clone();
         let schema = self.schema.clone();
         let total = self.total_rows;
 
         thread::spawn(move || {
-            // Build the OR-combined filter expression inside the thread so no
-            // non-Send Expr crosses a thread boundary.
-            let filter = schema
-                .iter_names()
-                .map(|name| {
-                    col(name.as_str())
-                        .cast(DataType::String)
-                        .str()
-                        .contains(lit(pattern.as_str()), false)
-                })
-                .reduce(|acc: Expr, e: Expr| acc.or(e));
+            // Build the filter expression inside the thread so no non-Send Expr
+            // crosses a thread boundary.
+            let filter = if let Some(ref name) = col_name {
+                col(name.as_str())
+                    .cast(DataType::String)
+                    .str()
+                    .contains(lit(pattern.as_str()), false)
+            } else {
+                let f = schema
+                    .iter_names()
+                    .map(|name| {
+                        col(name.as_str())
+                            .cast(DataType::String)
+                            .str()
+                            .contains(lit(pattern.as_str()), false)
+                    })
+                    .reduce(|acc: Expr, e: Expr| acc.or(e));
+                let Some(f) = f else { return };
+                f
+            };
 
-            let Some(filter) = filter else { return };
-
-            const CHUNK: usize = 100_000;
+            const CHUNK: usize = 10_000;
             let mut offset = 0usize;
 
             while offset < total {

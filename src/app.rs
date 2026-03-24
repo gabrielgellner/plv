@@ -1,4 +1,4 @@
-use std::{io, path::PathBuf, sync::mpsc, time::Duration};
+use std::{cell::Cell, io, path::PathBuf, sync::mpsc, time::Duration};
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{
@@ -10,7 +10,7 @@ use ratatui::{
 
 use crate::data::{loader, Store};
 use crate::search::{SearchQuery, SearchState, SearchStatus};
-use crate::ui::{DataTable, Prompt, StatusBar, Theme};
+use crate::ui::{DataTable, Prompt, SelectionMode, StatusBar, Theme};
 
 enum AppMode {
     Normal,
@@ -28,12 +28,23 @@ pub struct App {
     exit: bool,
     error: Option<String>,
     theme: Theme,
+    selection_mode: SelectionMode,
+    /// Selected column (absolute index). Only actively navigated in Column/Cell modes;
+    /// initialised to col_offset when entering those modes via Tab.
+    cursor_col: usize,
+    /// Last fully-visible column index from the most recent render. Used to
+    /// detect when the column cursor has scrolled off the right edge.
+    last_vis_col: usize,
+    /// Terminal width captured each frame; used to compute column layout.
+    last_frame_width: u16,
     mode: AppMode,
     search_buf: String,
     search_state: Option<SearchState>,
     /// Receives batches of matching row indices from the background search thread.
     /// Dropping this cancels the search.
     search_rx: Option<mpsc::Receiver<Vec<usize>>>,
+    /// Incremented each draw while a search is in progress; drives the status bar spinner.
+    spinner_tick: usize,
 }
 
 impl App {
@@ -49,10 +60,15 @@ impl App {
             exit: false,
             error: None,
             theme: Theme::catppuccin_mocha(),
+            selection_mode: SelectionMode::default(),
+            cursor_col: 0,
+            last_vis_col: 0,
+            last_frame_width: 0,
             mode: AppMode::Normal,
             search_buf: String::new(),
             search_state: None,
             search_rx: None,
+            spinner_tick: 0,
         }
     }
 
@@ -82,12 +98,26 @@ impl App {
 
     fn draw(&mut self, frame: &mut Frame) {
         let area = frame.area();
+        self.last_frame_width = area.width;
 
         let vp = Self::viewport_rows(area.height);
         if let Some(s) = &mut self.store
             && s.viewport_rows != vp
         {
             let _ = s.resize(vp);
+        }
+
+        // In Column/Cell mode keep cursor_col within [col_offset, last_vis_col].
+        // Must be correct in a single pass: handle_events blocks on event::read
+        // when no search is active, so multi-frame convergence never fires.
+        if !matches!(self.selection_mode, SelectionMode::Row) {
+            if self.cursor_col < self.col_offset {
+                self.col_offset = self.cursor_col;
+            } else if self.cursor_col > self.last_vis_col {
+                // cursor is off the right edge — compute the col_offset that
+                // places cursor_col at the rightmost visible position.
+                self.col_offset = self.col_offset_to_show_at_right(self.cursor_col);
+            }
         }
 
         let [table_area, status_area] = Layout::vertical([
@@ -106,15 +136,31 @@ impl App {
         let col_offset = self.col_offset;
         let cursor_row = self.cursor_row;
 
+        let vis_col_cell = Cell::new(self.col_offset);
+
         if let Some(store) = &self.store {
+            // Advance spinner each frame while a background search is running.
+            if self.search_rx.is_some() {
+                self.spinner_tick = self.spinner_tick.wrapping_add(1);
+            }
+
+            let cursor_col = match self.selection_mode {
+                SelectionMode::Row => col_offset,
+                _ => self.cursor_col,
+            };
+
             frame.render_widget(
                 DataTable {
                     df: &store.current_view,
                     col_offset,
+                    cursor_col,
                     row_offset: store.row_offset,
                     cursor_row,
+                    selection_mode: self.selection_mode,
                     theme: &self.theme,
                     search: self.search_state.as_ref(),
+                    search_col: self.search_state.as_ref().and_then(|s| s.col_idx),
+                    last_vis_col_out: &vis_col_cell,
                 },
                 table_area,
             );
@@ -143,6 +189,7 @@ impl App {
                             pending_z: self.pending_z,
                             theme: &self.theme,
                             search_info,
+                            spinner_tick: self.spinner_tick,
                         },
                         status_area,
                     );
@@ -159,6 +206,8 @@ impl App {
                 table_area,
             );
         }
+
+        self.last_vis_col = vis_col_cell.get();
     }
 
     fn handle_events(&mut self) -> io::Result<()> {
@@ -261,11 +310,19 @@ impl App {
                     }
                     Ok(query) => {
                         if let Some(store) = &self.store {
+                            let col_name = match self.selection_mode {
+                                SelectionMode::Column | SelectionMode::Cell => store
+                                    .schema
+                                    .get_at_index(self.cursor_col)
+                                    .map(|(name, _)| name.to_string()),
+                                SelectionMode::Row => None,
+                            };
                             let (tx, rx) = mpsc::channel();
-                            store.search_async(query.raw.clone(), tx);
+                            store.search_async(query.raw.clone(), col_name.clone(), tx);
                             // Replace any in-progress search (dropping old rx cancels it)
                             self.search_rx = Some(rx);
-                            self.search_state = Some(SearchState::new(query));
+                            let col_idx = col_name.map(|_| self.cursor_col);
+                            self.search_state = Some(SearchState::new(query, col_idx));
                         }
                     }
                 }
@@ -297,6 +354,20 @@ impl App {
 
         match key.code {
             KeyCode::Char('q') | KeyCode::Char('Q') => self.exit = true,
+
+            // In column/cell mode '0' jumps to the first column (vim-style).
+            // Must come before the digit-accumulation arm.
+            KeyCode::Char('0')
+                if !ctrl
+                    && matches!(
+                        self.selection_mode,
+                        SelectionMode::Column | SelectionMode::Cell
+                    ) =>
+            {
+                self.pending_num.clear();
+                self.col_offset = 0;
+                self.cursor_col = 0;
+            }
 
             // Accumulate numeric prefix (used by j/k/G)
             KeyCode::Char(c) if c.is_ascii_digit() && !ctrl => {
@@ -344,20 +415,71 @@ impl App {
             // Column navigation
             KeyCode::Char('h') | KeyCode::Left => {
                 self.pending_num.clear();
-                self.col_offset = self.col_offset.saturating_sub(1);
-            }
-            KeyCode::Char('l') | KeyCode::Right => {
-                self.pending_num.clear();
-                if let Some(store) = &self.store {
-                    let max_col = store.schema.len().saturating_sub(1);
-                    if self.col_offset < max_col {
-                        self.col_offset += 1;
+                match self.selection_mode {
+                    SelectionMode::Row => {
+                        self.col_offset = self.col_offset.saturating_sub(1);
+                    }
+                    SelectionMode::Column | SelectionMode::Cell => {
+                        self.cursor_col = self.cursor_col.saturating_sub(1);
+                        if self.cursor_col < self.col_offset {
+                            self.col_offset = self.cursor_col;
+                        }
                     }
                 }
             }
+            KeyCode::Char('l') | KeyCode::Right => {
+                self.pending_num.clear();
+                match self.selection_mode {
+                    SelectionMode::Row => {
+                        if let Some(store) = &self.store {
+                            let max_col = store.schema.len().saturating_sub(1);
+                            if self.col_offset < max_col {
+                                self.col_offset += 1;
+                            }
+                        }
+                    }
+                    SelectionMode::Column | SelectionMode::Cell => {
+                        if let Some(store) = &self.store {
+                            let max_col = store.schema.len().saturating_sub(1);
+                            if self.cursor_col < max_col {
+                                self.cursor_col += 1;
+                                if self.cursor_col > self.last_vis_col {
+                                    self.col_offset += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // Jump to first column (all modes) or last column (Column/Cell via $).
             KeyCode::Char('H') => {
                 self.pending_num.clear();
                 self.col_offset = 0;
+                self.cursor_col = 0;
+            }
+            KeyCode::Char('$')
+                if matches!(
+                    self.selection_mode,
+                    SelectionMode::Column | SelectionMode::Cell
+                ) =>
+            {
+                self.pending_num.clear();
+                if let Some(store) = &self.store {
+                    self.cursor_col = store.schema.len().saturating_sub(1);
+                    // col_offset will be corrected in draw() before the next render.
+                }
+            }
+
+            // Cycle selection mode: Row → Column → Cell → Row
+            KeyCode::Tab => {
+                self.selection_mode = self.selection_mode.cycle();
+                if !matches!(self.selection_mode, SelectionMode::Row) {
+                    // Start column cursor at the leftmost visible column.
+                    self.cursor_col = self.col_offset;
+                }
+                // Clear search — scope has changed
+                self.search_state = None;
+                self.search_rx = None;
             }
 
             // Search
@@ -368,29 +490,23 @@ impl App {
             }
             KeyCode::Char('n') => {
                 self.pending_num.clear();
-                match &mut self.search_state {
-                    None => {}
-                    Some(state) if state.matching_rows.is_empty() => {
-                        self.message = Some("Searching…".to_string());
+                if let Some(state) = &mut self.search_state {
+                    if let Some(ci) = state.col_idx {
+                        self.cursor_col = ci;
                     }
-                    Some(state) => {
-                        if let Some(row) = state.next_from(self.cursor_row) {
-                            self.cursor_to(row)?;
-                        }
+                    if let Some(row) = state.next_from(self.cursor_row) {
+                        self.cursor_to(row)?;
                     }
                 }
             }
             KeyCode::Char('N') => {
                 self.pending_num.clear();
-                match &mut self.search_state {
-                    None => {}
-                    Some(state) if state.matching_rows.is_empty() => {
-                        self.message = Some("Searching…".to_string());
+                if let Some(state) = &mut self.search_state {
+                    if let Some(ci) = state.col_idx {
+                        self.cursor_col = ci;
                     }
-                    Some(state) => {
-                        if let Some(row) = state.prev_from(self.cursor_row) {
-                            self.cursor_to(row)?;
-                        }
+                    if let Some(row) = state.prev_from(self.cursor_row) {
+                        self.cursor_to(row)?;
                     }
                 }
             }
@@ -515,5 +631,71 @@ impl App {
             self.pending_num.clear();
             n.max(1)
         }
+    }
+
+    /// Compute the `col_offset` that places `cursor_col` at the rightmost
+    /// visible position in the current terminal width.
+    ///
+    /// Mirrors the Phase-1 width logic in `DataTable::render` (no redistribution
+    /// needed — only visibility matters here).
+    fn col_offset_to_show_at_right(&self, cursor_col: usize) -> usize {
+        const SP: usize = 4; // COLUMN_SPACING
+        const MAX_COL_FRAC: f32 = 0.3;
+        const MIN_COL_WIDTH: usize = 3;
+
+        let store = match &self.store {
+            Some(s) => s,
+            None => return 0,
+        };
+        let df = &store.current_view;
+        let cols = df.columns();
+        if cols.is_empty() {
+            return 0;
+        }
+        let cursor_col = cursor_col.min(cols.len() - 1);
+
+        let inner_w = (self.last_frame_width as usize).saturating_sub(2);
+        let max_col = ((inner_w as f32 * MAX_COL_FRAC) as usize).max(MIN_COL_WIDTH);
+
+        // row_num_w — same formula as DataTable::row_num_width
+        let horizon = (store.row_offset + df.height() * 3).max(99);
+        let mut p: usize = 10;
+        while p <= horizon {
+            p *= 10;
+        }
+        let row_num_w = (p.to_string().len() - 1) + 2;
+
+        // Natural width for a column (header vs data max).
+        let nat = |ci: usize| -> usize {
+            let c = &cols[ci];
+            let header_w = c.name().len();
+            let data_w = (0..c.len())
+                .map(|i| c.get(i).map(|v| format!("{v}").len()).unwrap_or(0))
+                .max()
+                .unwrap_or(0);
+            header_w.max(data_w).max(MIN_COL_WIDTH)
+        };
+
+        // Budget: space after the row-number column and cursor_col's slot.
+        let cursor_w = nat(cursor_col).min(max_col);
+        let used_by_cursor = SP + cursor_w;
+        let Some(mut budget) = inner_w
+            .saturating_sub(row_num_w)
+            .checked_sub(used_by_cursor)
+        else {
+            return cursor_col; // cursor alone doesn't fit — show it at left edge
+        };
+
+        // Walk left from cursor_col, fitting as many columns as possible.
+        let mut offset = cursor_col;
+        for ci in (0..cursor_col).rev() {
+            let w = nat(ci).min(max_col);
+            if budget < SP + w {
+                break;
+            }
+            budget -= SP + w;
+            offset = ci;
+        }
+        offset
     }
 }

@@ -7,6 +7,8 @@ use ratatui::{
 
 use super::Theme;
 
+const SPINNER: &[&str] = &[".   ", "..  ", "... ", "...."];
+
 pub struct StatusBar<'a> {
     pub file_name: String,
     pub cursor_row: usize,
@@ -20,6 +22,8 @@ pub struct StatusBar<'a> {
     /// Active search: `(pattern, current_1based, total, complete)`.
     /// When `complete` is false the scan is still running and total may grow.
     pub search_info: Option<(String, usize, usize, bool)>,
+    /// Incremented each frame while a search is in progress; drives the spinner.
+    pub spinner_tick: usize,
 }
 
 impl Widget for StatusBar<'_> {
@@ -48,11 +52,19 @@ impl Widget for StatusBar<'_> {
         }
 
         if let Some((pat, cur, total, complete)) = &self.search_info {
-            let suffix = if *complete { "" } else { "+" };
-            if *total == 0 {
-                left.push_str(&format!("  /{pat}  [searching…]"));
+            if *complete {
+                if *total == 0 {
+                    left.push_str(&format!("  /{pat}  [no matches]"));
+                } else {
+                    left.push_str(&format!("  /{pat}  [{cur}/{total}]"));
+                }
             } else {
-                left.push_str(&format!("  /{pat}  [{cur}/{total}{suffix}]"));
+                let spin = SPINNER[(self.spinner_tick / 4) % SPINNER.len()];
+                if *total == 0 {
+                    left.push_str(&format!("  /{pat}  [{spin}]"));
+                } else {
+                    left.push_str(&format!("  /{pat}  [{cur}/{total} {spin}]"));
+                }
             }
         }
 
