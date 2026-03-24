@@ -5,12 +5,15 @@ use anyhow::Result;
 use polars::prelude::*;
 
 pub struct Store {
-    lf: LazyFrame,
+    base_lf: LazyFrame,
     pub schema: SchemaRef,
     pub total_rows: usize,
     pub row_offset: usize,
     pub viewport_rows: usize,
     pub current_view: DataFrame,
+    /// Active sort keys in priority order: `(column_index, ascending)`.
+    /// Empty = natural order. First entry is the primary sort key.
+    pub sort: Vec<(usize, bool)>,
 }
 
 impl Store {
@@ -19,26 +22,82 @@ impl Store {
         let total_rows = Self::count_rows(&lf)?;
         let current_view = Self::fetch(&lf, 0, viewport_rows)?;
         Ok(Self {
-            lf,
+            base_lf: lf,
             schema,
             total_rows,
             row_offset: 0,
             viewport_rows,
             current_view,
+            sort: Vec::new(),
         })
+    }
+
+    /// Effective lazy frame: base with all sort keys applied in priority order.
+    fn effective_lf(&self) -> LazyFrame {
+        if self.sort.is_empty() {
+            return self.base_lf.clone();
+        }
+        let (names, descending): (Vec<String>, Vec<bool>) = self
+            .sort
+            .iter()
+            .filter_map(|&(ci, asc)| {
+                self.schema
+                    .get_at_index(ci)
+                    .map(|(name, _)| (name.to_string(), !asc))
+            })
+            .unzip();
+        if names.is_empty() {
+            return self.base_lf.clone();
+        }
+        self.base_lf.clone().sort(
+            names,
+            SortMultipleOptions::default().with_order_descending_multi(descending),
+        )
+    }
+
+    /// Toggle sort direction on `col_idx`, or add it as a new ascending sort key.
+    /// Updates sort state immediately and spawns a background thread to fetch
+    /// the new first page. The caller should replace `current_view` when the
+    /// DataFrame arrives on the returned receiver.
+    pub fn begin_sort(&mut self, col_idx: usize) -> mpsc::Receiver<DataFrame> {
+        if let Some(entry) = self.sort.iter_mut().find(|(ci, _)| *ci == col_idx) {
+            entry.1 = !entry.1;
+        } else {
+            self.sort.push((col_idx, true));
+        }
+        self.row_offset = 0;
+        let lf = self.effective_lf();
+        let vp = self.viewport_rows;
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            if let Ok(df) = Self::fetch(&lf, 0, vp) {
+                let _ = tx.send(df);
+            }
+        });
+        rx
+    }
+
+    /// Clear all sort keys and return to natural order.
+    pub fn clear_sort(&mut self) -> Result<()> {
+        self.sort.clear();
+        self.row_offset = 0;
+        self.current_view = Self::fetch(&self.base_lf, 0, self.viewport_rows)?;
+        Ok(())
     }
 
     pub fn scroll_to_offset(&mut self, offset: usize) -> Result<()> {
         let max = self.total_rows.saturating_sub(self.viewport_rows);
         self.row_offset = offset.min(max);
-        self.current_view = Self::fetch(&self.lf, self.row_offset, self.viewport_rows)?;
+        let lf = self.effective_lf();
+        self.current_view = Self::fetch(&lf, self.row_offset, self.viewport_rows)?;
         Ok(())
     }
 
     pub fn resize(&mut self, new_height: usize) -> Result<()> {
         if self.viewport_rows != new_height && new_height > 0 {
             self.viewport_rows = new_height;
-            self.current_view = Self::fetch(&self.lf, self.row_offset, self.viewport_rows)?;
+            let lf = self.effective_lf();
+            self.current_view = Self::fetch(&lf, self.row_offset, self.viewport_rows)?;
         }
         Ok(())
     }
@@ -58,7 +117,7 @@ impl Store {
         col_name: Option<String>,
         tx: mpsc::Sender<Vec<usize>>,
     ) {
-        let lf = self.lf.clone();
+        let lf = self.effective_lf();
         let schema = self.schema.clone();
         let total = self.total_rows;
 
@@ -92,8 +151,8 @@ impl Store {
 
                 let Ok(df) = lf
                     .clone()
-                    .with_row_index("__idx__", None)
                     .slice(offset as i64, size as u32)
+                    .with_row_index("__idx__", Some(offset as u32))
                     .filter(filter.clone())
                     .select([col("__idx__")])
                     .collect()

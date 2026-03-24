@@ -33,6 +33,10 @@ pub struct DataTable<'a> {
     /// Written with the last fully-visible column index after each render so
     /// the app layer can scroll when the column cursor reaches the right edge.
     pub last_vis_col_out: &'a std::cell::Cell<usize>,
+    /// Active sort keys in priority order: `(column_index, ascending)`. Empty = unsorted.
+    pub sort: &'a [(usize, bool)],
+    /// `Some(tick)` while a background sort is in progress; drives the header animation.
+    pub sort_tick: Option<usize>,
 }
 
 /// Dynamic row number column width based on the current viewport position.
@@ -187,17 +191,51 @@ impl Widget for DataTable<'_> {
         let mut header_cells = vec![Cell::new(rn_hdr).style(hdr_style)];
 
         for (idx, &ci) in vis_cols.iter().enumerate() {
-            let name = truncate(cols[ci].name().as_str(), final_widths[idx]);
-            let padded = format!("{:>width$}{}", "", name, width = sp);
-            let style =
-                if matches!(self.selection_mode, SelectionMode::Column | SelectionMode::Cell)
-                    && ci == self.cursor_col
-                {
-                    col_hdr_style
-                } else {
-                    hdr_style
-                };
-            header_cells.push(Cell::new(padded).style(style));
+            let is_cursor_col =
+                matches!(self.selection_mode, SelectionMode::Column | SelectionMode::Cell)
+                    && ci == self.cursor_col;
+            let cell_style = if is_cursor_col { col_hdr_style } else { hdr_style };
+            let fg = if is_cursor_col { self.theme.col_cursor_fg } else { self.theme.header };
+
+            let sort_entry = self.sort.iter().enumerate().find(|(_, key)| key.0 == ci);
+
+            let cell = if let (Some(tick), Some((order, key))) = (self.sort_tick, sort_entry) {
+                // Sort in progress: animate [ arrow num ] with cycling bold.
+                let arrow = if key.1 { "▲" } else { "▼" };
+                let num = (order + 1).to_string();
+                // indicator is " [▲N]" — 4 chars for "[▲N]" plus 1 space = 5 + num digits
+                let indicator_len = 1 + 1 + 1 + num.len() + 1;
+                let avail = final_widths[idx].saturating_sub(indicator_len);
+                let name = truncate(cols[ci].name().as_str(), avail);
+
+                let bold_pos = (tick / 3) % 3; // 0="[", 1=arrow, 2="]"
+                let active = Style::new().fg(fg).bold().add_modifier(Modifier::UNDERLINED);
+                let quiet =
+                    Style::new().fg(fg).add_modifier(Modifier::UNDERLINED).remove_modifier(Modifier::BOLD);
+
+                let spans = vec![
+                    Span::styled(format!("{:>width$}{}", "", name, width = sp), cell_style),
+                    Span::styled(" ", quiet),
+                    Span::styled("[", if bold_pos == 0 { active } else { quiet }),
+                    Span::styled(arrow, if bold_pos == 1 { active } else { quiet }),
+                    Span::styled(num, quiet),
+                    Span::styled("]", if bold_pos == 2 { active } else { quiet }),
+                ];
+                Cell::new(Line::from(spans)).style(cell_style)
+            } else {
+                // Static: show completed sort indicator.
+                let sort_indicator = sort_entry
+                    .map(|(order, key)| {
+                        let arrow = if key.1 { "▲" } else { "▼" };
+                        format!(" [{arrow}{}]", order + 1)
+                    })
+                    .unwrap_or_default();
+                let avail = final_widths[idx].saturating_sub(sort_indicator.chars().count());
+                let name = truncate(cols[ci].name().as_str(), avail);
+                let padded = format!("{:>width$}{}{}", "", name, sort_indicator, width = sp);
+                Cell::new(padded).style(cell_style)
+            };
+            header_cells.push(cell);
         }
 
         // Partial column header — only add … if name doesn't fit.

@@ -28,6 +28,7 @@ plv <file.csv|file.parquet>
 | `0` | Jump to first column (column/cell mode) |
 | `$` | Jump to last column (column/cell mode) |
 | `Tab` | Cycle selection mode: row → column → cell |
+| `s` | Sort by cursor column (column/cell mode); toggles asc ↔ desc; add more columns for multi-sort |
 | `zz` / `zt` / `zb` | Center / top / bottom cursor in view |
 | `q` | Quit |
 
@@ -36,8 +37,8 @@ plv <file.csv|file.parquet>
 Press `Tab` to cycle through three selection modes:
 
 - **Row** (default) — entire cursor row is highlighted; search covers all columns
-- **Column** — the current column is highlighted; search covers only that column
-- **Cell** — only the cursor cell is highlighted; search covers only the current column
+- **Column** — the current column is highlighted; search covers only that column; press `s` to sort, `Esc` to clear all sorts
+- **Cell** — only the cursor cell is highlighted; search covers only the current column; press `s` to sort, `Esc` to clear all sorts
 
 ## Search
 
