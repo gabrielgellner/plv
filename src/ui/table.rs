@@ -3,10 +3,13 @@ use ratatui::{
     buffer::Buffer,
     layout::{Constraint, Rect},
     style::{Modifier, Style},
+    text::{Line, Span},
     widgets::{Block, Borders, Cell, Row, Table, Widget},
 };
 
-use super::Theme;
+use crate::search::SearchState;
+
+use super::{SelectionMode, Theme};
 
 const MIN_COL_WIDTH: usize = 3;
 /// Spacing baked into each data column's constraint width so the cursor bg fills gaps.
@@ -17,9 +20,19 @@ const MAX_COL_FRAC: f32 = 0.3;
 pub struct DataTable<'a> {
     pub df: &'a DataFrame,
     pub col_offset: usize,
+    pub cursor_col: usize,
     pub row_offset: usize,
     pub cursor_row: usize,
+    pub selection_mode: SelectionMode,
     pub theme: &'a Theme,
+    pub search: Option<&'a SearchState>,
+    /// Which column to restrict search highlights to. `None` = all columns.
+    /// Decoupled from `cursor_col` so highlights stay on the searched column
+    /// even after the cursor moves away.
+    pub search_col: Option<usize>,
+    /// Written with the last fully-visible column index after each render so
+    /// the app layer can scroll when the column cursor reaches the right edge.
+    pub last_vis_col_out: &'a std::cell::Cell<usize>,
 }
 
 /// Dynamic row number column width based on the current viewport position.
@@ -68,6 +81,27 @@ fn redistribute(mut widths: Vec<usize>, naturals: &[usize], slack: usize) -> Vec
         rem -= grow;
     }
     widths
+}
+
+/// Split `text` into styled spans, highlighting regex match ranges.
+/// The `base_style` is applied to non-matching text; `match_style` to matches.
+fn highlight_cell(text: &str, state: &SearchState, base_style: Style, match_style: Style) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut last = 0;
+    for mat in state.query.regex.find_iter(text) {
+        if mat.start() > last {
+            spans.push(Span::styled(text[last..mat.start()].to_string(), base_style));
+        }
+        spans.push(Span::styled(text[mat.start()..mat.end()].to_string(), match_style));
+        last = mat.end();
+    }
+    if last < text.len() {
+        spans.push(Span::styled(text[last..].to_string(), base_style));
+    }
+    if spans.is_empty() {
+        spans.push(Span::styled(text.to_string(), base_style));
+    }
+    Line::from(spans)
 }
 
 fn truncate(s: &str, max_chars: usize) -> String {
@@ -142,6 +176,11 @@ impl Widget for DataTable<'_> {
             .bold()
             .fg(self.theme.header)
             .add_modifier(Modifier::UNDERLINED);
+        let col_hdr_style = Style::new()
+            .bold()
+            .bg(self.theme.col_cursor_bg)
+            .fg(self.theme.col_cursor_fg)
+            .add_modifier(Modifier::UNDERLINED);
 
         // Row num header: right-align "#" with │ at the far right of the slot.
         let rn_hdr = format!("{:>w$}│", "#", w = row_num_w - 1);
@@ -150,7 +189,15 @@ impl Widget for DataTable<'_> {
         for (idx, &ci) in vis_cols.iter().enumerate() {
             let name = truncate(cols[ci].name().as_str(), final_widths[idx]);
             let padded = format!("{:>width$}{}", "", name, width = sp);
-            header_cells.push(Cell::new(padded).style(hdr_style));
+            let style =
+                if matches!(self.selection_mode, SelectionMode::Column | SelectionMode::Cell)
+                    && ci == self.cursor_col
+                {
+                    col_hdr_style
+                } else {
+                    hdr_style
+                };
+            header_cells.push(Cell::new(padded).style(style));
         }
 
         // Partial column header — only add … if name doesn't fit.
@@ -169,24 +216,59 @@ impl Widget for DataTable<'_> {
         let header = Row::new(header_cells);
 
         // ── Data rows ────────────────────────────────────────────────────
+        let match_style = Style::new().bg(self.theme.match_bg).fg(self.theme.match_fg);
+        let cursor_style = Style::new().bg(self.theme.cursor_bg).fg(self.theme.cursor_fg);
+        let col_cursor_style =
+            Style::new().bg(self.theme.col_cursor_bg).fg(self.theme.col_cursor_fg);
+
+        // Absolute row index of the currently selected search match (if any).
+        let current_match_row = self.search.and_then(|s| s.current_row());
+
         let rows: Vec<Row> = (0..self.df.height())
             .map(|ri| {
                 let abs_row = self.row_offset + ri;
                 let is_cursor = abs_row == self.cursor_row;
+                let is_match_row = current_match_row == Some(abs_row);
 
-                let row_style = if is_cursor {
-                    Style::new()
-                        .bg(self.theme.cursor_bg)
-                        .fg(self.theme.cursor_fg)
-                } else {
-                    Style::default()
+                // Style for the row-number cell.
+                let num_style = match self.selection_mode {
+                    SelectionMode::Row if is_cursor => cursor_style,
+                    SelectionMode::Column if is_match_row => cursor_style,
+                    SelectionMode::Column if is_cursor => cursor_style,
+                    _ => Style::new().fg(self.theme.row_num),
                 };
 
-                let num_style = if is_cursor {
-                    row_style
-                } else {
-                    Style::new().fg(self.theme.row_num)
+                // Per-column style: depends on selection mode.
+                //
+                // Column mode layering (highest priority first):
+                //   1. Current search-match row  → cursor_style (bright row bar)
+                //   2. Cursor position row        → cursor_style (same, so j/k are visible)
+                //   3. Selected column            → col_cursor_style
+                //   4. Everything else            → default
+                let cell_style = |ci: usize| -> Style {
+                    match self.selection_mode {
+                        SelectionMode::Row => {
+                            if is_cursor { cursor_style } else { Style::default() }
+                        }
+                        SelectionMode::Column => {
+                            if is_match_row || is_cursor {
+                                cursor_style
+                            } else if ci == self.cursor_col {
+                                col_cursor_style
+                            } else {
+                                Style::default()
+                            }
+                        }
+                        SelectionMode::Cell => {
+                            if is_cursor && ci == self.cursor_col {
+                                cursor_style
+                            } else {
+                                Style::default()
+                            }
+                        }
+                    }
                 };
+
 
                 // Row number with │ vertical separator at the right edge of slot.
                 let rn_str = format!("{:>w$}│", abs_row + 1, w = row_num_w - 1);
@@ -197,8 +279,22 @@ impl Widget for DataTable<'_> {
                         Ok(v) => truncate(&format!("{v}"), final_widths[idx]),
                         Err(_) => "null".to_string(),
                     };
-                    let padded = format!("{:>width$}{}", "", val, width = sp);
-                    cells.push(Cell::new(padded).style(row_style));
+                    let cs = cell_style(ci);
+                    // Scope highlights to the searched column when set.
+                    let search = match self.search_col {
+                        None => self.search,
+                        Some(sc) => if ci == sc { self.search } else { None },
+                    };
+
+                    let cell = if let Some(s) = search {
+                        let pad = Span::styled(format!("{:>width$}", "", width = sp), cs);
+                        let mut spans = vec![pad];
+                        spans.extend(highlight_cell(&val, s, cs, match_style).spans);
+                        Cell::new(Line::from(spans)).style(cs)
+                    } else {
+                        Cell::new(format!("{:>width$}{}", "", val, width = sp)).style(cs)
+                    };
+                    cells.push(cell);
                 }
 
                 // Partial right-edge column — only truncate+ellipsis when needed.
@@ -214,14 +310,28 @@ impl Widget for DataTable<'_> {
                     } else {
                         val
                     };
-                    cells.push(Cell::new(display).style(row_style));
+                    let cs = cell_style(next_col_idx);
+                    let search = match self.search_col {
+                        None => self.search,
+                        Some(sc) => if next_col_idx == sc { self.search } else { None },
+                    };
+                    let cell = if let Some(s) = search {
+                        Cell::new(highlight_cell(&display, s, cs, match_style)).style(cs)
+                    } else {
+                        Cell::new(display).style(cs)
+                    };
+                    cells.push(cell);
                 } else {
-                    cells.push(Cell::new("").style(row_style));
+                    cells.push(Cell::new("").style(Style::default()));
                 }
 
                 Row::new(cells)
             })
             .collect();
+
+        // Tell the app layer which column is the rightmost fully visible one.
+        self.last_vis_col_out
+            .set(vis_cols.last().copied().unwrap_or(self.col_offset));
 
         // ── Render ───────────────────────────────────────────────────────
         let border_style = Style::new().fg(self.theme.border);

@@ -16,12 +16,39 @@ plv <file.csv|file.parquet>
 
 | Key | Action |
 |-----|--------|
-| `j` / `k` | Scroll down / up |
+| `j` / `↓` | Move cursor down |
+| `k` / `↑` | Move cursor up |
 | `Ctrl+d` / `Ctrl+u` | Half page down / up |
-| `g` / `G` | Jump to top / bottom |
-| `h` / `l` | Scroll columns left / right |
-| `H` | Jump to first column |
+| `g` / `Home` | Jump to first row |
+| `G` / `End` | Jump to last row |
+| `{n}G` | Jump to row n |
+| `h` / `←` | Scroll columns left |
+| `l` / `→` | Scroll columns right |
+| `H` | Jump to first column (all modes) |
+| `0` | Jump to first column (column/cell mode) |
+| `$` | Jump to last column (column/cell mode) |
+| `Tab` | Cycle selection mode: row → column → cell |
+| `zz` / `zt` / `zb` | Center / top / bottom cursor in view |
 | `q` | Quit |
+
+## Selection modes
+
+Press `Tab` to cycle through three selection modes:
+
+- **Row** (default) — entire cursor row is highlighted; search covers all columns
+- **Column** — the current column is highlighted; search covers only that column
+- **Cell** — only the cursor cell is highlighted; search covers only the current column
+
+## Search
+
+| Key | Action |
+|-----|--------|
+| `/` | Open search prompt |
+| `n` | Jump to next match |
+| `N` | Jump to previous match |
+| `Esc` | Clear active search |
+
+Type a regex pattern after `/` and press `Enter`. In Row mode, search covers all columns. In Column or Cell mode, search is scoped to the selected column. Matches are highlighted in the table and the status bar shows progress (`/pattern [2/15]`).
 
 ## Install
 
