@@ -1,4 +1,4 @@
-use std::{io, path::PathBuf};
+use std::{io, path::PathBuf, sync::mpsc, time::Duration};
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{
@@ -9,7 +9,13 @@ use ratatui::{
 };
 
 use crate::data::{loader, Store};
-use crate::ui::{DataTable, StatusBar, Theme};
+use crate::search::{SearchQuery, SearchState, SearchStatus};
+use crate::ui::{DataTable, Prompt, StatusBar, Theme};
+
+enum AppMode {
+    Normal,
+    Search,
+}
 
 pub struct App {
     file_path: Option<PathBuf>,
@@ -22,6 +28,12 @@ pub struct App {
     exit: bool,
     error: Option<String>,
     theme: Theme,
+    mode: AppMode,
+    search_buf: String,
+    search_state: Option<SearchState>,
+    /// Receives batches of matching row indices from the background search thread.
+    /// Dropping this cancels the search.
+    search_rx: Option<mpsc::Receiver<Vec<usize>>>,
 }
 
 impl App {
@@ -37,6 +49,10 @@ impl App {
             exit: false,
             error: None,
             theme: Theme::catppuccin_mocha(),
+            mode: AppMode::Normal,
+            search_buf: String::new(),
+            search_state: None,
+            search_rx: None,
         }
     }
 
@@ -98,23 +114,40 @@ impl App {
                     row_offset: store.row_offset,
                     cursor_row,
                     theme: &self.theme,
+                    search: self.search_state.as_ref(),
                 },
                 table_area,
             );
-            frame.render_widget(
-                StatusBar {
-                    file_name,
-                    cursor_row,
-                    total_rows: store.total_rows,
-                    col_offset,
-                    total_cols: store.schema.len(),
-                    message: self.message.clone(),
-                    pending_num: self.pending_num.clone(),
-                    pending_z: self.pending_z,
-                    theme: &self.theme,
-                },
-                status_area,
-            );
+
+            match self.mode {
+                AppMode::Search => {
+                    frame.render_widget(
+                        Prompt { buffer: &self.search_buf, theme: &self.theme },
+                        status_area,
+                    );
+                }
+                AppMode::Normal => {
+                    let search_info = self.search_state.as_ref().map(|s| {
+                        let (cur, total, complete) = s.match_info();
+                        (s.query.raw.clone(), cur, total, complete)
+                    });
+                    frame.render_widget(
+                        StatusBar {
+                            file_name,
+                            cursor_row,
+                            total_rows: store.total_rows,
+                            col_offset,
+                            total_cols: store.schema.len(),
+                            message: self.message.clone(),
+                            pending_num: self.pending_num.clone(),
+                            pending_z: self.pending_z,
+                            theme: &self.theme,
+                            search_info,
+                        },
+                        status_area,
+                    );
+                }
+            }
         } else if let Some(err) = &self.error {
             frame.render_widget(
                 Paragraph::new(format!("Error: {err}")).style(Style::new().red()),
@@ -129,6 +162,18 @@ impl App {
     }
 
     fn handle_events(&mut self) -> io::Result<()> {
+        // If poll_search changed any state (new matches, auto-jump, completion),
+        // return immediately so the main loop redraws before blocking on input.
+        if self.poll_search() {
+            return Ok(());
+        }
+
+        // While a background search is running use a short timeout so the UI
+        // redraws as result batches arrive. When idle, block on read directly.
+        if self.search_rx.is_some() && !event::poll(Duration::from_millis(50))? {
+            return Ok(());
+        }
+
         if let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
             && let Err(e) = self.handle_key_event(key)
@@ -138,9 +183,105 @@ impl App {
         Ok(())
     }
 
+    /// Drain any pending search result batches from the background thread,
+    /// then auto-jump to the nearest match on the first batch that arrives.
+    /// Returns `true` if any state changed (triggers an immediate redraw).
+    fn poll_search(&mut self) -> bool {
+        let mut changed = false;
+
+        loop {
+            let result = match &self.search_rx {
+                None => break,
+                Some(rx) => rx.try_recv(),
+            };
+            match result {
+                Ok(rows) => {
+                    if let Some(state) = &mut self.search_state {
+                        state.matching_rows.extend(rows);
+                        changed = true;
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.search_rx = None;
+                    if let Some(state) = &mut self.search_state {
+                        state.status = SearchStatus::Complete;
+                    }
+                    changed = true;
+                    break;
+                }
+            }
+        }
+
+        // Auto-jump to nearest match the first time results arrive.
+        let needs_jump = self
+            .search_state
+            .as_ref()
+            .is_some_and(|s| !s.initial_jump_done && !s.matching_rows.is_empty());
+
+        if needs_jump {
+            let cursor = self.cursor_row;
+            let row = self.search_state.as_mut().and_then(|s| {
+                s.initial_jump_done = true;
+                s.next_from(cursor)
+            });
+            if let Some(row) = row {
+                let _ = self.cursor_to(row);
+            }
+        }
+
+        changed
+    }
+
     fn handle_key_event(&mut self, key: KeyEvent) -> anyhow::Result<()> {
         self.message = None;
+        match self.mode {
+            AppMode::Search => self.handle_search_key(key),
+            AppMode::Normal => self.handle_normal_key(key),
+        }
+    }
 
+    fn handle_search_key(&mut self, key: KeyEvent) -> anyhow::Result<()> {
+        match key.code {
+            KeyCode::Esc => {
+                self.mode = AppMode::Normal;
+                self.search_buf.clear();
+            }
+            KeyCode::Enter => {
+                let raw = std::mem::take(&mut self.search_buf);
+                self.mode = AppMode::Normal;
+                if raw.is_empty() {
+                    self.search_state = None;
+                    self.search_rx = None;
+                    return Ok(());
+                }
+                match SearchQuery::new(raw) {
+                    Err(e) => {
+                        self.message = Some(format!("Bad regex: {e}"));
+                    }
+                    Ok(query) => {
+                        if let Some(store) = &self.store {
+                            let (tx, rx) = mpsc::channel();
+                            store.search_async(query.raw.clone(), tx);
+                            // Replace any in-progress search (dropping old rx cancels it)
+                            self.search_rx = Some(rx);
+                            self.search_state = Some(SearchState::new(query));
+                        }
+                    }
+                }
+            }
+            KeyCode::Backspace => {
+                self.search_buf.pop();
+            }
+            KeyCode::Char(c) => {
+                self.search_buf.push(c);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn handle_normal_key(&mut self, key: KeyEvent) -> anyhow::Result<()> {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
         // Resolve pending z-prefix
@@ -185,7 +326,8 @@ impl App {
             }
             KeyCode::Char('G') | KeyCode::End => {
                 if self.pending_num.is_empty() {
-                    let last = self.store.as_ref().map_or(0, |s| s.total_rows.saturating_sub(1));
+                    let last =
+                        self.store.as_ref().map_or(0, |s| s.total_rows.saturating_sub(1));
                     self.cursor_to(last)?;
                 } else {
                     let s = std::mem::take(&mut self.pending_num);
@@ -216,6 +358,46 @@ impl App {
             KeyCode::Char('H') => {
                 self.pending_num.clear();
                 self.col_offset = 0;
+            }
+
+            // Search
+            KeyCode::Char('/') => {
+                self.pending_num.clear();
+                self.search_buf.clear();
+                self.mode = AppMode::Search;
+            }
+            KeyCode::Char('n') => {
+                self.pending_num.clear();
+                match &mut self.search_state {
+                    None => {}
+                    Some(state) if state.matching_rows.is_empty() => {
+                        self.message = Some("Searching…".to_string());
+                    }
+                    Some(state) => {
+                        if let Some(row) = state.next_from(self.cursor_row) {
+                            self.cursor_to(row)?;
+                        }
+                    }
+                }
+            }
+            KeyCode::Char('N') => {
+                self.pending_num.clear();
+                match &mut self.search_state {
+                    None => {}
+                    Some(state) if state.matching_rows.is_empty() => {
+                        self.message = Some("Searching…".to_string());
+                    }
+                    Some(state) => {
+                        if let Some(row) = state.prev_from(self.cursor_row) {
+                            self.cursor_to(row)?;
+                        }
+                    }
+                }
+            }
+            KeyCode::Esc => {
+                self.search_state = None;
+                self.search_rx = None; // dropping rx cancels background scan
+                self.pending_num.clear();
             }
 
             _ => {

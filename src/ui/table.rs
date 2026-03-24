@@ -3,8 +3,11 @@ use ratatui::{
     buffer::Buffer,
     layout::{Constraint, Rect},
     style::{Modifier, Style},
+    text::{Line, Span},
     widgets::{Block, Borders, Cell, Row, Table, Widget},
 };
+
+use crate::search::SearchState;
 
 use super::Theme;
 
@@ -20,6 +23,7 @@ pub struct DataTable<'a> {
     pub row_offset: usize,
     pub cursor_row: usize,
     pub theme: &'a Theme,
+    pub search: Option<&'a SearchState>,
 }
 
 /// Dynamic row number column width based on the current viewport position.
@@ -68,6 +72,27 @@ fn redistribute(mut widths: Vec<usize>, naturals: &[usize], slack: usize) -> Vec
         rem -= grow;
     }
     widths
+}
+
+/// Split `text` into styled spans, highlighting regex match ranges.
+/// The `base_style` is applied to non-matching text; `match_style` to matches.
+fn highlight_cell(text: &str, state: &SearchState, base_style: Style, match_style: Style) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut last = 0;
+    for mat in state.query.regex.find_iter(text) {
+        if mat.start() > last {
+            spans.push(Span::styled(text[last..mat.start()].to_string(), base_style));
+        }
+        spans.push(Span::styled(text[mat.start()..mat.end()].to_string(), match_style));
+        last = mat.end();
+    }
+    if last < text.len() {
+        spans.push(Span::styled(text[last..].to_string(), base_style));
+    }
+    if spans.is_empty() {
+        spans.push(Span::styled(text.to_string(), base_style));
+    }
+    Line::from(spans)
 }
 
 fn truncate(s: &str, max_chars: usize) -> String {
@@ -169,6 +194,8 @@ impl Widget for DataTable<'_> {
         let header = Row::new(header_cells);
 
         // ── Data rows ────────────────────────────────────────────────────
+        let match_style = Style::new().bg(self.theme.match_bg).fg(self.theme.match_fg);
+
         let rows: Vec<Row> = (0..self.df.height())
             .map(|ri| {
                 let abs_row = self.row_offset + ri;
@@ -197,8 +224,20 @@ impl Widget for DataTable<'_> {
                         Ok(v) => truncate(&format!("{v}"), final_widths[idx]),
                         Err(_) => "null".to_string(),
                     };
-                    let padded = format!("{:>width$}{}", "", val, width = sp);
-                    cells.push(Cell::new(padded).style(row_style));
+
+                    let cell = if let Some(s) = self.search {
+                        // Pad prefix as a plain span, then highlight the value.
+                        let pad = Span::styled(
+                            format!("{:>width$}", "", width = sp),
+                            row_style,
+                        );
+                        let mut spans = vec![pad];
+                        spans.extend(highlight_cell(&val, s, row_style, match_style).spans);
+                        Cell::new(Line::from(spans)).style(row_style)
+                    } else {
+                        Cell::new(format!("{:>width$}{}", "", val, width = sp)).style(row_style)
+                    };
+                    cells.push(cell);
                 }
 
                 // Partial right-edge column — only truncate+ellipsis when needed.
@@ -214,7 +253,13 @@ impl Widget for DataTable<'_> {
                     } else {
                         val
                     };
-                    cells.push(Cell::new(display).style(row_style));
+                    let cell = if let Some(s) = self.search {
+                        Cell::new(highlight_cell(&display, s, row_style, match_style))
+                            .style(row_style)
+                    } else {
+                        Cell::new(display).style(row_style)
+                    };
+                    cells.push(cell);
                 } else {
                     cells.push(Cell::new("").style(row_style));
                 }

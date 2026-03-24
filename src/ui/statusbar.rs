@@ -17,6 +17,9 @@ pub struct StatusBar<'a> {
     pub pending_num: String,
     pub pending_z: bool,
     pub theme: &'a Theme,
+    /// Active search: `(pattern, current_1based, total, complete)`.
+    /// When `complete` is false the scan is still running and total may grow.
+    pub search_info: Option<(String, usize, usize, bool)>,
 }
 
 impl Widget for StatusBar<'_> {
@@ -42,6 +45,15 @@ impl Widget for StatusBar<'_> {
             left.push_str("  z-");
         } else if !self.pending_num.is_empty() {
             left.push_str(&format!("  [{}]", self.pending_num));
+        }
+
+        if let Some((pat, cur, total, complete)) = &self.search_info {
+            let suffix = if *complete { "" } else { "+" };
+            if *total == 0 {
+                left.push_str(&format!("  /{pat}  [searching…]"));
+            } else {
+                left.push_str(&format!("  /{pat}  [{cur}/{total}{suffix}]"));
+            }
         }
 
         let help = " q  j/k:↕  g/G:top/bot  ^d/^u:page  h/l:←→  zz/zt/zb ";

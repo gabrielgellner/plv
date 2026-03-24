@@ -10,6 +10,8 @@ pub struct Theme {
     pub status_fg: Color,
     pub message_bg: Color,
     pub message_fg: Color,
+    pub match_bg: Color,
+    pub match_fg: Color,
 }
 
 impl Theme {
@@ -24,6 +26,8 @@ impl Theme {
             status_fg: Color::Rgb(205, 214, 244),  // Text
             message_bg: Color::Rgb(250, 179, 135), // Peach
             message_fg: Color::Rgb(30, 30, 46),    // Base
+            match_bg: Color::Rgb(249, 226, 175),   // Yellow
+            match_fg: Color::Rgb(30, 30, 46),      // Base
         }
     }
 }

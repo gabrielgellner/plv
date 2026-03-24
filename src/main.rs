@@ -1,5 +1,6 @@
 mod app;
 mod data;
+mod search;
 mod ui;
 
 use clap::Parser;
