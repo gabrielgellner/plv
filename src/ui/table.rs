@@ -2,14 +2,15 @@ use polars::prelude::*;
 use ratatui::{
     buffer::Buffer,
     layout::{Constraint, Rect},
-    style::{Color, Style},
+    style::{Modifier, Style},
     widgets::{Block, Borders, Cell, Row, Table, Widget},
 };
 
+use super::Theme;
+
 const MIN_COL_WIDTH: usize = 3;
-/// Columns are separated by this many spaces (matches csvlens' NUM_SPACES_BETWEEN_COLUMNS).
-const COLUMN_SPACING: u16 = 4;
-const ROW_NUM_WIDTH: u16 = 6;
+/// Spacing baked into each data column's constraint width so the cursor bg fills gaps.
+const COLUMN_SPACING: usize = 4;
 /// A column may consume at most this fraction of the available terminal width.
 const MAX_COL_FRAC: f32 = 0.3;
 
@@ -18,7 +19,21 @@ pub struct DataTable<'a> {
     pub col_offset: usize,
     pub row_offset: usize,
     pub cursor_row: usize,
-    pub title: &'a str,
+    pub theme: &'a Theme,
+}
+
+/// Dynamic row number column width based on the current viewport position.
+///
+/// Rounds the lookahead horizon up to the next power of 10 so the column only
+/// widens at order-of-magnitude boundaries (1→10→100→…), not every digit.
+fn row_num_width(row_offset: usize, viewport_rows: usize) -> usize {
+    let horizon = (row_offset + viewport_rows * 3).max(99);
+    let mut p: usize = 10;
+    while p <= horizon {
+        p *= 10;
+    }
+    // p.to_string().len() - 1 = digits needed to represent (p - 1)
+    (p.to_string().len() - 1) + 2 // +2: one left-padding space + the │ char
 }
 
 fn natural_col_width(col: &Column) -> usize {
@@ -35,11 +50,7 @@ fn natural_col_width(col: &Column) -> usize {
 /// After capping every column at `max_w`, any slack (unused terminal space) is
 /// given back to the capped columns, narrowest first, so they can grow back
 /// toward their natural width.
-fn redistribute(
-    mut widths: Vec<usize>,
-    naturals: &[usize],
-    slack: usize,
-) -> Vec<usize> {
+fn redistribute(mut widths: Vec<usize>, naturals: &[usize], slack: usize) -> Vec<usize> {
     if slack == 0 {
         return widths;
     }
@@ -72,16 +83,17 @@ impl Widget for DataTable<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let cols = self.df.columns();
 
-        // Inner area after block borders (ALL = 1px each side).
+        // Inner area after block borders (1px each side).
         let inner_w = area.width.saturating_sub(2) as usize;
-        let row_num_w = ROW_NUM_WIDTH as usize;
-        let sp = COLUMN_SPACING as usize;
+        let sp = COLUMN_SPACING;
         let max_col = ((inner_w as f32 * MAX_COL_FRAC) as usize).max(MIN_COL_WIDTH);
 
+        let row_num_w = row_num_width(self.row_offset, self.df.height());
         let naturals: Vec<usize> = cols.iter().map(natural_col_width).collect();
 
         // ── Phase 1: greedily pick visible columns ────────────────────────
-        // Accounting: consumed = row_num_w + Σ(sp + col_w) for each included col.
+        // Row num slot = row_num_w (includes the │ char at end).
+        // Each data column slot = sp + col_w.
         let mut vis_cols: Vec<usize> = Vec::new();
         let mut consumed = row_num_w;
 
@@ -104,19 +116,55 @@ impl Widget for DataTable<'_> {
         let vis_naturals: Vec<usize> = vis_cols.iter().map(|&i| naturals[i]).collect();
         let final_widths = redistribute(capped, &vis_naturals, slack);
 
+        // Actual pixels used by full columns (excluding the filler slot).
+        let used: usize =
+            row_num_w + final_widths.iter().map(|w| sp + w).sum::<usize>();
+
+        // Remaining space for a partial right-edge column.
+        let remaining = inner_w.saturating_sub(used);
+        let next_col_idx = vis_cols.last().map(|&i| i + 1).unwrap_or(self.col_offset);
+        let has_partial = remaining >= MIN_COL_WIDTH && next_col_idx < cols.len();
+        let partial_width = if has_partial { remaining } else { 0 };
+
         // ── Build ratatui constraints ─────────────────────────────────────
-        let mut widths: Vec<Constraint> = Vec::with_capacity(vis_cols.len() + 1);
-        widths.push(Constraint::Length(ROW_NUM_WIDTH));
+        // Spacing baked into constraints → cursor bg fills the full row.
+        // Layout: [row_num_w] [sp+col0] [sp+col1] ... [Min(0) filler]
+        let mut widths: Vec<Constraint> = Vec::with_capacity(vis_cols.len() + 2);
+        widths.push(Constraint::Length(row_num_w as u16));
         for &w in &final_widths {
-            widths.push(Constraint::Length(w as u16));
+            widths.push(Constraint::Length((sp + w) as u16));
         }
+        widths.push(Constraint::Min(0));
 
         // ── Header ───────────────────────────────────────────────────────
-        let hdr_style = Style::new().bold().fg(Color::Rgb(131, 148, 150));
-        let mut header_cells = vec![Cell::new("#").style(hdr_style)];
+        // UNDERLINED creates the horizontal separator line below the header.
+        let hdr_style = Style::new()
+            .bold()
+            .fg(self.theme.header)
+            .add_modifier(Modifier::UNDERLINED);
+
+        // Row num header: right-align "#" with │ at the far right of the slot.
+        let rn_hdr = format!("{:>w$}│", "#", w = row_num_w - 1);
+        let mut header_cells = vec![Cell::new(rn_hdr).style(hdr_style)];
+
         for (idx, &ci) in vis_cols.iter().enumerate() {
             let name = truncate(cols[ci].name().as_str(), final_widths[idx]);
-            header_cells.push(Cell::new(name).style(hdr_style));
+            let padded = format!("{:>width$}{}", "", name, width = sp);
+            header_cells.push(Cell::new(padded).style(hdr_style));
+        }
+
+        // Partial column header — only add … if name doesn't fit.
+        if has_partial && next_col_idx < cols.len() {
+            let name = cols[next_col_idx].name().as_str();
+            let display = if name.chars().count() >= partial_width {
+                let clipped: String = name.chars().take(partial_width.saturating_sub(1)).collect();
+                format!("{clipped}…")
+            } else {
+                name.to_string()
+            };
+            header_cells.push(Cell::new(display).style(hdr_style));
+        } else {
+            header_cells.push(Cell::new("").style(hdr_style));
         }
         let header = Row::new(header_cells);
 
@@ -128,8 +176,8 @@ impl Widget for DataTable<'_> {
 
                 let row_style = if is_cursor {
                     Style::new()
-                        .bg(Color::Rgb(62, 61, 50))
-                        .fg(Color::Rgb(192, 192, 192))
+                        .bg(self.theme.cursor_bg)
+                        .fg(self.theme.cursor_fg)
                 } else {
                     Style::default()
                 };
@@ -137,18 +185,38 @@ impl Widget for DataTable<'_> {
                 let num_style = if is_cursor {
                     row_style
                 } else {
-                    Style::new().fg(Color::Rgb(131, 148, 150))
+                    Style::new().fg(self.theme.row_num)
                 };
 
-                let mut cells =
-                    vec![Cell::new((abs_row + 1).to_string()).style(num_style)];
+                // Row number with │ vertical separator at the right edge of slot.
+                let rn_str = format!("{:>w$}│", abs_row + 1, w = row_num_w - 1);
+                let mut cells = vec![Cell::new(rn_str).style(num_style)];
 
                 for (idx, &ci) in vis_cols.iter().enumerate() {
                     let val = match cols[ci].get(ri) {
                         Ok(v) => truncate(&format!("{v}"), final_widths[idx]),
                         Err(_) => "null".to_string(),
                     };
-                    cells.push(Cell::new(val).style(row_style));
+                    let padded = format!("{:>width$}{}", "", val, width = sp);
+                    cells.push(Cell::new(padded).style(row_style));
+                }
+
+                // Partial right-edge column — only truncate+ellipsis when needed.
+                if has_partial && next_col_idx < cols.len() {
+                    let val = match cols[next_col_idx].get(ri) {
+                        Ok(v) => format!("{v}"),
+                        Err(_) => "null".to_string(),
+                    };
+                    let display = if val.chars().count() >= partial_width {
+                        let clipped: String =
+                            val.chars().take(partial_width.saturating_sub(1)).collect();
+                        format!("{clipped}…")
+                    } else {
+                        val
+                    };
+                    cells.push(Cell::new(display).style(row_style));
+                } else {
+                    cells.push(Cell::new("").style(row_style));
                 }
 
                 Row::new(cells)
@@ -156,18 +224,15 @@ impl Widget for DataTable<'_> {
             .collect();
 
         // ── Render ───────────────────────────────────────────────────────
-        let border_style = Style::new().fg(Color::Rgb(80, 80, 95));
-        let title_style = Style::new().fg(Color::Rgb(131, 148, 150));
+        let border_style = Style::new().fg(self.theme.border);
         let block = Block::new()
             .borders(Borders::ALL)
-            .border_style(border_style)
-            .title(format!(" {} ", self.title))
-            .title_style(title_style);
+            .border_style(border_style);
 
         Table::new(rows, widths)
             .header(header)
             .block(block)
-            .column_spacing(COLUMN_SPACING)
+            .column_spacing(0)
             .render(area, buf);
     }
 }

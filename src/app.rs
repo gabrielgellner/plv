@@ -9,7 +9,7 @@ use ratatui::{
 };
 
 use crate::data::{loader, Store};
-use crate::ui::{DataTable, StatusBar};
+use crate::ui::{DataTable, StatusBar, Theme};
 
 pub struct App {
     file_path: Option<PathBuf>,
@@ -21,6 +21,7 @@ pub struct App {
     message: Option<String>,
     exit: bool,
     error: Option<String>,
+    theme: Theme,
 }
 
 impl App {
@@ -35,6 +36,7 @@ impl App {
             message: None,
             exit: false,
             error: None,
+            theme: Theme::catppuccin_mocha(),
         }
     }
 
@@ -95,7 +97,7 @@ impl App {
                     col_offset,
                     row_offset: store.row_offset,
                     cursor_row,
-                    title: &file_name,
+                    theme: &self.theme,
                 },
                 table_area,
             );
@@ -109,6 +111,7 @@ impl App {
                     message: self.message.clone(),
                     pending_num: self.pending_num.clone(),
                     pending_z: self.pending_z,
+                    theme: &self.theme,
                 },
                 status_area,
             );
