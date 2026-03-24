@@ -22,13 +22,13 @@ footer = """
 {% set repo = "https://gitlab.com/gabrielgellner/plv" %}\
 {% for release in releases %}\
     {% if release.version %}\
-        {% if release.previous %}\
+        {% if release.previous.version %}\
             [{{ release.version | trim_start_matches(pat="v") }}]: {{ repo }}/-/compare/{{ release.previous.version }}...{{ release.version }}\n
         {% else %}\
             [{{ release.version | trim_start_matches(pat="v") }}]: {{ repo }}/-/tags/{{ release.version }}\n
         {% endif %}\
     {% else %}\
-        {% if release.previous %}\
+        {% if release.previous.version %}\
             [unreleased]: {{ repo }}/-/compare/{{ release.previous.version }}...HEAD\n
         {% endif %}\
     {% endif %}\
