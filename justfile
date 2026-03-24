@@ -40,11 +40,8 @@ bump version="":
     VER="${NEXT#v}"
     echo "Bumping to $NEXT"
 
-    # Update version in Cargo.toml
-    sed -i '' "s/^version = \".*\"/version = \"$VER\"/" Cargo.toml
-
-    # Refresh Cargo.lock
-    cargo generate-lockfile
+    # Update version in Cargo.toml and refresh Cargo.lock
+    cargo set-version "$VER"
 
     # Write full changelog (--tag sets the version for unreleased commits)
     git-cliff --tag "$NEXT" -o CHANGELOG.md

@@ -3,6 +3,7 @@
 ## Prerequisites
 
 - [Rust](https://rustup.rs/) (stable toolchain)
+- [cargo-edit](https://github.com/killercup/cargo-edit) — adds `cargo set-version` (`cargo install cargo-edit`)
 - [just](https://github.com/casey/just) — task runner (`cargo install just` or `brew install just`)
 - [git-cliff](https://git-cliff.org/) — changelog generator (`cargo install git-cliff` or `brew install git-cliff`)
 - [glab](https://gitlab.com/gitlab-org/cli) — GitLab CLI, needed only for publishing releases (`brew install glab`)
