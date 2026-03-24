@@ -1,0 +1,60 @@
+[changelog]
+header = """
+# Changelog\n
+All notable changes to this project will be documented in this file.\n
+"""
+body = """
+{% set repo = "https://gitlab.com/gabrielgellner/plv" %}\
+{% if version %}\
+    ## [{{ version | trim_start_matches(pat="v") }}] - {{ timestamp | date(format="%Y-%m-%d") }}
+{% else %}\
+    ## [Unreleased]
+{% endif %}\
+{% for group, commits in commits | group_by(attribute="group") %}
+    ### {{ group | striptags | trim | upper_first }}
+    {% for commit in commits %}
+        - {% if commit.breaking %}[**breaking**] {% endif %}\
+          {{ commit.message | upper_first }} ([`{{ commit.id | truncate(length=7, end="") }}`]({{ repo }}/-/commit/{{ commit.id }}))\
+    {% endfor %}
+{% endfor %}\n
+"""
+footer = """
+{% set repo = "https://gitlab.com/gabrielgellner/plv" %}\
+{% for release in releases %}\
+    {% if release.version %}\
+        {% if release.previous %}\
+            [{{ release.version | trim_start_matches(pat="v") }}]: {{ repo }}/-/compare/{{ release.previous.version }}...{{ release.version }}\n
+        {% else %}\
+            [{{ release.version | trim_start_matches(pat="v") }}]: {{ repo }}/-/tags/{{ release.version }}\n
+        {% endif %}\
+    {% else %}\
+        {% if release.previous %}\
+            [unreleased]: {{ repo }}/-/compare/{{ release.previous.version }}...HEAD\n
+        {% endif %}\
+    {% endif %}\
+{% endfor %}
+"""
+trim = true
+
+[git]
+conventional_commits = true
+filter_unconventional = true
+split_commits = false
+commit_parsers = [
+    { message = "^feat", group = "Features" },
+    { message = "^fix", group = "Bug Fixes" },
+    { message = "^perf", group = "Performance" },
+    { message = "^refactor", group = "Refactoring" },
+    { message = "^style", group = "Styling" },
+    { message = "^docs", group = "Documentation" },
+    { message = "^chore\\(release\\)", skip = true },
+    { message = "^chore", group = "Miscellaneous" },
+    { body = ".*security", group = "Security" },
+]
+protect_breaking_commits = false
+filter_commits = true
+tag_pattern = "v[0-9].*"
+skip_tags = ""
+ignore_tags = ""
+topo_order = false
+sort_commits = "oldest"
