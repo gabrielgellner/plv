@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.0] - 2026-03-24
+
+### Features
+
+- Vim-style regex search with async background scanning ([`644d7e2`](https://gitlab.com/gabrielgellner/plv/-/commit/644d7e2c8d7816ec8a689389aedfd3d195f9d311))
+- Column/cell selection modes with scoped search ([`034ff2a`](https://gitlab.com/gabrielgellner/plv/-/commit/034ff2affeccbec869fad8165de247474174ef7f))
+- Merge feat/search — search, selection modes, spinner ([`90c6c0c`](https://gitlab.com/gabrielgellner/plv/-/commit/90c6c0c21b159275fed0b56a2c489d16db95d879))
+
+### Miscellaneous
+
+- Replace sed with cargo set-version for version bumping ([`8c1c235`](https://gitlab.com/gabrielgellner/plv/-/commit/8c1c235f8dbc897e142b9bf3b5d7bd16fa5937f7))
+
 ## [0.1.0] - 2026-03-24
 
 ### Documentation
@@ -25,6 +37,8 @@ All notable changes to this project will be documented in this file.
 ### Styling
 
 - Fix clippy warnings ([`5cb0dba`](https://gitlab.com/gabrielgellner/plv/-/commit/5cb0dba5f5d4bc0be4d3d3b09fd1e7cd00ff7722))
+
+[0.2.0]: https://gitlab.com/gabrielgellner/plv/-/compare/v0.1.0...v0.2.0
 
 [0.1.0]: https://gitlab.com/gabrielgellner/plv/-/tags/v0.1.0
 
