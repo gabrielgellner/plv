@@ -43,7 +43,9 @@ pub struct App {
     /// Receives batches of matching row indices from the background search thread.
     /// Dropping this cancels the search.
     search_rx: Option<mpsc::Receiver<Vec<usize>>>,
-    /// Incremented each draw while a search is in progress; drives the status bar spinner.
+    /// Receives the sorted first-page DataFrame from the background sort thread.
+    sort_rx: Option<mpsc::Receiver<polars::prelude::DataFrame>>,
+    /// Incremented each draw while a background task is running; drives animations.
     spinner_tick: usize,
 }
 
@@ -68,6 +70,7 @@ impl App {
             search_buf: String::new(),
             search_state: None,
             search_rx: None,
+            sort_rx: None,
             spinner_tick: 0,
         }
     }
@@ -139,8 +142,8 @@ impl App {
         let vis_col_cell = Cell::new(self.col_offset);
 
         if let Some(store) = &self.store {
-            // Advance spinner each frame while a background search is running.
-            if self.search_rx.is_some() {
+            // Advance spinner each frame while any background task is running.
+            if self.search_rx.is_some() || self.sort_rx.is_some() {
                 self.spinner_tick = self.spinner_tick.wrapping_add(1);
             }
 
@@ -161,6 +164,8 @@ impl App {
                     search: self.search_state.as_ref(),
                     search_col: self.search_state.as_ref().and_then(|s| s.col_idx),
                     last_vis_col_out: &vis_col_cell,
+                    sort: &store.sort,
+                    sort_tick: self.sort_rx.as_ref().map(|_| self.spinner_tick),
                 },
                 table_area,
             );
@@ -190,6 +195,7 @@ impl App {
                             theme: &self.theme,
                             search_info,
                             spinner_tick: self.spinner_tick,
+                            sort_tick: self.sort_rx.as_ref().map(|_| self.spinner_tick),
                         },
                         status_area,
                     );
@@ -211,15 +217,17 @@ impl App {
     }
 
     fn handle_events(&mut self) -> io::Result<()> {
-        // If poll_search changed any state (new matches, auto-jump, completion),
-        // return immediately so the main loop redraws before blocking on input.
-        if self.poll_search() {
+        // If poll_sort or poll_search changed any state, return immediately so
+        // the main loop redraws before blocking on input.
+        if self.poll_sort() || self.poll_search() {
             return Ok(());
         }
 
-        // While a background search is running use a short timeout so the UI
+        // While any background task is running use a short timeout so the UI
         // redraws as result batches arrive. When idle, block on read directly.
-        if self.search_rx.is_some() && !event::poll(Duration::from_millis(50))? {
+        if (self.search_rx.is_some() || self.sort_rx.is_some())
+            && !event::poll(Duration::from_millis(50))?
+        {
             return Ok(());
         }
 
@@ -280,6 +288,29 @@ impl App {
         }
 
         changed
+    }
+
+    /// Check for completion of the background sort thread.
+    /// Returns `true` if state changed (triggers an immediate redraw).
+    fn poll_sort(&mut self) -> bool {
+        let result = match &self.sort_rx {
+            None => return false,
+            Some(rx) => rx.try_recv(),
+        };
+        match result {
+            Ok(df) => {
+                self.sort_rx = None;
+                if let Some(store) = &mut self.store {
+                    store.current_view = df;
+                }
+                true
+            }
+            Err(mpsc::TryRecvError::Empty) => false,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.sort_rx = None;
+                true
+            }
+        }
     }
 
     fn handle_key_event(&mut self, key: KeyEvent) -> anyhow::Result<()> {
@@ -470,6 +501,24 @@ impl App {
                 }
             }
 
+            // Sort by cursor column (Column/Cell mode only). Toggles asc ↔ desc;
+            // pressing s on a new column adds it as the next priority sort key.
+            KeyCode::Char('s')
+                if matches!(
+                    self.selection_mode,
+                    SelectionMode::Column | SelectionMode::Cell
+                ) =>
+            {
+                if let Some(store) = &mut self.store {
+                    self.sort_rx = Some(store.begin_sort(self.cursor_col));
+                    self.cursor_row = 0;
+                    // Sort changes the frame order, so any active search positions
+                    // are now stale. Clear the search.
+                    self.search_state = None;
+                    self.search_rx = None;
+                }
+            }
+
             // Cycle selection mode: Row → Column → Cell → Row
             KeyCode::Tab => {
                 self.selection_mode = self.selection_mode.cycle();
@@ -514,6 +563,12 @@ impl App {
                 self.search_state = None;
                 self.search_rx = None; // dropping rx cancels background scan
                 self.pending_num.clear();
+                if let Some(store) = &mut self.store
+                    && !store.sort.is_empty()
+                {
+                    let _ = store.clear_sort();
+                    self.cursor_row = 0;
+                }
             }
 
             _ => {

@@ -1,13 +1,15 @@
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
-    style::Style,
+    style::{Modifier, Style},
+    text::{Line, Span},
     widgets::{Paragraph, Widget},
 };
 
 use super::Theme;
 
 const SPINNER: &[&str] = &[".   ", "..  ", "... ", "...."];
+const SORT_WORD: &str = "Sorting";
 
 pub struct StatusBar<'a> {
     pub file_name: String,
@@ -24,10 +26,14 @@ pub struct StatusBar<'a> {
     pub search_info: Option<(String, usize, usize, bool)>,
     /// Incremented each frame while a search is in progress; drives the spinner.
     pub spinner_tick: usize,
+    /// `Some(tick)` while a background sort is running; drives the sort animation.
+    pub sort_tick: Option<usize>,
 }
 
 impl Widget for StatusBar<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
+        let base = Style::new().bg(self.theme.status_bg).fg(self.theme.status_fg);
+
         if let Some(msg) = self.message {
             let text = format!(" {msg}");
             Paragraph::new(text)
@@ -51,30 +57,60 @@ impl Widget for StatusBar<'_> {
             left.push_str(&format!("  [{}]", self.pending_num));
         }
 
-        if let Some((pat, cur, total, complete)) = &self.search_info {
+        let search_text = if let Some((pat, cur, total, complete)) = &self.search_info {
             if *complete {
                 if *total == 0 {
-                    left.push_str(&format!("  /{pat}  [no matches]"));
+                    format!("  /{pat}  [no matches]")
                 } else {
-                    left.push_str(&format!("  /{pat}  [{cur}/{total}]"));
+                    format!("  /{pat}  [{cur}/{total}]")
                 }
             } else {
                 let spin = SPINNER[(self.spinner_tick / 4) % SPINNER.len()];
                 if *total == 0 {
-                    left.push_str(&format!("  /{pat}  [{spin}]"));
+                    format!("  /{pat}  [{spin}]")
                 } else {
-                    left.push_str(&format!("  /{pat}  [{cur}/{total} {spin}]"));
+                    format!("  /{pat}  [{cur}/{total} {spin}]")
                 }
             }
-        }
+        } else {
+            String::new()
+        };
 
         let help = " q  j/k:↕  g/G:top/bot  ^d/^u:page  h/l:←→  zz/zt/zb ";
         let width = area.width as usize;
-        let pad = width.saturating_sub(left.len() + help.len());
-        let text = format!("{}{}{}", left, " ".repeat(pad), help);
 
-        Paragraph::new(text)
-            .style(Style::new().bg(self.theme.status_bg).fg(self.theme.status_fg))
-            .render(area, buf);
+        if let Some(tick) = self.sort_tick {
+            // "  Sorting" with one cycling bold character.
+            let sort_prefix = "  ";
+            let bold_idx = (tick / 3) % SORT_WORD.len();
+
+            let left_len = left.len()
+                + sort_prefix.len()
+                + SORT_WORD.len()
+                + search_text.len();
+            let pad = width.saturating_sub(left_len + help.len());
+
+            let mut spans: Vec<Span<'static>> = vec![
+                Span::styled(left, base),
+                Span::styled(sort_prefix, base),
+            ];
+            for (i, ch) in SORT_WORD.chars().enumerate() {
+                let style = if i == bold_idx {
+                    base.add_modifier(Modifier::BOLD)
+                } else {
+                    base
+                };
+                spans.push(Span::styled(ch.to_string(), style));
+            }
+            spans.push(Span::styled(search_text, base));
+            spans.push(Span::styled(" ".repeat(pad), base));
+            spans.push(Span::styled(help, base));
+
+            Paragraph::new(Line::from(spans)).render(area, buf);
+        } else {
+            let pad = width.saturating_sub(left.len() + search_text.len() + help.len());
+            let text = format!("{left}{search_text}{}{help}", " ".repeat(pad));
+            Paragraph::new(text).style(base).render(area, buf);
+        }
     }
 }
