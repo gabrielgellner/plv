@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.1] - 2026-08-27
+
+### Bug Fixes
+
+- Add --version flag ([`458e329`](https://gitlab.com/gabrielgellner/plv/-/commit/458e329f53c86bc9c9de3123cd2a540b2b5d6093))
+
 ## [0.4.0] - 2026-08-27
 
 ### Documentation
@@ -61,6 +67,8 @@ All notable changes to this project will be documented in this file.
 ### Styling
 
 - Fix clippy warnings ([`5cb0dba`](https://gitlab.com/gabrielgellner/plv/-/commit/5cb0dba5f5d4bc0be4d3d3b09fd1e7cd00ff7722))
+
+[0.4.1]: https://gitlab.com/gabrielgellner/plv/-/compare/v0.4.0...v0.4.1
 
 [0.4.0]: https://gitlab.com/gabrielgellner/plv/-/compare/v0.3.0...v0.4.0
 
