@@ -71,24 +71,22 @@ a **catalog browser** instead of a single table.
 ```
 
 `Enter` opens a table in the normal viewer. `l` or `f` descends into that table's
-**data files**, so you can scope the view to a single partition instead of
-scanning the whole table — which matters when one partition is most of the data:
+**partitions**, so you can scope the view to one partition instead of scanning
+the whole table — which matters when one partition is most of the data:
 
 ```
-│GEO_LEVEL=DisseminationArea            842,209,475   800.2 MB   73.8%  │
-│GEO_LEVEL=Country                      14,545        73.0 KB    0.0%   │
+│GEO_LEVEL=DisseminationArea            842,209,475   73.8%  │
+│GEO_LEVEL=CensusTract                  90,840,592    8.0%   │
+│GEO_LEVEL=Country                      14,545        0.0%   │
 ```
-
-Partition columns are reconstructed from the catalog, so `GEO_LEVEL` appears as a
-real column even though it only exists in the file path.
 
 ### Keys
 
 | Key | Action |
 |-----|--------|
 | `Enter` | Open the selected table, file, or snapshot |
-| `l` / `f` | Show the selected table's data files |
-| `a` | Open the whole table (from the file list) |
+| `l` / `f` | Show the selected table's partitions |
+| `a` | Open the whole table (from the partition list) |
 | `T` | Show snapshots |
 | `h` / `Esc` | Back |
 | `b` | Back to the catalog (from the viewer) |
@@ -104,15 +102,25 @@ can step through snapshots watching the same table change.
 A file-level scope widens to the whole table when you travel, because file ids
 are not stable across snapshots.
 
-### Notes and limitations
+### How lake data is read
 
-- The catalog is opened **read-only**. If another process holds it open for
+Lake tables are read through DuckDB's `ducklake` extension — DuckLake's own
+reference reader. That means what you see is the **logical** table: rows that
+DuckLake has inlined into the catalog database are included, delete files are
+applied, and schema evolution is handled by the format's implementation rather
+than by plv. CSV and Parquet files still go through Polars.
+
+Notes:
+
+- The lake is attached **read-only**. If another process holds it open for
   writing, plv says so rather than waiting.
-- DuckDB is used only to read catalog metadata; Polars does all the scanning.
-- DuckLake can keep recent rows **inlined** in the catalog database rather than
-  in Parquet. plv reports the count in the browser and warns when you open such
-  a table, but does not yet merge those rows into the view — so a table with
-  inlined rows shows slightly fewer rows than a DuckDB query would.
+- The first lake you open needs network access, once: DuckDB fetches the
+  `ducklake` extension and caches it under `~/.duckdb/extensions/`.
+- If a bundle has been copied since it was built, the data path recorded inside
+  it no longer exists; plv falls back to the data directory sitting beside the
+  catalog file.
+- Columns are shown with their DuckDB types where they map cleanly to numbers or
+  booleans; dates, timestamps and other types are displayed as text.
 
 ## Install
 

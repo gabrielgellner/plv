@@ -29,8 +29,8 @@ src/
   lake.rs         DuckLake browse state: table list ↔ file pane ↔ open scope
   data/
     loader.rs     detect format by extension, return LazyFrame
-    store.rs      scroll state + lazy data fetching
-    catalog.rs    DuckLake catalog reader (DuckDB metadata → Polars scans)
+    store.rs      scroll state + data fetching (Polars or lake-backed)
+    lake_db.rs    DuckLake access via DuckDB's ducklake extension
   ui/
     table.rs      DataTable widget: renders DataFrame as a table
     browser.rs    Browser widget + cursor/scroll state for catalog lists
@@ -70,57 +70,52 @@ Key API differences from older polars:
 Pointing plv at a `.ducklake` file — or a directory containing one — opens the
 **catalog browser** instead of the table viewer.
 
-**Screens.** `App` has two: `Screen::Browser` (the catalog) and `Screen::Viewer`
-(the existing `DataTable`). `lake.rs` holds the browse state: `Level::Tables`
-lists the lake's tables, `Level::Files { table }` lists that table's Parquet
-files, and `Scope` records what the viewer is currently scanning.
+**Lake data is read through DuckDB's `ducklake` extension**, not by plv. The
+extension is DuckLake's reference reader and presents the *logical* table:
+inlined rows merged, delete files applied, schema evolution and column mapping
+handled. Reading the Parquet files directly would mean re-implementing all of
+that against a 28-table spec — plv did that once, and it leaked (inlined rows
+went missing, delete files were ignored). CSV and Parquet still go through
+Polars; `Store` carries a `Source` enum with one arm for each.
 
-Browser keys: `j/k` move, `g/G` top/bottom, `l`/`f` descend into the file pane,
-`T` list snapshots, `h`/`Esc` back, `Enter` open the selection, `a` open the
-whole table from within the file pane. In the viewer, `f` returns to the file
-pane, `b` to the browser, and `T` to the snapshot picker.
+**Screens.** `App` has two: `Screen::Browser` (the lake) and `Screen::Viewer`
+(the existing `DataTable`). `lake.rs` holds the browse state: `Level::Tables`
+lists the lake's tables, `Level::Partitions { table }` lists that table's
+partition values, `Level::Snapshots` lists snapshots, and `Scope` records what
+the viewer is scanning.
+
+Browser keys: `j/k` move, `g/G` top/bottom, `l`/`f` descend into the partition
+list, `T` list snapshots, `h`/`Esc` back, `Enter` open the selection, `a` open
+the whole table from within the partition list. In the viewer, `f` returns to
+the partitions, `b` to the browser, `T` to the snapshot picker.
 
 `?` opens a key-binding overlay whose contents follow the current screen
 (`App::help_sections`); any key dismisses it. The status bar only has room for a
 few hints, so it degrades to `?:help` and then to nothing rather than truncating
 the position readout — the overlay is the authoritative in-app reference.
 
-**Time travel.** `Enter` on a snapshot re-runs `Catalog::open_at` for that id and
-replaces the whole `Lake`. If the table the viewer was showing still exists at
-the target snapshot it is reopened by *name*, so the same data can be compared
-across snapshots; a file-level scope widens to the whole table, because file ids
-are not stable across snapshots.
+**Time travel** is an ATTACH option (`SNAPSHOT_VERSION`), so selecting a
+snapshot re-opens the lake rather than rewriting every query. If the table the
+viewer was showing still exists at the target snapshot it is reopened by *name*,
+so the same data can be compared across snapshots.
 
-**`data/catalog.rs`.** DuckDB is used *only* to read catalog metadata; Polars
-remains the query engine. `Catalog::open` reads snapshots, schemas, tables,
-columns, partition keys and data files, then `scan_files` builds a `LazyFrame`.
+### `data/lake_db.rs`
 
-Things the reader has to get right, all of which the census bundle exercises:
-
-- **Read-only.** The connection uses `AccessMode::ReadOnly`. A read-write handle
-  takes an exclusive lock, which would both risk mutating a lake and lock out
-  other readers. A lock held by a writer is reported as a plain "locked by
-  another process" message.
-- **Snapshot filtering.** Every catalog row carries `begin_snapshot`/
-  `end_snapshot`; `visible(alias)` builds the predicate that pins a query to one
-  snapshot. Qualify it with the table alias — the columns are ambiguous in joins.
-- **Path resolution.** `ducklake_metadata.data_path` is an absolute path written
-  by the machine that built the lake, so it is wrong once a bundle moves.
-  `resolve_data_root` prefers it only if it still exists, then falls back to the
-  same-named directory beside the catalog file.
-- **Partition columns.** Hive partition values live in the directory path, not
-  in the Parquet file. Rather than rely on path inference, each file is scanned
-  separately and its partition values are attached as literal columns taken from
-  the catalog, then projected into catalog column order.
-- **Inlined rows.** DuckDB can hold recent rows in the catalog database instead
-  of Parquet (`ducklake_inlined_data_*`). A Parquet-only scan silently misses
-  them, so `TableInfo::inlined_rows` is surfaced in the browser and as a warning
-  when the table is opened. They are *not* currently merged into the view.
-- **Snapshot-scoped stats.** `TableInfo::record_count`/`file_size` are summed
-  from the files visible at the resolved snapshot, *not* read from
-  `ducklake_table_stats` — that table is a running total for the current state
-  and would report today's row count while time travelling to a snapshot taken
-  before the data landed.
-- **Row counts.** Use `Store::with_row_count` with the catalog's per-file
-  `record_count`. Counting by scanning cost ~7s on the 1.1B-row census table for
-  a number the catalog already stores exactly.
+- **Read-only.** Attached with `READ_ONLY`. A lock held by a writer is reported
+  as a plain "locked by another process" message.
+- **Relocation.** DuckLake rejects a `DATA_PATH` that disagrees with the one
+  recorded in the lake, so plv attaches plainly first, checks the recorded path
+  via `ducklake_options()`, and only re-attaches with `DATA_PATH` +
+  `OVERRIDE_DATA_PATH` when that path is gone.
+- **Partition columns** are read off the Hive-style data file paths from
+  `ducklake_list_files()`. The logical reader deliberately exposes no partition
+  metadata; the paths only tell us *which* columns to group by, and the values
+  shown come from a real `GROUP BY`.
+- **Row counts** come from `count(*)`, which the extension answers from catalog
+  statistics — 0.01s on the 1.1B-row census table.
+- **Partition lists** cost a `GROUP BY` (~0.5s on that table), so they load on
+  demand rather than up front.
+- **Background work** clones the connection with `try_clone()`, which shares the
+  attached lake instead of paying the ~20ms ATTACH again.
+- **Type mapping.** Page results are converted to Polars columns; integers,
+  floats and booleans keep their type, everything else renders as text.

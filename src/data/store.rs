@@ -2,10 +2,29 @@ use std::sync::mpsc;
 use std::thread::{self, yield_now};
 
 use anyhow::Result;
+use duckdb::Connection;
 use polars::prelude::*;
 
+use crate::data::lake_db::{self, LakeSource};
+
+/// Where a store's rows come from.
+///
+/// CSV and Parquet are read lazily by Polars. Lake tables go through DuckDB's
+/// `ducklake` extension instead, so that inlined rows, delete files and schema
+/// evolution are handled by the format's own reader rather than by us.
+enum Source {
+    Lazy(LazyFrame),
+    Lake(LakeQuery),
+}
+
+struct LakeQuery {
+    conn: Connection,
+    source: LakeSource,
+    columns: Vec<String>,
+}
+
 pub struct Store {
-    base_lf: LazyFrame,
+    source: Source,
     pub schema: SchemaRef,
     pub total_rows: usize,
     pub row_offset: usize,
@@ -17,17 +36,13 @@ pub struct Store {
 }
 
 impl Store {
-    /// Open a store, counting rows by scanning. Prefer
+    /// Open a store over a Polars frame, counting rows by scanning. Prefer
     /// [`Store::with_row_count`] when the row count is already known.
     pub fn new(lf: LazyFrame, viewport_rows: usize) -> Result<Self> {
         Self::build(lf, viewport_rows, None)
     }
 
-    /// Open a store with a row count supplied by the caller.
-    ///
-    /// A DuckLake catalog records an exact `record_count` per data file, so
-    /// counting again would mean a full scan of every file — seconds of
-    /// startup lag on a billion-row table, for a number we already have.
+    /// Open a store over a Polars frame with a caller-supplied row count.
     pub fn with_row_count(lf: LazyFrame, viewport_rows: usize, total_rows: usize) -> Result<Self> {
         Self::build(lf, viewport_rows, Some(total_rows))
     }
@@ -38,9 +53,9 @@ impl Store {
             Some(n) => n,
             None => Self::count_rows(&lf)?,
         };
-        let current_view = Self::fetch(&lf, 0, viewport_rows)?;
+        let current_view = Self::fetch_lazy(&lf, 0, viewport_rows)?;
         Ok(Self {
-            base_lf: lf,
+            source: Source::Lazy(lf),
             schema,
             total_rows,
             row_offset: 0,
@@ -50,27 +65,81 @@ impl Store {
         })
     }
 
-    /// Effective lazy frame: base with all sort keys applied in priority order.
-    fn effective_lf(&self) -> LazyFrame {
-        if self.sort.is_empty() {
-            return self.base_lf.clone();
-        }
-        let (names, descending): (Vec<String>, Vec<bool>) = self
-            .sort
+    /// Open a store over one table or partition of a lake.
+    ///
+    /// `total_rows` comes from `count(*)`, which the extension answers from
+    /// catalog statistics — a metadata lookup even on a billion-row table.
+    pub fn new_lake(
+        conn: Connection,
+        source: LakeSource,
+        viewport_rows: usize,
+        total_rows: usize,
+    ) -> Result<Self> {
+        let columns = lake_db::column_names(&conn, &source)?;
+        let query = LakeQuery {
+            conn,
+            source,
+            columns,
+        };
+        let current_view = lake_db::page_with(&query.conn, &query.source, &[], 0, viewport_rows)?;
+
+        // Take the schema from the first page: it is the only place column
+        // types are observable, and the viewer only needs names and arity.
+        let schema = current_view.schema().clone();
+        Ok(Self {
+            source: Source::Lake(query),
+            schema,
+            total_rows,
+            row_offset: 0,
+            viewport_rows,
+            current_view,
+            sort: Vec::new(),
+        })
+    }
+
+    /// Sort keys as `(column_name, ascending)`, dropping any stale indices.
+    fn sort_keys(&self) -> Vec<(String, bool)> {
+        self.sort
             .iter()
             .filter_map(|&(ci, asc)| {
                 self.schema
                     .get_at_index(ci)
-                    .map(|(name, _)| (name.to_string(), !asc))
+                    .map(|(name, _)| (name.to_string(), asc))
             })
-            .unzip();
-        if names.is_empty() {
-            return self.base_lf.clone();
+            .collect()
+    }
+
+    /// Effective lazy frame: base with all sort keys applied in priority order.
+    fn effective_lf(&self) -> Option<LazyFrame> {
+        let Source::Lazy(base) = &self.source else {
+            return None;
+        };
+        let keys = self.sort_keys();
+        if keys.is_empty() {
+            return Some(base.clone());
         }
-        self.base_lf.clone().sort(
+        let (names, descending): (Vec<String>, Vec<bool>) =
+            keys.into_iter().map(|(name, asc)| (name, !asc)).unzip();
+        Some(base.clone().sort(
             names,
             SortMultipleOptions::default().with_order_descending_multi(descending),
-        )
+        ))
+    }
+
+    fn fetch(&self, offset: usize, height: usize) -> Result<DataFrame> {
+        match &self.source {
+            Source::Lazy(_) => {
+                let lf = self.effective_lf().expect("lazy source");
+                Self::fetch_lazy(&lf, offset, height)
+            }
+            Source::Lake(query) => lake_db::page_with(
+                &query.conn,
+                &query.source,
+                &self.sort_keys(),
+                offset,
+                height,
+            ),
+        }
     }
 
     /// Toggle sort direction on `col_idx`, or add it as a new ascending sort key.
@@ -84,14 +153,31 @@ impl Store {
             self.sort.push((col_idx, true));
         }
         self.row_offset = 0;
-        let lf = self.effective_lf();
         let vp = self.viewport_rows;
         let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            if let Ok(df) = Self::fetch(&lf, 0, vp) {
-                let _ = tx.send(df);
+
+        match &self.source {
+            Source::Lazy(_) => {
+                let lf = self.effective_lf().expect("lazy source");
+                thread::spawn(move || {
+                    if let Ok(df) = Self::fetch_lazy(&lf, 0, vp) {
+                        let _ = tx.send(df);
+                    }
+                });
             }
-        });
+            Source::Lake(query) => {
+                // A cloned handle shares the attached lake, so the background
+                // thread does not pay the ATTACH cost again.
+                let Ok(conn) = query.conn.try_clone() else { return rx };
+                let source = query.source.clone();
+                let keys = self.sort_keys();
+                thread::spawn(move || {
+                    if let Ok(df) = lake_db::page_with(&conn, &source, &keys, 0, vp) {
+                        let _ = tx.send(df);
+                    }
+                });
+            }
+        }
         rx
     }
 
@@ -99,28 +185,26 @@ impl Store {
     pub fn clear_sort(&mut self) -> Result<()> {
         self.sort.clear();
         self.row_offset = 0;
-        self.current_view = Self::fetch(&self.base_lf, 0, self.viewport_rows)?;
+        self.current_view = self.fetch(0, self.viewport_rows)?;
         Ok(())
     }
 
     pub fn scroll_to_offset(&mut self, offset: usize) -> Result<()> {
         let max = self.total_rows.saturating_sub(self.viewport_rows);
         self.row_offset = offset.min(max);
-        let lf = self.effective_lf();
-        self.current_view = Self::fetch(&lf, self.row_offset, self.viewport_rows)?;
+        self.current_view = self.fetch(self.row_offset, self.viewport_rows)?;
         Ok(())
     }
 
     pub fn resize(&mut self, new_height: usize) -> Result<()> {
         if self.viewport_rows != new_height && new_height > 0 {
             self.viewport_rows = new_height;
-            let lf = self.effective_lf();
-            self.current_view = Self::fetch(&lf, self.row_offset, self.viewport_rows)?;
+            self.current_view = self.fetch(self.row_offset, self.viewport_rows)?;
         }
         Ok(())
     }
 
-    fn fetch(lf: &LazyFrame, offset: usize, height: usize) -> Result<DataFrame> {
+    fn fetch_lazy(lf: &LazyFrame, offset: usize, height: usize) -> Result<DataFrame> {
         Ok(lf.clone().slice(offset as i64, height as u32).collect()?)
     }
 
@@ -135,7 +219,71 @@ impl Store {
         col_name: Option<String>,
         tx: mpsc::Sender<Vec<usize>>,
     ) {
-        let lf = self.effective_lf();
+        match &self.source {
+            Source::Lazy(_) => self.search_lazy(pattern, col_name, tx),
+            Source::Lake(query) => self.search_lake(query, pattern, col_name, tx),
+        }
+    }
+
+    fn search_lake(
+        &self,
+        query: &LakeQuery,
+        pattern: String,
+        col_name: Option<String>,
+        tx: mpsc::Sender<Vec<usize>>,
+    ) {
+        let Ok(conn) = query.conn.try_clone() else { return };
+        let source = query.source.clone();
+        let columns = query.columns.clone();
+        let keys = self.sort_keys();
+        let total = self.total_rows;
+
+        thread::spawn(move || {
+            const CHUNK: usize = 10_000;
+            let mut offset = 0usize;
+
+            while offset < total {
+                let size = CHUNK.min(total - offset);
+                let sql = lake_db::match_indices_sql(
+                    &source,
+                    &keys,
+                    col_name.as_deref(),
+                    &pattern,
+                    offset,
+                    size,
+                    &columns,
+                );
+
+                let Ok(mut stmt) = conn.prepare(&sql) else { break };
+                let Ok(mut rows) = stmt.query([]) else { break };
+
+                let mut batch = Vec::new();
+                loop {
+                    match rows.next() {
+                        Ok(Some(row)) => match row.get::<_, i64>(0) {
+                            Ok(idx) if idx >= 0 => batch.push(idx as usize),
+                            _ => {}
+                        },
+                        Ok(None) => break,
+                        Err(_) => return,
+                    }
+                }
+
+                if !batch.is_empty() && tx.send(batch).is_err() {
+                    return; // receiver dropped — search cancelled
+                }
+                offset += CHUNK;
+            }
+        });
+    }
+
+    fn search_lazy(
+        &self,
+        pattern: String,
+        col_name: Option<String>,
+        tx: mpsc::Sender<Vec<usize>>,
+    ) {
+        let Some(lf) = self.effective_lf() else { return };
         let schema = self.schema.clone();
         let total = self.total_rows;
 
