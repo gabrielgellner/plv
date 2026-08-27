@@ -12,6 +12,7 @@ use crate::ui::BrowserState;
 pub enum Level {
     Tables,
     Files { table: usize },
+    Snapshots,
 }
 
 /// What the data viewer is currently scanning: a whole table, or one file of it.
@@ -48,7 +49,17 @@ impl Lake {
         match self.level {
             Level::Tables => self.catalog.tables.len(),
             Level::Files { table } => self.table(table).map_or(0, |t| t.files.len()),
+            Level::Snapshots => self.catalog.snapshots.len(),
         }
+    }
+
+    /// Index of the currently loaded snapshot in `catalog.snapshots`.
+    pub fn current_snapshot_index(&self) -> usize {
+        self.catalog
+            .snapshots
+            .iter()
+            .position(|s| s.id == self.catalog.snapshot)
+            .unwrap_or(0)
     }
 
     pub fn title(&self) -> String {
@@ -63,19 +74,24 @@ impl Lake {
 
         match self.level {
             Level::Tables => format!(
-                " {lake_name} — {} tables @ snapshot {} ",
-                self.catalog.tables.len(),
+                " {lake_name} — {} @ snapshot {} ",
+                plural(self.catalog.tables.len(), "table"),
                 self.catalog.snapshot
             ),
             Level::Files { table } => match self.table(table) {
                 Some(t) => format!(
-                    " {} — {} files, {} rows ",
+                    " {} — {}, {} rows ",
                     t.qualified_name(),
-                    t.files.len(),
+                    plural(t.files.len(), "file"),
                     catalog::human_count(t.record_count)
                 ),
                 None => format!(" {lake_name} "),
             },
+            Level::Snapshots => format!(
+                " {lake_name} — {}, currently at {} ",
+                plural(self.catalog.snapshots.len(), "snapshot"),
+                self.catalog.snapshot
+            ),
         }
     }
 
@@ -83,6 +99,7 @@ impl Lake {
         match self.level {
             Level::Tables => &["Table", "Rows", "Size", "Files", "Partitioned by", "Inlined"],
             Level::Files { .. } => &["File", "Rows", "Size", "Share"],
+            Level::Snapshots => &["", "Snapshot", "Time", "Schema", "Changes"],
         }
     }
 
@@ -101,6 +118,13 @@ impl Lake {
                 Constraint::Length(16),
                 Constraint::Length(10),
                 Constraint::Length(7),
+            ],
+            Level::Snapshots => &[
+                Constraint::Length(1),
+                Constraint::Length(8),
+                Constraint::Length(21),
+                Constraint::Length(6),
+                Constraint::Min(30),
             ],
         }
     }
@@ -134,7 +158,9 @@ impl Lake {
                 let Some(t) = self.table(table) else {
                     return Vec::new();
                 };
-                let total = t.record_count.max(1) as f64;
+                // Share is of the Parquet rows, which is what the file list
+                // actually accounts for — inlined rows have no file.
+                let total = t.files.iter().map(|f| f.record_count).sum::<u64>().max(1) as f64;
                 // A partition can be spread over several files, so the
                 // partition value alone is not a unique label — tag repeats
                 // with the catalog's file id.
@@ -160,6 +186,24 @@ impl Lake {
                     })
                     .collect()
             }
+            Level::Snapshots => self
+                .catalog
+                .snapshots
+                .iter()
+                .map(|s| {
+                    vec![
+                        if s.id == self.catalog.snapshot { "▸" } else { " " }.to_string(),
+                        s.id.to_string(),
+                        s.short_time(),
+                        format!("v{}", s.schema_version),
+                        if s.changes.is_empty() {
+                            "—".to_string()
+                        } else {
+                            s.changes.replace(',', ", ")
+                        },
+                    ]
+                })
+                .collect(),
         }
     }
 
@@ -186,5 +230,26 @@ impl Lake {
             "{} row(s) are inlined in the catalog and not shown (Parquet-only scan)",
             catalog::human_count(table.inlined_rows)
         ))
+    }
+}
+
+/// `1 table` / `2 tables`.
+fn plural(n: usize, noun: &str) -> String {
+    if n == 1 {
+        format!("{n} {noun}")
+    } else {
+        format!("{n} {noun}s")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::plural;
+
+    #[test]
+    fn plural_agrees_with_count() {
+        assert_eq!(plural(0, "table"), "0 tables");
+        assert_eq!(plural(1, "table"), "1 table");
+        assert_eq!(plural(22, "file"), "22 files");
     }
 }

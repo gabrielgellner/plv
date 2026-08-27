@@ -28,6 +28,16 @@ pub struct Snapshot {
     pub changes: String,
 }
 
+impl Snapshot {
+    /// Timestamp trimmed to whole seconds for display.
+    pub fn short_time(&self) -> String {
+        match self.time.split_once('.') {
+            Some((head, _)) => head.to_string(),
+            None => self.time.clone(),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ColumnInfo {
     pub name: String,
@@ -73,7 +83,9 @@ pub struct TableInfo {
     pub table_id: i64,
     pub schema_name: String,
     pub name: String,
+    /// Rows visible at the resolved snapshot: data files plus inlined rows.
     pub record_count: u64,
+    /// Total size of the data files visible at the resolved snapshot.
     pub file_size: u64,
     pub partition_cols: Vec<String>,
     pub columns: Vec<ColumnInfo>,
@@ -296,7 +308,6 @@ fn read_tables(conn: &Connection, snap: i64, data_root: &Path) -> Result<Vec<Tab
     let columns = read_columns(conn, snap)?;
     let partition_cols = read_partition_cols(conn, snap)?;
     let file_partitions = read_file_partitions(conn)?;
-    let stats = read_table_stats(conn)?;
     let inlined = read_inlined_counts(conn, snap)?;
 
     // Table directory = data_root / schema.path / table.path, honouring the
@@ -338,7 +349,13 @@ fn read_tables(conn: &Connection, snap: i64, data_root: &Path) -> Result<Vec<Tab
 
         let part_cols = partition_cols.get(&table_id).cloned().unwrap_or_default();
         let files = read_files(conn, snap, table_id, &table_dir, &part_cols, &file_partitions)?;
-        let (record_count, file_size) = stats.get(&table_id).copied().unwrap_or((0, 0));
+        // Derived from the snapshot-visible files rather than
+        // `ducklake_table_stats`, which is a running total for the *current*
+        // state of the table and would report today's row count while time
+        // travelling to a snapshot taken before the data was inserted.
+        let inlined_rows = inlined.get(&table_id).copied().unwrap_or(0);
+        let file_size = files.iter().map(|f| f.file_size).sum();
+        let record_count = files.iter().map(|f| f.record_count).sum::<u64>() + inlined_rows;
 
         out.push(TableInfo {
             table_id,
@@ -349,7 +366,7 @@ fn read_tables(conn: &Connection, snap: i64, data_root: &Path) -> Result<Vec<Tab
             partition_cols: part_cols,
             columns: columns.get(&table_id).cloned().unwrap_or_default(),
             files,
-            inlined_rows: inlined.get(&table_id).copied().unwrap_or(0),
+            inlined_rows,
         });
     }
     Ok(out)
@@ -432,18 +449,6 @@ fn read_file_partitions(conn: &Connection) -> Result<HashMap<i64, Vec<String>>> 
         map.entry(file_id).or_default().push(value);
     }
     Ok(map)
-}
-
-fn read_table_stats(conn: &Connection) -> Result<HashMap<i64, (u64, u64)>> {
-    let mut stmt =
-        conn.prepare("SELECT table_id, record_count, file_size_bytes FROM ducklake_table_stats")?;
-    let rows = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            (row.get::<_, i64>(1)? as u64, row.get::<_, i64>(2)? as u64),
-        ))
-    })?;
-    Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
 
 fn read_files(
@@ -563,6 +568,21 @@ mod tests {
         assert_eq!(human_count(0), "0");
         assert_eq!(human_count(999), "999");
         assert_eq!(human_count(1_140_560_738), "1,140,560,738");
+    }
+
+    #[test]
+    fn short_time_drops_subseconds() {
+        let snap = |t: &str| Snapshot {
+            id: 0,
+            time: t.to_string(),
+            schema_version: 0,
+            changes: String::new(),
+        };
+        assert_eq!(
+            snap("2026-08-27 05:34:33.552681+00").short_time(),
+            "2026-08-27 05:34:33"
+        );
+        assert_eq!(snap("2026-08-27 05:34:33").short_time(), "2026-08-27 05:34:33");
     }
 
     #[test]

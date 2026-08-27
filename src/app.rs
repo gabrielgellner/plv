@@ -288,8 +288,9 @@ impl App {
         );
 
         let help = match lake.level {
-            Level::Tables => " q  j/k:↕  Enter:open table  l:files ",
+            Level::Tables => " q  j/k:↕  Enter:open table  l:files  T:snapshots ",
             Level::Files { .. } => " q  j/k:↕  Enter:open file  a:whole table  h:back ",
+            Level::Snapshots => " q  j/k:↕  Enter:travel to snapshot  h:back ",
         };
         let line = match &self.message {
             Some(msg) => format!(" {msg}"),
@@ -328,12 +329,23 @@ impl App {
                 }
             }
 
-            // Back out of the file pane to the table list.
+            // Time travel: list the lake's snapshots.
+            KeyCode::Char('T') => {
+                lake.level = Level::Snapshots;
+                lake.state = Default::default();
+                let current = lake.current_snapshot_index();
+                lake.state.go_to(current, lake.list_len());
+            }
+
+            // Back out of a sub-list to the table list.
             KeyCode::Char('h') | KeyCode::Left | KeyCode::Esc => {
                 if let Level::Files { table } = lake.level {
                     lake.level = Level::Tables;
                     lake.state = Default::default();
                     lake.state.go_to(table, lake.list_len());
+                } else if let Level::Snapshots = lake.level {
+                    lake.level = Level::Tables;
+                    lake.state = Default::default();
                 } else if self.store.is_some() {
                     // Nothing to go back to at the top level; return to the
                     // viewer if one is already open.
@@ -357,10 +369,65 @@ impl App {
                     let file = lake.state.selected;
                     self.open_scope(Scope { table, file: Some(file) })?;
                 }
+                Level::Snapshots => {
+                    let Some(snapshot) = lake.catalog.snapshots.get(lake.state.selected) else {
+                        return Ok(());
+                    };
+                    let (id, time) = (snapshot.id, snapshot.short_time());
+                    self.switch_snapshot(id, &time)?;
+                }
             },
 
             _ => {}
         }
+        Ok(())
+    }
+
+    /// Re-resolve the whole catalog as of `snapshot` and, where possible, stay
+    /// on the table the viewer was already showing so the same data can be
+    /// compared across snapshots.
+    ///
+    /// A file-level scope is deliberately widened to the whole table: file ids
+    /// are not stable across snapshots, so the same list position would mean a
+    /// different slice of data.
+    fn switch_snapshot(&mut self, snapshot: i64, time: &str) -> anyhow::Result<()> {
+        let Some(lake) = &self.lake else { return Ok(()) };
+        let path = lake.catalog.path.clone();
+        let previous = lake
+            .scope
+            .and_then(|s| lake.table(s.table))
+            .map(|t| t.qualified_name());
+
+        let catalog = match Catalog::open_at(&path, Some(snapshot)) {
+            Ok(catalog) => catalog,
+            Err(e) => {
+                self.message = Some(format!("Cannot read snapshot {snapshot}: {e}"));
+                return Ok(());
+            }
+        };
+
+        let target = previous.and_then(|name| {
+            catalog
+                .tables
+                .iter()
+                .position(|t| t.qualified_name() == name)
+        });
+
+        self.store = None;
+        self.reset_view();
+        self.lake = Some(Lake::new(catalog));
+
+        if let Some(table) = target {
+            self.open_scope(Scope { table, file: None })?;
+            if let Some(lake) = &mut self.lake {
+                lake.state.go_to(table, lake.list_len());
+            }
+        }
+
+        // Whether or not the table survived, say where we landed. This
+        // overwrites any inlined-rows notice from open_scope — the snapshot
+        // change is the more important thing to report right now.
+        self.message = Some(format!("Snapshot {snapshot} ({time})"));
         Ok(())
     }
 
@@ -751,6 +818,16 @@ impl App {
             KeyCode::Char('b') if self.lake.is_some() => {
                 self.pending_num.clear();
                 self.screen = Screen::Browser;
+            }
+            KeyCode::Char('T') if self.lake.is_some() => {
+                self.pending_num.clear();
+                if let Some(lake) = &mut self.lake {
+                    lake.level = Level::Snapshots;
+                    lake.state = Default::default();
+                    let current = lake.current_snapshot_index();
+                    lake.state.go_to(current, lake.list_len());
+                    self.screen = Screen::Browser;
+                }
             }
 
             // Search

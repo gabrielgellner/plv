@@ -75,9 +75,15 @@ lists the lake's tables, `Level::Files { table }` lists that table's Parquet
 files, and `Scope` records what the viewer is currently scanning.
 
 Browser keys: `j/k` move, `g/G` top/bottom, `l`/`f` descend into the file pane,
-`h`/`Esc` back, `Enter` open the selection, `a` open the whole table from within
-the file pane. In the viewer, `f` returns to the file pane and `b` to the
-browser.
+`T` list snapshots, `h`/`Esc` back, `Enter` open the selection, `a` open the
+whole table from within the file pane. In the viewer, `f` returns to the file
+pane, `b` to the browser, and `T` to the snapshot picker.
+
+**Time travel.** `Enter` on a snapshot re-runs `Catalog::open_at` for that id and
+replaces the whole `Lake`. If the table the viewer was showing still exists at
+the target snapshot it is reopened by *name*, so the same data can be compared
+across snapshots; a file-level scope widens to the whole table, because file ids
+are not stable across snapshots.
 
 **`data/catalog.rs`.** DuckDB is used *only* to read catalog metadata; Polars
 remains the query engine. `Catalog::open` reads snapshots, schemas, tables,
@@ -104,6 +110,11 @@ Things the reader has to get right, all of which the census bundle exercises:
   of Parquet (`ducklake_inlined_data_*`). A Parquet-only scan silently misses
   them, so `TableInfo::inlined_rows` is surfaced in the browser and as a warning
   when the table is opened. They are *not* currently merged into the view.
+- **Snapshot-scoped stats.** `TableInfo::record_count`/`file_size` are summed
+  from the files visible at the resolved snapshot, *not* read from
+  `ducklake_table_stats` — that table is a running total for the current state
+  and would report today's row count while time travelling to a snapshot taken
+  before the data landed.
 - **Row counts.** Use `Store::with_row_count` with the catalog's per-file
   `record_count`. Counting by scanning cost ~7s on the 1.1B-row census table for
   a number the catalog already stores exactly.
