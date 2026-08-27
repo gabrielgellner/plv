@@ -2,13 +2,37 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.0] - 2026-08-27
+
+### Documentation
+
+- README section and in-app `?` key overlay ([`1b9fc95`](https://gitlab.com/gabrielgellner/plv/-/commit/1b9fc95dbd29610cd1b9ea9748bd335f9ecfa63c))
+
+### Features
+
+- Catalog reader and file pane ([`2c6dbe2`](https://gitlab.com/gabrielgellner/plv/-/commit/2c6dbe2bfd833f84f4e1970dd2d33ed69cb68857))
+- Snapshot picker with time travel ([`f0595bd`](https://gitlab.com/gabrielgellner/plv/-/commit/f0595bd1c72c1b9e00233c183f664c3e659982ac))
+
+### Miscellaneous
+
+- Skip merge commits in the changelog ([`150e6ee`](https://gitlab.com/gabrielgellner/plv/-/commit/150e6eecbed0ee6f36091e2787da8c35e451f9c0))
+
+### Refactoring
+
+- Read lakes through the ducklake extension ([`c5dece3`](https://gitlab.com/gabrielgellner/plv/-/commit/c5dece3a252f031af117e5ebd60accac772a7b78))
+
+## [0.3.0] - 2026-03-24
+
+### Features
+
+- Multi-column sort with async animation ([`41b2688`](https://gitlab.com/gabrielgellner/plv/-/commit/41b2688cfac764d13f7c9327cb97c2110a4516c2))
+
 ## [0.2.0] - 2026-03-24
 
 ### Features
 
 - Vim-style regex search with async background scanning ([`644d7e2`](https://gitlab.com/gabrielgellner/plv/-/commit/644d7e2c8d7816ec8a689389aedfd3d195f9d311))
 - Column/cell selection modes with scoped search ([`034ff2a`](https://gitlab.com/gabrielgellner/plv/-/commit/034ff2affeccbec869fad8165de247474174ef7f))
-- Merge feat/search — search, selection modes, spinner ([`90c6c0c`](https://gitlab.com/gabrielgellner/plv/-/commit/90c6c0c21b159275fed0b56a2c489d16db95d879))
 
 ### Miscellaneous
 
@@ -37,6 +61,10 @@ All notable changes to this project will be documented in this file.
 ### Styling
 
 - Fix clippy warnings ([`5cb0dba`](https://gitlab.com/gabrielgellner/plv/-/commit/5cb0dba5f5d4bc0be4d3d3b09fd1e7cd00ff7722))
+
+[0.4.0]: https://gitlab.com/gabrielgellner/plv/-/compare/v0.3.0...v0.4.0
+
+[0.3.0]: https://gitlab.com/gabrielgellner/plv/-/compare/v0.2.0...v0.3.0
 
 [0.2.0]: https://gitlab.com/gabrielgellner/plv/-/compare/v0.1.0...v0.2.0
 
