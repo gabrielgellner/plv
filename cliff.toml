@@ -41,6 +41,8 @@ conventional_commits = true
 filter_unconventional = true
 split_commits = false
 commit_parsers = [
+    # Merge commits repeat the branch's own commits, which are listed already.
+    { message = "^\\w+(\\(.*\\))?!?: merge ", skip = true },
     { message = "^feat", group = "Features" },
     { message = "^fix", group = "Bug Fixes" },
     { message = "^perf", group = "Performance" },
