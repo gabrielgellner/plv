@@ -28,6 +28,8 @@ pub struct StatusBar<'a> {
     pub spinner_tick: usize,
     /// `Some(tick)` while a background sort is running; drives the sort animation.
     pub sort_tick: Option<usize>,
+    /// Key-help text for the right-hand side; varies by mode.
+    pub help: &'static str,
 }
 
 impl Widget for StatusBar<'_> {
@@ -76,7 +78,7 @@ impl Widget for StatusBar<'_> {
             String::new()
         };
 
-        let help = " q  j/k:↕  g/G:top/bot  ^d/^u:page  h/l:←→  zz/zt/zb ";
+        let help = self.help;
         let width = area.width as usize;
 
         if let Some(tick) = self.sort_tick {

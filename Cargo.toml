@@ -11,6 +11,7 @@ color-eyre = "0.6.3"
 crossterm = "0.29.0"
 polars = { version = "0.53.0", features = ["lazy", "parquet", "strings", "regex"] }
 ratatui = "0.30.0"
+duckdb = { version = "1.10505.0", features = ["bundled"] }
 
 # Read the optimization guideline for more details: https://ratatui.rs/recipes/apps/release-your-app/#optimizations
 [profile.release]
@@ -18,3 +19,7 @@ codegen-units = 1
 lto = true
 opt-level = "s"
 strip = true
+
+[lib]
+name = "plv"
+path = "src/lib.rs"
