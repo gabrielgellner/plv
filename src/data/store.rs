@@ -17,9 +17,27 @@ pub struct Store {
 }
 
 impl Store {
-    pub fn new(mut lf: LazyFrame, viewport_rows: usize) -> Result<Self> {
+    /// Open a store, counting rows by scanning. Prefer
+    /// [`Store::with_row_count`] when the row count is already known.
+    pub fn new(lf: LazyFrame, viewport_rows: usize) -> Result<Self> {
+        Self::build(lf, viewport_rows, None)
+    }
+
+    /// Open a store with a row count supplied by the caller.
+    ///
+    /// A DuckLake catalog records an exact `record_count` per data file, so
+    /// counting again would mean a full scan of every file — seconds of
+    /// startup lag on a billion-row table, for a number we already have.
+    pub fn with_row_count(lf: LazyFrame, viewport_rows: usize, total_rows: usize) -> Result<Self> {
+        Self::build(lf, viewport_rows, Some(total_rows))
+    }
+
+    fn build(mut lf: LazyFrame, viewport_rows: usize, total_rows: Option<usize>) -> Result<Self> {
         let schema = lf.collect_schema()?;
-        let total_rows = Self::count_rows(&lf)?;
+        let total_rows = match total_rows {
+            Some(n) => n,
+            None => Self::count_rows(&lf)?,
+        };
         let current_view = Self::fetch(&lf, 0, viewport_rows)?;
         Ok(Self {
             base_lf: lf,

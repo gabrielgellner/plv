@@ -1,17 +1,12 @@
-mod app;
-mod data;
-mod search;
-mod ui;
-
 use clap::Parser;
 use std::path::PathBuf;
 
-use app::App;
+use plv::app::App;
 
 #[derive(Parser)]
-#[command(name = "plv", about = "Polars CSV/Parquet viewer")]
+#[command(name = "plv", about = "Polars CSV/Parquet/DuckLake viewer")]
 struct Args {
-    /// File to open (CSV or Parquet)
+    /// File to open: .csv, .parquet, a .ducklake catalog, or a bundle directory
     file: Option<PathBuf>,
 }
 

@@ -8,13 +8,22 @@ use ratatui::{
     widgets::Paragraph,
 };
 
+use crate::data::catalog::{self, Catalog};
 use crate::data::{loader, Store};
+use crate::lake::{Lake, Level, Scope};
 use crate::search::{SearchQuery, SearchState, SearchStatus};
-use crate::ui::{DataTable, Prompt, SelectionMode, StatusBar, Theme};
+use crate::ui::{Browser, DataTable, Prompt, SelectionMode, StatusBar, Theme};
 
 enum AppMode {
     Normal,
     Search,
+}
+
+/// Which screen is in front: the lake catalog browser, or the data viewer.
+#[derive(PartialEq)]
+enum Screen {
+    Browser,
+    Viewer,
 }
 
 pub struct App {
@@ -47,6 +56,11 @@ pub struct App {
     sort_rx: Option<mpsc::Receiver<polars::prelude::DataFrame>>,
     /// Incremented each draw while a background task is running; drives animations.
     spinner_tick: usize,
+    /// Present when the opened path was a DuckLake catalog rather than a file.
+    lake: Option<Lake>,
+    screen: Screen,
+    /// Viewport height captured each frame, so key handlers can size a new Store.
+    last_vp: usize,
 }
 
 impl App {
@@ -72,6 +86,9 @@ impl App {
             search_rx: None,
             sort_rx: None,
             spinner_tick: 0,
+            lake: None,
+            screen: Screen::Viewer,
+            last_vp: 20,
         }
     }
 
@@ -79,11 +96,23 @@ impl App {
         if let Some(path) = self.file_path.clone() {
             let size = terminal.size()?;
             let vp = Self::viewport_rows(size.height);
-            let result: anyhow::Result<Store> =
-                loader::load(&path).and_then(|lf| Store::new(lf, vp));
-            match result {
-                Ok(store) => self.store = Some(store),
-                Err(e) => self.error = Some(e.to_string()),
+            self.last_vp = vp;
+
+            if let Some(lake_path) = catalog::detect(&path) {
+                match Catalog::open(&lake_path) {
+                    Ok(cat) => {
+                        self.lake = Some(Lake::new(cat));
+                        self.screen = Screen::Browser;
+                    }
+                    Err(e) => self.error = Some(e.to_string()),
+                }
+            } else {
+                let result: anyhow::Result<Store> =
+                    loader::load(&path).and_then(|lf| Store::new(lf, vp));
+                match result {
+                    Ok(store) => self.store = Some(store),
+                    Err(e) => self.error = Some(e.to_string()),
+                }
             }
         }
 
@@ -104,10 +133,16 @@ impl App {
         self.last_frame_width = area.width;
 
         let vp = Self::viewport_rows(area.height);
+        self.last_vp = vp;
         if let Some(s) = &mut self.store
             && s.viewport_rows != vp
         {
             let _ = s.resize(vp);
+        }
+
+        if self.screen == Screen::Browser {
+            self.draw_browser(frame, area);
+            return;
         }
 
         // In Column/Cell mode keep cursor_col within [col_offset, last_vis_col].
@@ -130,11 +165,16 @@ impl App {
         .areas(area);
 
         let file_name = self
-            .file_path
+            .lake
             .as_ref()
-            .and_then(|p| p.file_name())
-            .and_then(|n| n.to_str())
-            .map(|s| s.to_string())
+            .and_then(|l| l.scope_label())
+            .or_else(|| {
+                self.file_path
+                    .as_ref()
+                    .and_then(|p| p.file_name())
+                    .and_then(|n| n.to_str())
+                    .map(|s| s.to_string())
+            })
             .unwrap_or_else(|| "plv".to_string());
         let col_offset = self.col_offset;
         let cursor_row = self.cursor_row;
@@ -196,6 +236,11 @@ impl App {
                             search_info,
                             spinner_tick: self.spinner_tick,
                             sort_tick: self.sort_rx.as_ref().map(|_| self.spinner_tick),
+                            help: if self.lake.is_some() {
+                                " q  j/k:↕  h/l:←→  f:files  b:back "
+                            } else {
+                                " q  j/k:↕  g/G:top/bot  ^d/^u:page  h/l:←→  zz/zt/zb "
+                            },
                         },
                         status_area,
                     );
@@ -208,12 +253,170 @@ impl App {
             );
         } else {
             frame.render_widget(
-                Paragraph::new("Usage: plv <file.csv|file.parquet>").centered(),
+                Paragraph::new("Usage: plv <file.csv|file.parquet|lake.ducklake|bundle-dir>").centered(),
                 table_area,
             );
         }
 
         self.last_vis_col = vis_col_cell.get();
+    }
+
+    // ── lake catalog browser ──────────────────────────────────────────────
+
+    fn draw_browser(&mut self, frame: &mut Frame, area: ratatui::layout::Rect) {
+        let [list_area, status_area] =
+            Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(area);
+
+        let Some(lake) = &mut self.lake else { return };
+
+        let len = lake.list_len();
+        lake.state.go_to(lake.state.selected, len);
+        lake.state.clamp_scroll(Browser::viewport_rows(list_area.height));
+
+        let rows = lake.rows();
+        frame.render_widget(
+            Browser {
+                title: lake.title(),
+                headers: lake.headers(),
+                widths: lake.widths(),
+                rows: &rows,
+                selected: lake.state.selected,
+                offset: lake.state.offset,
+                theme: &self.theme,
+            },
+            list_area,
+        );
+
+        let help = match lake.level {
+            Level::Tables => " q  j/k:↕  Enter:open table  l:files ",
+            Level::Files { .. } => " q  j/k:↕  Enter:open file  a:whole table  h:back ",
+        };
+        let line = match &self.message {
+            Some(msg) => format!(" {msg}"),
+            None => format!("{help}  [{}/{}]", lake.state.selected + 1, len.max(1)),
+        };
+        let style = if self.message.is_some() {
+            Style::new().bg(self.theme.message_bg).fg(self.theme.message_fg)
+        } else {
+            Style::new().bg(self.theme.status_bg).fg(self.theme.status_fg)
+        };
+        frame.render_widget(Paragraph::new(line).style(style), status_area);
+    }
+
+    fn handle_browser_key(&mut self, key: KeyEvent) -> anyhow::Result<()> {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let Some(lake) = &mut self.lake else { return Ok(()) };
+        let len = lake.list_len();
+
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Char('Q') => self.exit = true,
+            KeyCode::Char('j') | KeyCode::Down => lake.state.move_by(1, len),
+            KeyCode::Char('k') | KeyCode::Up => lake.state.move_by(-1, len),
+            KeyCode::Char('d') if ctrl => lake.state.move_by(self.last_vp as isize / 2, len),
+            KeyCode::Char('u') if ctrl => lake.state.move_by(-(self.last_vp as isize) / 2, len),
+            KeyCode::Char('g') | KeyCode::Home => lake.state.go_to(0, len),
+            KeyCode::Char('G') | KeyCode::End => lake.state.go_to(len.saturating_sub(1), len),
+
+            // Descend into the file pane for the selected table.
+            KeyCode::Char('l') | KeyCode::Right | KeyCode::Char('f') => {
+                if let Level::Tables = lake.level {
+                    let table = lake.state.selected;
+                    if lake.table(table).is_some_and(|t| !t.files.is_empty()) {
+                        lake.level = Level::Files { table };
+                        lake.state = Default::default();
+                    }
+                }
+            }
+
+            // Back out of the file pane to the table list.
+            KeyCode::Char('h') | KeyCode::Left | KeyCode::Esc => {
+                if let Level::Files { table } = lake.level {
+                    lake.level = Level::Tables;
+                    lake.state = Default::default();
+                    lake.state.go_to(table, lake.list_len());
+                } else if self.store.is_some() {
+                    // Nothing to go back to at the top level; return to the
+                    // viewer if one is already open.
+                    self.screen = Screen::Viewer;
+                }
+            }
+
+            // Open the whole table even while standing in its file pane.
+            KeyCode::Char('a') => {
+                if let Level::Files { table } = lake.level {
+                    self.open_scope(Scope { table, file: None })?;
+                }
+            }
+
+            KeyCode::Enter => match lake.level {
+                Level::Tables => {
+                    let table = lake.state.selected;
+                    self.open_scope(Scope { table, file: None })?;
+                }
+                Level::Files { table } => {
+                    let file = lake.state.selected;
+                    self.open_scope(Scope { table, file: Some(file) })?;
+                }
+            },
+
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Build a `Store` for `scope` and switch to the data viewer.
+    ///
+    /// Errors are surfaced as a status message rather than aborting: a bad
+    /// scope should leave the user in the browser, able to pick another.
+    fn open_scope(&mut self, scope: Scope) -> anyhow::Result<()> {
+        let vp = self.last_vp;
+        let Some(lake) = &self.lake else { return Ok(()) };
+        let Some(table) = lake.table(scope.table) else {
+            return Ok(());
+        };
+
+        // Row counts come from the catalog rather than a scan. Summing the
+        // *scoped* files (not `table.record_count`) keeps the total honest:
+        // it excludes rows inlined in the catalog, which a Parquet scan will
+        // not return either.
+        let (lf, rows) = match scope.file {
+            Some(i) => match table.files.get(i) {
+                Some(f) => (
+                    lake.catalog.scan_files(table, std::slice::from_ref(f)),
+                    f.record_count,
+                ),
+                None => return Ok(()),
+            },
+            None => (
+                lake.catalog.scan_table(table),
+                table.files.iter().map(|f| f.record_count).sum(),
+            ),
+        };
+
+        match lf.and_then(|lf| Store::with_row_count(lf, vp, rows as usize)) {
+            Ok(store) => {
+                self.store = Some(store);
+                self.reset_view();
+                if let Some(lake) = &mut self.lake {
+                    lake.scope = Some(scope);
+                }
+                self.screen = Screen::Viewer;
+                self.message = self.lake.as_ref().and_then(|l| l.inlined_warning());
+            }
+            Err(e) => self.message = Some(format!("Cannot open: {e}")),
+        }
+        Ok(())
+    }
+
+    /// Clear per-table view state when a different scope is loaded.
+    fn reset_view(&mut self) {
+        self.col_offset = 0;
+        self.cursor_row = 0;
+        self.cursor_col = 0;
+        self.pending_num.clear();
+        self.search_state = None;
+        self.search_rx = None;
+        self.sort_rx = None;
     }
 
     fn handle_events(&mut self) -> io::Result<()> {
@@ -315,6 +518,9 @@ impl App {
 
     fn handle_key_event(&mut self, key: KeyEvent) -> anyhow::Result<()> {
         self.message = None;
+        if self.screen == Screen::Browser {
+            return self.handle_browser_key(key);
+        }
         match self.mode {
             AppMode::Search => self.handle_search_key(key),
             AppMode::Normal => self.handle_normal_key(key),
@@ -529,6 +735,22 @@ impl App {
                 // Clear search — scope has changed
                 self.search_state = None;
                 self.search_rx = None;
+            }
+
+            // Lake: jump to this table's file pane / back to the browser.
+            KeyCode::Char('f') if self.lake.is_some() => {
+                self.pending_num.clear();
+                if let Some(lake) = &mut self.lake
+                    && let Some(scope) = lake.scope
+                {
+                    lake.level = Level::Files { table: scope.table };
+                    lake.state.go_to(scope.file.unwrap_or(0), lake.list_len());
+                    self.screen = Screen::Browser;
+                }
+            }
+            KeyCode::Char('b') if self.lake.is_some() => {
+                self.pending_num.clear();
+                self.screen = Screen::Browser;
             }
 
             // Search
