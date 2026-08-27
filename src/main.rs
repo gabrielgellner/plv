@@ -4,7 +4,11 @@ use std::path::PathBuf;
 use plv::app::App;
 
 #[derive(Parser)]
-#[command(name = "plv", about = "Polars CSV/Parquet/DuckLake viewer")]
+#[command(
+    name = "plv",
+    version,
+    about = "Polars CSV/Parquet/DuckLake viewer"
+)]
 struct Args {
     /// File to open: .csv, .parquet, a .ducklake catalog, or a bundle directory
     file: Option<PathBuf>,
