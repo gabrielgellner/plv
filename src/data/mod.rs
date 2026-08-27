@@ -1,4 +1,4 @@
-pub mod catalog;
+pub mod lake_db;
 pub mod loader;
 pub mod store;
 

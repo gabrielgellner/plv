@@ -8,7 +8,7 @@ use ratatui::{
     widgets::Paragraph,
 };
 
-use crate::data::catalog::{self, Catalog};
+use crate::data::lake_db::{self, LakeDb};
 use crate::data::{loader, Store};
 use crate::lake::{Lake, Level, Scope};
 use crate::search::{SearchQuery, SearchState, SearchStatus};
@@ -101,10 +101,10 @@ impl App {
             let vp = Self::viewport_rows(size.height);
             self.last_vp = vp;
 
-            if let Some(lake_path) = catalog::detect(&path) {
-                match Catalog::open(&lake_path) {
-                    Ok(cat) => {
-                        self.lake = Some(Lake::new(cat));
+            if let Some(lake_path) = lake_db::detect(&path) {
+                match LakeDb::open(&lake_path, None).and_then(Lake::new) {
+                    Ok(lake) => {
+                        self.lake = Some(lake);
                         self.screen = Screen::Browser;
                     }
                     Err(e) => self.error = Some(e.to_string()),
@@ -241,7 +241,7 @@ impl App {
                             spinner_tick: self.spinner_tick,
                             sort_tick: self.sort_rx.as_ref().map(|_| self.spinner_tick),
                             help: if self.lake.is_some() {
-                                " f:files  T:snapshots  b:back  ?:help  q:quit "
+                                " f:partitions  T:snapshots  b:back  ?:help "
                             } else {
                                 " j/k:↕  h/l:←→  /:search  ?:help  q:quit "
                             },
@@ -303,7 +303,7 @@ impl App {
         ];
         const GENERAL: &[(&str, &str)] = &[("?", "This help"), ("q", "Quit")];
         const LAKE: &[(&str, &str)] = &[
-            ("f", "Data files of this table"),
+            ("f", "Partitions of this table"),
             ("b", "Back to the catalog"),
             ("T", "Snapshots (time travel)"),
         ];
@@ -312,9 +312,9 @@ impl App {
             ("g / G", "First / last entry"),
             ("Ctrl+d / Ctrl+u", "Half page down / up"),
             ("Enter", "Open the selection"),
-            ("l / f", "Data files of this table"),
+            ("l / f", "Partitions of this table"),
             ("T", "Snapshots (time travel)"),
-            ("a", "Whole table (from file list)"),
+            ("a", "Whole table (from partitions)"),
             ("h / Esc", "Back"),
         ];
 
@@ -369,8 +369,8 @@ impl App {
         );
 
         let help = match lake.level {
-            Level::Tables => " Enter:open  l:files  T:snapshots  ?:help  q:quit ",
-            Level::Files { .. } => " Enter:open file  a:whole table  h:back  ?:help ",
+            Level::Tables => " Enter:open  l:partitions  T:snapshots  ?:help  q:quit ",
+            Level::Partitions { .. } => " Enter:open partition  a:whole table  h:back  ?:help ",
             Level::Snapshots => " Enter:travel to snapshot  h:back  ?:help ",
         };
         let line = match &self.message {
@@ -399,13 +399,14 @@ impl App {
             KeyCode::Char('g') | KeyCode::Home => lake.state.go_to(0, len),
             KeyCode::Char('G') | KeyCode::End => lake.state.go_to(len.saturating_sub(1), len),
 
-            // Descend into the file pane for the selected table.
+            // Descend into the partition list for the selected table.
             KeyCode::Char('l') | KeyCode::Right | KeyCode::Char('f') => {
                 if let Level::Tables = lake.level {
                     let table = lake.state.selected;
-                    if lake.table(table).is_some_and(|t| !t.files.is_empty()) {
-                        lake.level = Level::Files { table };
-                        lake.state = Default::default();
+                    if lake.table(table).is_some_and(|t| !t.partition_cols.is_empty()) {
+                        self.show_partitions(table, 0)?;
+                    } else {
+                        self.message = Some("Table is not partitioned".to_string());
                     }
                 }
             }
@@ -420,7 +421,7 @@ impl App {
 
             // Back out of a sub-list to the table list.
             KeyCode::Char('h') | KeyCode::Left | KeyCode::Esc => {
-                if let Level::Files { table } = lake.level {
+                if let Level::Partitions { table } = lake.level {
                     lake.level = Level::Tables;
                     lake.state = Default::default();
                     lake.state.go_to(table, lake.list_len());
@@ -434,24 +435,24 @@ impl App {
                 }
             }
 
-            // Open the whole table even while standing in its file pane.
+            // Open the whole table even while standing in its partition list.
             KeyCode::Char('a') => {
-                if let Level::Files { table } = lake.level {
-                    self.open_scope(Scope { table, file: None })?;
+                if let Level::Partitions { table } = lake.level {
+                    self.open_scope(Scope { table, partition: None })?;
                 }
             }
 
             KeyCode::Enter => match lake.level {
                 Level::Tables => {
                     let table = lake.state.selected;
-                    self.open_scope(Scope { table, file: None })?;
+                    self.open_scope(Scope { table, partition: None })?;
                 }
-                Level::Files { table } => {
-                    let file = lake.state.selected;
-                    self.open_scope(Scope { table, file: Some(file) })?;
+                Level::Partitions { table } => {
+                    let partition = lake.state.selected;
+                    self.open_scope(Scope { table, partition: Some(partition) })?;
                 }
                 Level::Snapshots => {
-                    let Some(snapshot) = lake.catalog.snapshots.get(lake.state.selected) else {
+                    let Some(snapshot) = lake.snapshots.get(lake.state.selected) else {
                         return Ok(());
                     };
                     let (id, time) = (snapshot.id, snapshot.short_time());
@@ -473,33 +474,29 @@ impl App {
     /// different slice of data.
     fn switch_snapshot(&mut self, snapshot: i64, time: &str) -> anyhow::Result<()> {
         let Some(lake) = &self.lake else { return Ok(()) };
-        let path = lake.catalog.path.clone();
+        let path = lake.db.path.clone();
         let previous = lake
             .scope
             .and_then(|s| lake.table(s.table))
             .map(|t| t.qualified_name());
 
-        let catalog = match Catalog::open_at(&path, Some(snapshot)) {
-            Ok(catalog) => catalog,
+        let reopened = match LakeDb::open(&path, Some(snapshot)).and_then(Lake::new) {
+            Ok(lake) => lake,
             Err(e) => {
                 self.message = Some(format!("Cannot read snapshot {snapshot}: {e}"));
                 return Ok(());
             }
         };
 
-        let target = previous.and_then(|name| {
-            catalog
-                .tables
-                .iter()
-                .position(|t| t.qualified_name() == name)
-        });
+        let target = previous
+            .and_then(|name| reopened.tables.iter().position(|t| t.qualified_name() == name));
 
         self.store = None;
         self.reset_view();
-        self.lake = Some(Lake::new(catalog));
+        self.lake = Some(reopened);
 
         if let Some(table) = target {
-            self.open_scope(Scope { table, file: None })?;
+            self.open_scope(Scope { table, partition: None })?;
             if let Some(lake) = &mut self.lake {
                 lake.state.go_to(table, lake.list_len());
             }
@@ -509,6 +506,23 @@ impl App {
         // overwrites any inlined-rows notice from open_scope — the snapshot
         // change is the more important thing to report right now.
         self.message = Some(format!("Snapshot {snapshot} ({time})"));
+        Ok(())
+    }
+
+    /// Show the partition list for `table`, loading it if needed.
+    ///
+    /// Partition lists are not loaded up front: each one costs a GROUP BY over
+    /// the table, so it is paid only when the user asks to see it.
+    fn show_partitions(&mut self, table: usize, select: usize) -> anyhow::Result<()> {
+        let Some(lake) = &mut self.lake else { return Ok(()) };
+        if let Err(e) = lake.load_partitions(table) {
+            self.message = Some(format!("Cannot list partitions: {e}"));
+            return Ok(());
+        }
+        lake.level = Level::Partitions { table };
+        lake.state = Default::default();
+        lake.state.go_to(select, lake.list_len());
+        self.screen = Screen::Browser;
         Ok(())
     }
 
@@ -523,25 +537,23 @@ impl App {
             return Ok(());
         };
 
-        // Row counts come from the catalog rather than a scan. Summing the
-        // *scoped* files (not `table.record_count`) keeps the total honest:
-        // it excludes rows inlined in the catalog, which a Parquet scan will
-        // not return either.
-        let (lf, rows) = match scope.file {
-            Some(i) => match table.files.get(i) {
-                Some(f) => (
-                    lake.catalog.scan_files(table, std::slice::from_ref(f)),
-                    f.record_count,
-                ),
+        // Row counts come from the partition list or the table's own count,
+        // both of which the extension answers from catalog statistics.
+        let (partition, rows) = match scope.partition {
+            Some(i) => match lake.partitions.get(i) {
+                Some(p) => (Some(p), p.rows),
                 None => return Ok(()),
             },
-            None => (
-                lake.catalog.scan_table(table),
-                table.files.iter().map(|f| f.record_count).sum(),
-            ),
+            None => (None, table.rows),
         };
 
-        match lf.and_then(|lf| Store::with_row_count(lf, vp, rows as usize)) {
+        let source = lake.db.source(table, partition);
+        let opened = lake
+            .db
+            .try_clone()
+            .and_then(|conn| Store::new_lake(conn, source, vp, rows as usize));
+
+        match opened {
             Ok(store) => {
                 self.store = Some(store);
                 self.reset_view();
@@ -549,7 +561,6 @@ impl App {
                     lake.scope = Some(scope);
                 }
                 self.screen = Screen::Viewer;
-                self.message = self.lake.as_ref().and_then(|l| l.inlined_warning());
             }
             Err(e) => self.message = Some(format!("Cannot open: {e}")),
         }
@@ -897,12 +908,8 @@ impl App {
             // Lake: jump to this table's file pane / back to the browser.
             KeyCode::Char('f') if self.lake.is_some() => {
                 self.pending_num.clear();
-                if let Some(lake) = &mut self.lake
-                    && let Some(scope) = lake.scope
-                {
-                    lake.level = Level::Files { table: scope.table };
-                    lake.state.go_to(scope.file.unwrap_or(0), lake.list_len());
-                    self.screen = Screen::Browser;
+                if let Some(scope) = self.lake.as_ref().and_then(|l| l.scope) {
+                    self.show_partitions(scope.table, scope.partition.unwrap_or(0))?;
                 }
             }
             KeyCode::Char('b') if self.lake.is_some() => {

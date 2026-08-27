@@ -1,104 +1,133 @@
-//! Navigation state for browsing a DuckLake catalog: the table list, the
-//! per-table file list, and which slice of the lake the data viewer is showing.
-
-use std::collections::HashMap;
+//! Navigation state for browsing a DuckLake lake: the table list, the
+//! per-table partition list, the snapshot list, and which slice the viewer is
+//! currently showing.
 
 use ratatui::layout::Constraint;
 
-use crate::data::catalog::{self, Catalog, TableInfo};
+use crate::data::lake_db::{self, LakeDb, Partition, Snapshot, TableInfo};
 use crate::ui::BrowserState;
 
 /// Which list the browser is currently showing.
 pub enum Level {
     Tables,
-    Files { table: usize },
+    Partitions { table: usize },
     Snapshots,
 }
 
-/// What the data viewer is currently scanning: a whole table, or one file of it.
+/// What the data viewer is currently scanning: a whole table, or one partition.
 #[derive(Clone, Copy)]
 pub struct Scope {
     pub table: usize,
-    /// `None` = every file of the table.
-    pub file: Option<usize>,
+    /// `None` = the whole table.
+    pub partition: Option<usize>,
 }
 
 pub struct Lake {
-    pub catalog: Catalog,
+    pub db: LakeDb,
+    pub snapshot: i64,
+    pub snapshots: Vec<Snapshot>,
+    pub tables: Vec<TableInfo>,
+    /// Partitions of the table currently being browsed. Loaded on demand,
+    /// because each list costs a GROUP BY over the table.
+    pub partitions: Vec<Partition>,
+    partitions_of: Option<usize>,
     pub level: Level,
     pub state: BrowserState,
     pub scope: Option<Scope>,
 }
 
 impl Lake {
-    pub fn new(catalog: Catalog) -> Self {
-        Self {
-            catalog,
+    pub fn new(db: LakeDb) -> anyhow::Result<Self> {
+        let snapshot = db.current_snapshot()?;
+        let snapshots = db.snapshots()?;
+        let tables = db.tables()?;
+        Ok(Self {
+            db,
+            snapshot,
+            snapshots,
+            tables,
+            partitions: Vec::new(),
+            partitions_of: None,
             level: Level::Tables,
             state: BrowserState::default(),
             scope: None,
-        }
+        })
     }
 
     pub fn table(&self, index: usize) -> Option<&TableInfo> {
-        self.catalog.tables.get(index)
+        self.tables.get(index)
+    }
+
+    /// Load the partition list for `table` unless it is already loaded.
+    pub fn load_partitions(&mut self, table: usize) -> anyhow::Result<()> {
+        if self.partitions_of == Some(table) {
+            return Ok(());
+        }
+        let Some(info) = self.tables.get(table) else {
+            return Ok(());
+        };
+        self.partitions = self.db.partitions(info)?;
+        self.partitions_of = Some(table);
+        Ok(())
     }
 
     /// Number of entries in the list currently being browsed.
     pub fn list_len(&self) -> usize {
         match self.level {
-            Level::Tables => self.catalog.tables.len(),
-            Level::Files { table } => self.table(table).map_or(0, |t| t.files.len()),
-            Level::Snapshots => self.catalog.snapshots.len(),
+            Level::Tables => self.tables.len(),
+            Level::Partitions { .. } => self.partitions.len(),
+            Level::Snapshots => self.snapshots.len(),
         }
     }
 
-    /// Index of the currently loaded snapshot in `catalog.snapshots`.
+    /// Index of the currently loaded snapshot in `snapshots`.
     pub fn current_snapshot_index(&self) -> usize {
-        self.catalog
-            .snapshots
+        self.snapshots
             .iter()
-            .position(|s| s.id == self.catalog.snapshot)
+            .position(|s| s.id == self.snapshot)
             .unwrap_or(0)
     }
 
-    pub fn title(&self) -> String {
-        let lake_name = self
-            .catalog
+    fn lake_name(&self) -> String {
+        self.db
             .path
             .parent()
             .and_then(|p| p.file_name())
             .and_then(|n| n.to_str())
             .unwrap_or("lake")
-            .to_string();
+            .to_string()
+    }
 
+    pub fn title(&self) -> String {
         match self.level {
             Level::Tables => format!(
-                " {lake_name} — {} @ snapshot {} ",
-                plural(self.catalog.tables.len(), "table"),
-                self.catalog.snapshot
+                " {} — {} @ snapshot {} ",
+                self.lake_name(),
+                plural(self.tables.len(), "table"),
+                self.snapshot
             ),
-            Level::Files { table } => match self.table(table) {
+            Level::Partitions { table } => match self.table(table) {
                 Some(t) => format!(
                     " {} — {}, {} rows ",
                     t.qualified_name(),
-                    plural(t.files.len(), "file"),
-                    catalog::human_count(t.record_count)
+                    plural(self.partitions.len(), "partition"),
+                    lake_db::human_count(t.rows)
                 ),
-                None => format!(" {lake_name} "),
+                None => format!(" {} ", self.lake_name()),
             },
             Level::Snapshots => format!(
-                " {lake_name} — {}, currently at {} ",
-                plural(self.catalog.snapshots.len(), "snapshot"),
-                self.catalog.snapshot
+                " {} — {}, currently at {} ",
+                self.lake_name(),
+                plural(self.snapshots.len(), "snapshot"),
+                self.snapshot
             ),
         }
     }
 
     pub fn headers(&self) -> &'static [&'static str] {
         match self.level {
-            Level::Tables => &["Table", "Rows", "Size", "Files", "Partitioned by", "Inlined"],
-            Level::Files { .. } => &["File", "Rows", "Size", "Share"],
+            Level::Tables => &["Table", "Rows", "Size", "Files", "Partitioned by", "Deletes"],
+            Level::Partitions { .. } => &["Partition", "Rows", "Share"],
             Level::Snapshots => &["", "Snapshot", "Time", "Schema", "Changes"],
         }
     }
@@ -111,12 +140,11 @@ impl Lake {
                 Constraint::Length(10),
                 Constraint::Length(6),
                 Constraint::Length(18),
-                Constraint::Length(9),
+                Constraint::Length(8),
             ],
-            Level::Files { .. } => &[
+            Level::Partitions { .. } => &[
                 Constraint::Min(30),
                 Constraint::Length(16),
-                Constraint::Length(10),
                 Constraint::Length(7),
             ],
             Level::Snapshots => &[
@@ -132,75 +160,57 @@ impl Lake {
     pub fn rows(&self) -> Vec<Vec<String>> {
         match self.level {
             Level::Tables => self
-                .catalog
                 .tables
                 .iter()
                 .map(|t| {
                     vec![
                         t.qualified_name(),
-                        catalog::human_count(t.record_count),
-                        catalog::human_bytes(t.file_size),
-                        t.files.len().to_string(),
+                        lake_db::human_count(t.rows),
+                        lake_db::human_bytes(t.file_size),
+                        t.file_count.to_string(),
                         if t.partition_cols.is_empty() {
                             "—".to_string()
                         } else {
                             t.partition_cols.join(", ")
                         },
-                        if t.inlined_rows == 0 {
+                        if t.delete_file_count == 0 {
                             "—".to_string()
                         } else {
-                            catalog::human_count(t.inlined_rows)
+                            t.delete_file_count.to_string()
                         },
                     ]
                 })
                 .collect(),
-            Level::Files { table } => {
-                let Some(t) = self.table(table) else {
-                    return Vec::new();
-                };
-                // Share is of the Parquet rows, which is what the file list
-                // actually accounts for — inlined rows have no file.
-                let total = t.files.iter().map(|f| f.record_count).sum::<u64>().max(1) as f64;
-                // A partition can be spread over several files, so the
-                // partition value alone is not a unique label — tag repeats
-                // with the catalog's file id.
-                let mut seen: HashMap<String, usize> = HashMap::new();
-                for f in &t.files {
-                    *seen.entry(f.label()).or_default() += 1;
-                }
-                t.files
+            Level::Partitions { table } => {
+                let total = self.table(table).map_or(1, |t| t.rows).max(1) as f64;
+                self.partitions
                     .iter()
-                    .map(|f| {
-                        let label = f.label();
-                        let label = if seen.get(&label).copied().unwrap_or(0) > 1 {
-                            format!("{label}  ·file {}", f.id)
-                        } else {
-                            label
-                        };
+                    .map(|p| {
                         vec![
-                            label,
-                            catalog::human_count(f.record_count),
-                            catalog::human_bytes(f.file_size),
-                            format!("{:.1}%", f.record_count as f64 / total * 100.0),
+                            p.label(),
+                            lake_db::human_count(p.rows),
+                            format!("{:.1}%", p.rows as f64 / total * 100.0),
                         ]
                     })
                     .collect()
             }
             Level::Snapshots => self
-                .catalog
                 .snapshots
                 .iter()
                 .map(|s| {
                     vec![
-                        if s.id == self.catalog.snapshot { "▸" } else { " " }.to_string(),
+                        if s.id == self.snapshot { "▸" } else { " " }.to_string(),
                         s.id.to_string(),
                         s.short_time(),
                         format!("v{}", s.schema_version),
-                        if s.changes.is_empty() {
-                            "—".to_string()
-                        } else {
-                            s.changes.replace(',', ", ")
-                        },
+                        // `changes` arrives pre-formatted from the extension.
+                        s.commit_message.clone().unwrap_or_else(|| {
+                            if s.changes.is_empty() {
+                                "—".to_string()
+                            } else {
+                                s.changes.clone()
+                            }
+                        }),
                     ]
                 })
                 .collect(),
@@ -211,25 +221,11 @@ impl Lake {
     pub fn scope_label(&self) -> Option<String> {
         let scope = self.scope?;
         let table = self.table(scope.table)?;
-        let base = format!("{} @snap{}", table.qualified_name(), self.catalog.snapshot);
-        Some(match scope.file.and_then(|i| table.files.get(i)) {
-            Some(file) => format!("{base} [{}]", file.label()),
-            None => format!("{base} [{} files]", table.files.len()),
+        let base = format!("{} @snap{}", table.qualified_name(), self.snapshot);
+        Some(match scope.partition.and_then(|i| self.partitions.get(i)) {
+            Some(partition) => format!("{base} [{}]", partition.label()),
+            None => base,
         })
-    }
-
-    /// Warning to show when the current scope hides rows that live in the
-    /// catalog database rather than in Parquet.
-    pub fn inlined_warning(&self) -> Option<String> {
-        let scope = self.scope?;
-        let table = self.table(scope.table)?;
-        if table.inlined_rows == 0 {
-            return None;
-        }
-        Some(format!(
-            "{} row(s) are inlined in the catalog and not shown (Parquet-only scan)",
-            catalog::human_count(table.inlined_rows)
-        ))
     }
 }
 
@@ -250,6 +246,6 @@ mod tests {
     fn plural_agrees_with_count() {
         assert_eq!(plural(0, "table"), "0 tables");
         assert_eq!(plural(1, "table"), "1 table");
-        assert_eq!(plural(22, "file"), "22 files");
+        assert_eq!(plural(22, "partition"), "22 partitions");
     }
 }
