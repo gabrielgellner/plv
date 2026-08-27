@@ -10,6 +10,8 @@ use super::Theme;
 
 const SPINNER: &[&str] = &[".   ", "..  ", "... ", "...."];
 const SORT_WORD: &str = "Sorting";
+/// Fallback when the full key help will not fit beside the position readout.
+const MIN_HELP: &str = " ?:help ";
 
 pub struct StatusBar<'a> {
     pub file_name: String,
@@ -78,19 +80,30 @@ impl Widget for StatusBar<'_> {
             String::new()
         };
 
-        let help = self.help;
         let width = area.width as usize;
+
+        // Position and search state matter more than the key hints, and the
+        // `?` overlay is the real reference — so shrink, then drop, the help
+        // rather than truncating what is to its left.
+        let fixed = display_width(&left) + display_width(&search_text);
+        let help = if fixed + display_width(self.help) <= width {
+            self.help
+        } else if fixed + display_width(MIN_HELP) <= width {
+            MIN_HELP
+        } else {
+            ""
+        };
 
         if let Some(tick) = self.sort_tick {
             // "  Sorting" with one cycling bold character.
             let sort_prefix = "  ";
             let bold_idx = (tick / 3) % SORT_WORD.len();
 
-            let left_len = left.len()
+            let left_len = display_width(&left)
                 + sort_prefix.len()
-                + SORT_WORD.len()
-                + search_text.len();
-            let pad = width.saturating_sub(left_len + help.len());
+                + SORT_WORD.chars().count()
+                + display_width(&search_text);
+            let pad = width.saturating_sub(left_len + display_width(help));
 
             let mut spans: Vec<Span<'static>> = vec![
                 Span::styled(left, base),
@@ -110,9 +123,25 @@ impl Widget for StatusBar<'_> {
 
             Paragraph::new(Line::from(spans)).render(area, buf);
         } else {
-            let pad = width.saturating_sub(left.len() + search_text.len() + help.len());
+            let pad = width.saturating_sub(fixed + display_width(help));
             let text = format!("{left}{search_text}{}{help}", " ".repeat(pad));
             Paragraph::new(text).style(base).render(area, buf);
         }
+    }
+}
+
+/// Terminal cells a string occupies. Close enough for the status bar, whose
+/// only non-ASCII content is single-width arrows.
+fn display_width(s: &str) -> usize {
+    s.chars().count()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_width_counts_chars_not_bytes() {
+        assert_eq!(display_width(" j/k:\u{2195} "), 7);
     }
 }

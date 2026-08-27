@@ -12,7 +12,7 @@ use crate::data::catalog::{self, Catalog};
 use crate::data::{loader, Store};
 use crate::lake::{Lake, Level, Scope};
 use crate::search::{SearchQuery, SearchState, SearchStatus};
-use crate::ui::{Browser, DataTable, Prompt, SelectionMode, StatusBar, Theme};
+use crate::ui::{Browser, DataTable, Help, Prompt, Section, SelectionMode, StatusBar, Theme};
 
 enum AppMode {
     Normal,
@@ -61,6 +61,8 @@ pub struct App {
     screen: Screen,
     /// Viewport height captured each frame, so key handlers can size a new Store.
     last_vp: usize,
+    /// The `?` key-binding overlay is showing.
+    help_visible: bool,
 }
 
 impl App {
@@ -89,6 +91,7 @@ impl App {
             lake: None,
             screen: Screen::Viewer,
             last_vp: 20,
+            help_visible: false,
         }
     }
 
@@ -142,6 +145,7 @@ impl App {
 
         if self.screen == Screen::Browser {
             self.draw_browser(frame, area);
+            self.draw_help(frame, area);
             return;
         }
 
@@ -237,9 +241,9 @@ impl App {
                             spinner_tick: self.spinner_tick,
                             sort_tick: self.sort_rx.as_ref().map(|_| self.spinner_tick),
                             help: if self.lake.is_some() {
-                                " q  j/k:↕  h/l:←→  f:files  b:back "
+                                " f:files  T:snapshots  b:back  ?:help  q:quit "
                             } else {
-                                " q  j/k:↕  g/G:top/bot  ^d/^u:page  h/l:←→  zz/zt/zb "
+                                " j/k:↕  h/l:←→  /:search  ?:help  q:quit "
                             },
                         },
                         status_area,
@@ -258,7 +262,84 @@ impl App {
             );
         }
 
+        self.draw_help(frame, area);
         self.last_vis_col = vis_col_cell.get();
+    }
+
+    fn draw_help(&self, frame: &mut Frame, area: ratatui::layout::Rect) {
+        if !self.help_visible {
+            return;
+        }
+        frame.render_widget(
+            Help {
+                sections: self.help_sections(),
+                theme: &self.theme,
+            },
+            area,
+        );
+    }
+
+    /// Key bindings for whatever is currently in front.
+    fn help_sections(&self) -> &'static [Section<'static>] {
+        const MOVE: &[(&str, &str)] = &[
+            ("j / \u{2193}", "Move down"),
+            ("k / \u{2191}", "Move up"),
+            ("Ctrl+d / Ctrl+u", "Half page down / up"),
+            ("g / G", "First / last row"),
+            ("{n}G", "Jump to row n"),
+            ("zz / zt / zb", "Centre / top / bottom"),
+        ];
+        const COLUMNS: &[(&str, &str)] = &[
+            ("h / l", "Scroll columns left / right"),
+            ("H", "First column"),
+            ("0 / $", "First / last column (column mode)"),
+            ("Tab", "Cycle row \u{2192} column \u{2192} cell"),
+            ("s", "Sort by cursor column"),
+        ];
+        const SEARCH: &[(&str, &str)] = &[
+            ("/", "Search (regex)"),
+            ("n / N", "Next / previous match"),
+            ("Esc", "Clear search and sorts"),
+        ];
+        const GENERAL: &[(&str, &str)] = &[("?", "This help"), ("q", "Quit")];
+        const LAKE: &[(&str, &str)] = &[
+            ("f", "Data files of this table"),
+            ("b", "Back to the catalog"),
+            ("T", "Snapshots (time travel)"),
+        ];
+        const BROWSE: &[(&str, &str)] = &[
+            ("j / k", "Move selection"),
+            ("g / G", "First / last entry"),
+            ("Ctrl+d / Ctrl+u", "Half page down / up"),
+            ("Enter", "Open the selection"),
+            ("l / f", "Data files of this table"),
+            ("T", "Snapshots (time travel)"),
+            ("a", "Whole table (from file list)"),
+            ("h / Esc", "Back"),
+        ];
+
+        const VIEWER: &[Section<'static>] = &[
+            ("Rows", MOVE),
+            ("Columns", COLUMNS),
+            ("Search", SEARCH),
+            ("General", GENERAL),
+        ];
+        const VIEWER_LAKE: &[Section<'static>] = &[
+            ("Rows", MOVE),
+            ("Columns", COLUMNS),
+            ("Search", SEARCH),
+            ("Lake", LAKE),
+            ("General", GENERAL),
+        ];
+        const BROWSER: &[Section<'static>] = &[("Catalog", BROWSE), ("General", GENERAL)];
+
+        if self.screen == Screen::Browser {
+            BROWSER
+        } else if self.lake.is_some() {
+            VIEWER_LAKE
+        } else {
+            VIEWER
+        }
     }
 
     // ── lake catalog browser ──────────────────────────────────────────────
@@ -288,9 +369,9 @@ impl App {
         );
 
         let help = match lake.level {
-            Level::Tables => " q  j/k:↕  Enter:open table  l:files  T:snapshots ",
-            Level::Files { .. } => " q  j/k:↕  Enter:open file  a:whole table  h:back ",
-            Level::Snapshots => " q  j/k:↕  Enter:travel to snapshot  h:back ",
+            Level::Tables => " Enter:open  l:files  T:snapshots  ?:help  q:quit ",
+            Level::Files { .. } => " Enter:open file  a:whole table  h:back  ?:help ",
+            Level::Snapshots => " Enter:travel to snapshot  h:back  ?:help ",
         };
         let line = match &self.message {
             Some(msg) => format!(" {msg}"),
@@ -585,6 +666,15 @@ impl App {
 
     fn handle_key_event(&mut self, key: KeyEvent) -> anyhow::Result<()> {
         self.message = None;
+        if self.help_visible {
+            // Any key dismisses the overlay, including a second '?'.
+            self.help_visible = false;
+            return Ok(());
+        }
+        if key.code == KeyCode::Char('?') {
+            self.help_visible = true;
+            return Ok(());
+        }
         if self.screen == Screen::Browser {
             return self.handle_browser_key(key);
         }

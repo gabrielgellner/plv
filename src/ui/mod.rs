@@ -1,10 +1,12 @@
 mod browser;
+mod help;
 mod prompt;
 mod statusbar;
 mod table;
 pub mod theme;
 
 pub use browser::{Browser, BrowserState};
+pub use help::{Help, Section};
 pub use prompt::Prompt;
 pub use statusbar::StatusBar;
 pub use table::DataTable;

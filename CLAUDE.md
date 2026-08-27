@@ -34,6 +34,7 @@ src/
   ui/
     table.rs      DataTable widget: renders DataFrame as a table
     browser.rs    Browser widget + cursor/scroll state for catalog lists
+    help.rs       Help widget: the `?` key-binding overlay
     statusbar.rs  StatusBar widget: file/row/col position + help
 ```
 
@@ -78,6 +79,11 @@ Browser keys: `j/k` move, `g/G` top/bottom, `l`/`f` descend into the file pane,
 `T` list snapshots, `h`/`Esc` back, `Enter` open the selection, `a` open the
 whole table from within the file pane. In the viewer, `f` returns to the file
 pane, `b` to the browser, and `T` to the snapshot picker.
+
+`?` opens a key-binding overlay whose contents follow the current screen
+(`App::help_sections`); any key dismisses it. The status bar only has room for a
+few hints, so it degrades to `?:help` and then to nothing rather than truncating
+the position readout — the overlay is the authoritative in-app reference.
 
 **Time travel.** `Enter` on a snapshot re-runs `Catalog::open_at` for that id and
 replaces the whole `Lake`. If the table the viewer was showing still exists at
