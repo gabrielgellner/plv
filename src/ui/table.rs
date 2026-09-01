@@ -79,16 +79,29 @@ fn row_num_width(row_offset: usize, viewport_rows: usize) -> usize {
     (p.to_string().len() - 1) + 2 // +2: one left-padding space + the │ char
 }
 
+/// What an empty cell shows.
+///
+/// An absent field and an empty one are the same thing to plv — both read as
+/// null and both are written back as an empty field — so one marker covers
+/// both. A marker rather than nothing at all, because a genuinely blank cell
+/// is indistinguishable from a column that simply ends there; and a marker
+/// rather than the word `null`, which reads as data and collides with a field
+/// whose text really is "null".
+const EMPTY: &str = "\u{b7}";
+
 /// One cell as the viewer shows it.
 ///
 /// `AnyValue`'s own `Display` wraps strings in quotes — it is written for
 /// debugging, where telling `1` from `"1"` matters. In a viewer over a file
 /// that is text to begin with, the quotes are noise that also costs two
 /// columns of width per cell. `str_value` gives the bare text for strings and
-/// categoricals, `null` for nulls, and `Display` for everything else, so
-/// numbers, booleans and dates are unchanged.
+/// categoricals, and `Display` for everything else, so numbers, booleans and
+/// dates are unchanged. Nulls become [`EMPTY`] rather than the word `null`.
 fn cell_text(value: AnyValue) -> String {
-    value.str_value().into_owned()
+    match value {
+        AnyValue::Null => EMPTY.to_string(),
+        value => value.str_value().into_owned(),
+    }
 }
 
 fn natural_col_width(col: &Column) -> usize {
@@ -405,11 +418,20 @@ impl Widget for DataTable<'_> {
                 let mut cells = vec![Cell::new(rn_str).style(num_style)];
 
                 for (idx, &ci) in vis_cols.iter().enumerate() {
-                    let val = match cols[ci].get(ri) {
+                    let value = cols[ci].get(ri);
+                    let is_empty = !matches!(&value, Ok(v) if !v.is_null());
+                    let val = match value {
                         Ok(v) => truncate(&cell_text(v), final_widths[idx]),
-                        Err(_) => "null".to_string(),
+                        Err(_) => EMPTY.to_string(),
                     };
                     let cs = cell_style(ci);
+                    // An empty cell recedes, so a column of them reads as a
+                    // gap rather than as content.
+                    let cs = if is_empty {
+                        cs.fg(self.theme.null_fg)
+                    } else {
+                        cs
+                    };
                     // Call out an unwritten edit, so the state of the buffer is
                     // visible in the grid and not only as a count in the status
                     // bar. Foreground only, so it layers over the cursor and the
@@ -446,7 +468,7 @@ impl Widget for DataTable<'_> {
                 if has_partial && next_col_idx < cols.len() {
                     let val = match cols[next_col_idx].get(ri) {
                         Ok(v) => cell_text(v),
-                        Err(_) => "null".to_string(),
+                        Err(_) => EMPTY.to_string(),
                     };
                     let display = if val.chars().count() >= partial_width {
                         let clipped: String =
@@ -540,21 +562,31 @@ mod tests {
         assert!(gutter(5000, 0, false, 3).ends_with('│'));
     }
 
-    /// Every rendered line, so the gutter is read off the screen rather than
-    /// off the function that is supposed to produce it.
+    /// Every rendered line, so what is checked is what reaches the screen
+    /// rather than what the function meant to put there.
     fn rendered(cursor_row: usize, relative: bool) -> Vec<String> {
         let df = df! {
             "name" => ["a", "b", "c", "d", "e"],
             "n" => [1, 2, 3, 4, 5],
         }
         .unwrap();
+        lines(&draw(&df, cursor_row, relative))
+    }
+
+    fn lines(buf: &Buffer) -> Vec<String> {
+        (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect())
+            .collect()
+    }
+
+    fn draw(df: &DataFrame, cursor_row: usize, relative: bool) -> Buffer {
         let theme = Theme::catppuccin_mocha();
         let last_vis = std::cell::Cell::new(0);
         let area = Rect::new(0, 0, 40, 10);
         let mut buf = Buffer::empty(area);
 
         DataTable {
-            df: &df,
+            df,
             col_offset: 0,
             cursor_col: 0,
             row_offset: 0,
@@ -571,10 +603,7 @@ mod tests {
             relative_rows: relative,
         }
         .render(area, &mut buf);
-
-        (0..area.height)
-            .map(|y| (0..area.width).map(|x| buf[(x, y)].symbol()).collect())
-            .collect()
+        buf
     }
 
     #[test]
@@ -626,7 +655,13 @@ mod tests {
         assert_eq!(cell_text(AnyValue::Int64(42)), "42");
         assert_eq!(cell_text(AnyValue::Float64(1.5)), "1.5");
         assert_eq!(cell_text(AnyValue::Boolean(true)), "true");
-        assert_eq!(cell_text(AnyValue::Null), "null");
+        assert_eq!(cell_text(AnyValue::Null), EMPTY);
+        // A field whose text really is "null" is no longer confusable with
+        // one that holds nothing.
+        assert_ne!(
+            cell_text(AnyValue::String("null")),
+            cell_text(AnyValue::Null)
+        );
     }
 
     #[test]
@@ -641,6 +676,33 @@ mod tests {
         let df = df! { "s" => ["alpha"] }.unwrap();
         // "alpha" is five characters; the quotes used to make it seven.
         assert_eq!(natural_col_width(&df.columns()[0]), 5);
+    }
+
+    #[test]
+    fn an_empty_cell_is_drawn_recessive() {
+        // Read the colour off the buffer: a style the code passes but the
+        // screen does not show is not a colour.
+        let df = df! {
+            "name" => [Some("a"), None],
+            "n" => [1, 2],
+        }
+        .unwrap();
+        let buf = draw(&df, 0, true);
+        let theme = Theme::catppuccin_mocha();
+
+        let marker = (0..buf.area.height)
+            .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
+            .find(|&(x, y)| buf[(x, y)].symbol() == EMPTY)
+            .expect("the empty cell should be marked");
+
+        assert_eq!(buf[marker].fg, theme.null_fg);
+        assert_ne!(theme.null_fg, theme.cursor_fg, "and not the data colour");
+    }
+
+    #[test]
+    fn an_empty_column_does_not_reserve_room_for_the_word_null() {
+        let df = df! { "s" => [None::<&str>, None] }.unwrap();
+        assert_eq!(natural_col_width(&df.columns()[0]), MIN_COL_WIDTH);
     }
 
     /// The width the gutter asks for only grows at powers of ten, so scrolling
