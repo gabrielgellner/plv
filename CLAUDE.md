@@ -33,6 +33,7 @@ src/
     edit.rs       the edit buffer: a sparse overlay + undo history
     writer.rs     splice edits back into the file, byte-preserving
     lake_db.rs    DuckLake access via DuckDB's ducklake extension
+  view.rs         the view language: parse and check :select/:filter/:sort
   ui/
     table.rs      DataTable widget: renders DataFrame as a table
     browser.rs    Browser widget + cursor/scroll state for catalog lists
@@ -119,6 +120,35 @@ because a column-mode selection covers every row in the file.
 `:` opens an ex line: `:w`, `:w!`, `:w path`, `:q`, `:q!`, `:wq`, `:x`. Bare `q`
 and `:q` refuse while edits are unwritten. The status bar carries a `[+n]` count
 and edited cells render in red.
+
+## The view language (`src/view.rs`)
+
+`:select`, `:hide`, `:filter` and `:sort` shape what the viewer shows. The
+module parses and checks; nothing in it touches a `LazyFrame`.
+
+**Validation happens when the line is typed, not when the frame collects.**
+Polars is lazy, so `filter count > abc` does not fail where it was written — it
+fails inside a later `collect`, as a query-planner error naming nodes the user
+never typed. The schema is in hand at the prompt, so column names resolve to
+indices there (which also settles duplicate names) and literals are checked
+against the column's dtype there. Errors carry the byte span of the word that
+caused them, so the prompt can underline it.
+
+**The view is state, not a pipeline.** Each command replaces its own slot, so
+`:select a b` then `:select c` shows `c` rather than trying to select `c` from a
+frame already narrowed to `a b`. `:hide` writes to the same slot `:select` does.
+`Store::sort` already worked this way.
+
+Evaluation order is fixed independently of the order commands were typed:
+**filter → sort → select**, as in SQL, so a filter or sort can name a column
+that is not on show.
+
+Grammar, deliberately closed: `~` and `!~` are regex and read any column as text
+(as `/` search does); other comparisons require a literal matching the column's
+type; an empty literal `""` means the cells with nothing in them, matching how
+plv renders and writes empty fields elsewhere. Conditions join with `and` only —
+no `or` and no parentheses, because precedence cannot be introduced later
+without changing what already-written commands mean.
 
 ## Polars 0.53 API notes
 
