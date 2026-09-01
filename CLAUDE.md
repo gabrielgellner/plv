@@ -33,6 +33,7 @@ src/
     edit.rs       the edit buffer: a sparse overlay + undo history
     writer.rs     splice edits back into the file, byte-preserving
     lake_db.rs    DuckLake access via DuckDB's ducklake extension
+    rows.rs       row sets: which rows a :filter matched, and paging by index
   view.rs         the view language: parse and check :select/:filter/:sort
   ui/
     table.rs      DataTable widget: renders DataFrame as a table
@@ -143,10 +144,29 @@ Evaluation order is fixed independently of the order commands were typed:
 **filter → sort → select**, as in SQL, so a filter or sort can name a column
 that is not on show.
 
+**`:filter` does not go into the frame.** Polars pushes a projection into the
+scan and lets the slice follow it down, but a filter stops the slice pushdown
+dead — measured on a 400k-row CSV, the first page costs 18ms unfiltered and
+101ms filtered, and that gap grows with the file rather than staying put,
+because a filtered slice reads everything whatever offset it is asked for.
+Scrolling would pay it on every keypress.
+
+So a filter is resolved once into the sorted set of source rows it matches
+(`data/rows.rs`), and paging becomes a gather: read the span the page covers,
+take the wanted rows out of it. `Store::scan_rows` is the chunked background
+scan, shared with `/` search — both ask the same question of the file and both
+want the answer progressively. It buys a real row count, cancellation, and row
+identity, which is what lets the edit buffer survive a filter: a row picked out
+of a filtered view still knows which line of the file it came from.
+
+A filter and a sort are refused together for now: a sort puts the rows in an
+order the source row numbers no longer describe, so the set would have to be
+rebuilt on every sort.
+
 `Store` holds the `View` and converts at its own boundary: **its indices are
 source columns, everything above it counts display positions.** `source_column`
-/ `display_column` are the crossing points, and the edit overlay goes through
-them in both directions — an edit typed into a reordered view is stored against
+/ `display_column` and `source_row` / `display_row` are the crossing points,
+and the edit overlay goes through them in both directions — an edit typed into a reordered view is stored against
 the file's column, and an edit on a column the view hides stays pending and is
 still written by `:w`, it just has nowhere on screen to be marked.
 

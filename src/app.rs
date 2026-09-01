@@ -145,6 +145,9 @@ pub struct App {
     search_rx: Option<mpsc::Receiver<Vec<usize>>>,
     /// Receives the sorted first-page DataFrame from the background sort thread.
     sort_rx: Option<mpsc::Receiver<polars::prelude::DataFrame>>,
+    /// Receives batches of rows matching the active `:filter`. Dropping this
+    /// cancels the scan.
+    filter_rx: Option<mpsc::Receiver<Vec<usize>>>,
     /// Incremented each draw while a background task is running; drives animations.
     spinner_tick: usize,
     /// Present when the opened path was a DuckLake catalog rather than a file.
@@ -188,6 +191,7 @@ impl App {
             search_state: None,
             search_rx: None,
             sort_rx: None,
+            filter_rx: None,
             spinner_tick: 0,
             lake: None,
             screen: Screen::Viewer,
@@ -289,7 +293,7 @@ impl App {
 
         if let Some(store) = &self.store {
             // Advance spinner each frame while any background task is running.
-            if self.search_rx.is_some() || self.sort_rx.is_some() {
+            if self.search_rx.is_some() || self.sort_rx.is_some() || self.filter_rx.is_some() {
                 self.spinner_tick = self.spinner_tick.wrapping_add(1);
             }
 
@@ -380,7 +384,7 @@ impl App {
                         StatusBar {
                             file_name,
                             cursor_row,
-                            total_rows: store.total_rows,
+                            total_rows: store.row_count(),
                             view: store.view.describe(&store.schema),
                             col_position: self.col_position(),
                             total_cols: store.column_count(),
@@ -395,6 +399,7 @@ impl App {
                             search_info,
                             spinner_tick: self.spinner_tick,
                             sort_tick: self.sort_rx.as_ref().map(|_| self.spinner_tick),
+                            filtering: store.filtering(),
                             help: if self.lake.is_some() {
                                 " f:partitions  T:snapshots  b:back  ?:help "
                             } else {
@@ -478,6 +483,8 @@ impl App {
         const VIEWS: &[(&str, &str)] = &[
             (":select a b", "Show only these columns"),
             (":hide a b", "Drop these columns"),
+            (":filter c > 10", "Keep matching rows; `~` is a regex"),
+            (":filter a = x and b ~ y", "Conditions join with `and`"),
             (":sort a b-", "Sort by columns, `-` for descending"),
             (":select   :sort", "The verb alone puts it back"),
             (":reset [slot]", "Clear select, filter, sort, or all"),
@@ -808,18 +815,19 @@ impl App {
         self.search_state = None;
         self.search_rx = None;
         self.sort_rx = None;
+        self.filter_rx = None;
     }
 
     fn handle_events(&mut self) -> io::Result<()> {
-        // If poll_sort or poll_search changed any state, return immediately so
-        // the main loop redraws before blocking on input.
-        if self.poll_sort() || self.poll_search() {
+        // If a background task changed any state, return immediately so the
+        // main loop redraws before blocking on input.
+        if self.poll_sort() || self.poll_search() || self.poll_filter() {
             return Ok(());
         }
 
         // While any background task is running use a short timeout so the UI
         // redraws as result batches arrive. When idle, block on read directly.
-        if (self.search_rx.is_some() || self.sort_rx.is_some())
+        if (self.search_rx.is_some() || self.sort_rx.is_some() || self.filter_rx.is_some())
             && !event::poll(Duration::from_millis(50))?
         {
             return Ok(());
@@ -847,8 +855,17 @@ impl App {
             };
             match result {
                 Ok(rows) => {
+                    // The search scans the file, so it reports the file's own
+                    // rows; a filter means not all of them are on show.
+                    let shown: Vec<usize> = match &self.store {
+                        Some(store) => rows
+                            .into_iter()
+                            .filter_map(|r| store.display_row(r))
+                            .collect(),
+                        None => rows,
+                    };
                     if let Some(state) = &mut self.search_state {
-                        state.matching_rows.extend(rows);
+                        state.matching_rows.extend(shown);
                         changed = true;
                     }
                 }
@@ -882,6 +899,46 @@ impl App {
         }
 
         changed
+    }
+
+    /// Take whatever the filter scan has found since the last frame.
+    fn poll_filter(&mut self) -> bool {
+        let Some(rx) = &self.filter_rx else {
+            return false;
+        };
+        let mut batches = Vec::new();
+        let mut finished = false;
+        loop {
+            match rx.try_recv() {
+                Ok(batch) => batches.push(batch),
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    finished = true;
+                    break;
+                }
+            }
+        }
+        if batches.is_empty() && !finished {
+            return false;
+        }
+        if let Some(store) = &mut self.store {
+            for batch in batches {
+                let _ = store.extend_filter(batch);
+            }
+            if finished {
+                let _ = store.finish_filter();
+            }
+        }
+        if finished {
+            self.filter_rx = None;
+        }
+        // Rows arriving can leave the cursor past the end of what matched.
+        let last = self
+            .store
+            .as_ref()
+            .map_or(0, |s| s.row_count().saturating_sub(1));
+        self.cursor_row = self.cursor_row.min(last);
+        true
     }
 
     /// Check for completion of the background sort thread.
@@ -1025,7 +1082,7 @@ impl App {
                     let last = self
                         .store
                         .as_ref()
-                        .map_or(0, |s| s.total_rows.saturating_sub(1));
+                        .map_or(0, |s| s.row_count().saturating_sub(1));
                     self.cursor_to(last)?;
                 } else {
                     let s = std::mem::take(&mut self.pending_num);
@@ -1073,6 +1130,11 @@ impl App {
                 ) =>
             {
                 self.visual_anchor = None;
+                if self.store.as_ref().is_some_and(|s| s.view.filter.is_some()) {
+                    self.message =
+                        Some("cannot sort a filtered view — :filter clears it".to_string());
+                    return Ok(());
+                }
                 if let Some(store) = &mut self.store {
                     self.sort_rx = Some(store.begin_sort(self.cursor_col));
                     self.cursor_row = 0;
@@ -1295,7 +1357,7 @@ impl App {
             anchor_col.min(self.cursor_col),
             anchor_col.max(self.cursor_col),
         );
-        let all_rows = (0, store.total_rows.saturating_sub(1));
+        let all_rows = (0, store.row_count().saturating_sub(1));
         let all_cols = (0, store.column_count().saturating_sub(1));
         Some(match self.selection_mode {
             SelectionMode::Row => (rows, all_cols),
@@ -1381,7 +1443,7 @@ impl App {
         let Some(store) = self.store.as_ref() else {
             return Ok(());
         };
-        let last_row = store.total_rows.saturating_sub(1);
+        let last_row = store.row_count().saturating_sub(1);
         let last_col = store.column_count().saturating_sub(1);
 
         let mut edits = Vec::new();
@@ -1706,13 +1768,24 @@ impl App {
             }
         };
 
+        // Whether the row set has to be rebuilt is a property of the command,
+        // not of the state it produces: `:select` leaves a filter's matches
+        // exactly as they were, and rescanning the file to rediscover that
+        // would throw away the whole point of resolving it once.
+        let refiltered = matches!(
+            command,
+            view::Command::Filter(_)
+                | view::Command::Reset(None)
+                | view::Command::Reset(Some(view::Slot::Filter))
+        );
+
         let mut next = store.view.clone();
-        let was_sorted = next.sort.clone();
+        let sort_before = next.sort.clone();
         if let Err(e) = next.apply(command, store.schema.len()) {
             self.message = Some(e);
             return Ok(());
         }
-        let reordered = next.sort != was_sorted;
+        let reordered = next.sort != sort_before;
 
         if let Some(store) = &mut self.store
             && let Err(e) = store.apply_view(next)
@@ -1720,7 +1793,15 @@ impl App {
             self.message = Some(e.to_string());
             return Ok(());
         }
-        self.after_view_change(reordered)?;
+        if refiltered && let Some(store) = &mut self.store {
+            // Dropping the old receiver cancels a scan still running.
+            self.filter_rx = None;
+            match store.begin_filter() {
+                Ok(rx) => self.filter_rx = rx,
+                Err(e) => self.message = Some(e.to_string()),
+            }
+        }
+        self.after_view_change(reordered || refiltered)?;
         Ok(())
     }
 
@@ -1822,12 +1903,12 @@ impl App {
         };
         let viewport = store.viewport_rows.max(1);
         let step = (viewport / 2).max(1);
-        let last_row = store.total_rows.saturating_sub(1);
+        let last_row = store.row_count().saturating_sub(1);
         let offset = store.row_offset;
         let height_in_view = self.cursor_row.saturating_sub(offset);
 
         let new_offset = if down {
-            (offset + step).min(store.total_rows.saturating_sub(viewport))
+            (offset + step).min(store.row_count().saturating_sub(viewport))
         } else {
             offset.saturating_sub(step)
         };
@@ -1855,7 +1936,7 @@ impl App {
     /// Move cursor to `row` (0-based), scrolling the viewport only if needed.
     fn cursor_to(&mut self, row: usize) -> anyhow::Result<()> {
         let (total, vp, offset) = match &self.store {
-            Some(s) => (s.total_rows, s.viewport_rows, s.row_offset),
+            Some(s) => (s.row_count(), s.viewport_rows, s.row_offset),
             None => return Ok(()),
         };
         if total == 0 {
@@ -1879,7 +1960,7 @@ impl App {
     }
 
     fn cursor_down(&mut self, n: usize) -> anyhow::Result<()> {
-        let total = self.store.as_ref().map_or(0, |s| s.total_rows);
+        let total = self.store.as_ref().map_or(0, |s| s.row_count());
         if total == 0 {
             return Ok(());
         }
@@ -1894,7 +1975,7 @@ impl App {
     /// zz — scroll so the cursor is vertically centered.
     fn scroll_center(&mut self) -> anyhow::Result<()> {
         let (total, vp) = match &self.store {
-            Some(s) => (s.total_rows, s.viewport_rows),
+            Some(s) => (s.row_count(), s.viewport_rows),
             None => return Ok(()),
         };
         let offset = self
@@ -1918,7 +1999,7 @@ impl App {
     /// zb — scroll so the cursor is at the bottom of the viewport.
     fn scroll_cursor_bottom(&mut self) -> anyhow::Result<()> {
         let (total, vp) = match &self.store {
-            Some(s) => (s.total_rows, s.viewport_rows),
+            Some(s) => (s.row_count(), s.viewport_rows),
             None => return Ok(()),
         };
         let offset = self
@@ -1933,7 +2014,7 @@ impl App {
 
     /// Parse a buffered number string and jump to that 1-based line number.
     fn jump_to_line(&mut self, num_str: &str) -> anyhow::Result<()> {
-        let total = self.store.as_ref().map_or(0, |s| s.total_rows);
+        let total = self.store.as_ref().map_or(0, |s| s.row_count());
         match num_str.parse::<usize>() {
             Ok(0) => {
                 self.message = Some(format!("Invalid line: 0  (valid: 1–{total})"));
@@ -2535,6 +2616,125 @@ mod tests {
 
         command(&mut app, "reset");
         assert_eq!(shown_columns(&app), ["a", "b", "c", "d"]);
+    }
+
+    const CATS: &str = "id,cat\n0,a\n1,b\n2,a\n3,b\n4,a\n";
+
+    /// The scan runs on a worker thread; drain it until it finishes.
+    fn settle(app: &mut App) {
+        for _ in 0..2000 {
+            if app.filter_rx.is_none() {
+                return;
+            }
+            app.poll_filter();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        panic!("the filter scan never finished");
+    }
+
+    fn filter(app: &mut App, line: &str) {
+        command(app, line);
+        settle(app);
+    }
+
+    #[test]
+    fn a_filter_narrows_the_rows_on_show() {
+        let mut app = app_sized("filter.csv", CATS, 60);
+        filter(&mut app, "filter cat = a");
+
+        let store = app.store.as_ref().unwrap();
+        assert_eq!(store.row_count(), 3, "three rows say a");
+        assert_eq!(store.total_rows, 5, "the file still has five");
+        assert_eq!(shown(&app, 0, 0).as_deref(), Some("0"));
+        assert_eq!(shown(&app, 0, 1).as_deref(), Some("2"));
+        assert_eq!(shown(&app, 0, 2).as_deref(), Some("4"));
+    }
+
+    #[test]
+    fn a_bare_filter_puts_the_rows_back() {
+        let mut app = app_sized("unfilter.csv", CATS, 60);
+        filter(&mut app, "filter cat = a");
+        assert_eq!(app.store.as_ref().unwrap().row_count(), 3);
+
+        filter(&mut app, "filter");
+        assert_eq!(app.store.as_ref().unwrap().row_count(), 5);
+        assert_eq!(shown(&app, 0, 1).as_deref(), Some("1"));
+    }
+
+    /// The reason a filter is resolved to row indices rather than composed
+    /// into the frame: the edit buffer is keyed by source row, so a row picked
+    /// out of a filtered view has to know which line of the file it came from.
+    #[test]
+    fn editing_a_filtered_row_writes_the_right_line() {
+        let (mut app, path) = app_with("filteredit.csv", CATS);
+        app.last_frame_width = 60;
+        filter(&mut app, "filter cat = a");
+
+        // Display row 1 is the file's row 2.
+        press(&mut app, 'j');
+        cell_mode(&mut app);
+        press(&mut app, 'c');
+        typed(&mut app, "99");
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(shown(&app, 0, 1).as_deref(), Some("99"));
+
+        command(&mut app, "w");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "id,cat\n0,a\n1,b\n99,a\n3,b\n4,a\n",
+            "the edit belongs to the third line, not the second"
+        );
+    }
+
+    #[test]
+    fn a_filtered_view_can_still_be_edited() {
+        let mut app = app_sized("filteditable.csv", CATS, 60);
+        filter(&mut app, "filter cat = a");
+        assert_eq!(
+            app.store.as_ref().unwrap().edit_blocked(),
+            None,
+            "a filter keeps row identity, so it need not block edits"
+        );
+    }
+
+    #[test]
+    fn a_filter_and_a_sort_are_refused_together() {
+        let mut app = app_sized("filtersort.csv", CATS, 60);
+        filter(&mut app, "filter cat = a");
+
+        command(&mut app, "sort id");
+        assert!(app.message.clone().unwrap().contains("filtered view"));
+        assert_eq!(app.store.as_ref().unwrap().row_count(), 3, "filter intact");
+
+        // The `s` key is refused for the same reason, in the same words.
+        cell_mode(&mut app);
+        press(&mut app, 's');
+        assert!(app.message.clone().unwrap().contains("filtered view"));
+        assert!(app.store.as_ref().unwrap().view.sort.is_empty());
+    }
+
+    #[test]
+    fn a_filter_that_matches_nothing_shows_nothing() {
+        let mut app = app_sized("nomatch.csv", CATS, 60);
+        filter(&mut app, "filter cat = zzz");
+        let store = app.store.as_ref().unwrap();
+        assert_eq!(store.row_count(), 0);
+        assert_eq!(store.current_view.height(), 0);
+        assert_eq!(
+            store.current_view.width(),
+            2,
+            "still the right columns to draw a header from"
+        );
+    }
+
+    #[test]
+    fn a_filter_composes_with_a_projection() {
+        let mut app = app_sized("filterselect.csv", CATS, 60);
+        filter(&mut app, "filter cat = a");
+        command(&mut app, "select cat");
+        assert_eq!(shown_columns(&app), ["cat"]);
+        assert_eq!(app.store.as_ref().unwrap().row_count(), 3);
+        assert_eq!(shown(&app, 0, 0).as_deref(), Some("a"));
     }
 
     #[test]

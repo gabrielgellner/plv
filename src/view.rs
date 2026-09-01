@@ -166,8 +166,22 @@ impl View {
                 }
                 self.select = Some(kept);
             }
-            Command::Filter(filter) => self.filter = Some(filter),
-            Command::Sort(keys) => self.sort = keys,
+            Command::Filter(filter) => {
+                // A filter is resolved to a set of source rows; a sort puts the
+                // rows in an order those numbers no longer describe. Carrying
+                // both would mean re-deriving the set on every sort, so for now
+                // the two are exclusive and say so.
+                if !self.sort.is_empty() {
+                    return Err("cannot filter a sorted view — :sort clears it".to_string());
+                }
+                self.filter = Some(filter);
+            }
+            Command::Sort(keys) => {
+                if self.filter.is_some() && !keys.is_empty() {
+                    return Err("cannot sort a filtered view — :filter clears it".to_string());
+                }
+                self.sort = keys;
+            }
             Command::Reset(None) => *self = Self::default(),
             Command::Reset(Some(Slot::Select)) => self.select = None,
             Command::Reset(Some(Slot::Filter)) => self.filter = None,
@@ -873,16 +887,38 @@ mod tests {
     }
 
     #[test]
+    fn a_filter_and_a_sort_are_refused_together() {
+        let mut view = View::default();
+        view.apply(ok("sort name"), 6).unwrap();
+        let e = view.apply(ok("filter count > 1"), 6).unwrap_err();
+        assert!(e.contains("sorted view"), "{e}");
+        assert!(view.filter.is_none(), "and the sort is left alone");
+
+        view.apply(ok("sort"), 6).unwrap();
+        view.apply(ok("filter count > 1"), 6).unwrap();
+        let e = view.apply(ok("sort name"), 6).unwrap_err();
+        assert!(e.contains("filtered view"), "{e}");
+
+        // Clearing either one is always allowed.
+        view.apply(ok("sort"), 6).unwrap();
+        view.apply(ok("filter"), 6).unwrap();
+        assert!(view.is_empty());
+    }
+
+    #[test]
     fn reset_clears_one_slot_or_all_of_them() {
         let mut view = View::default();
         view.apply(ok("select name"), 6).unwrap();
         view.apply(ok("filter count > 1"), 6).unwrap();
-        view.apply(ok("sort name-"), 6).unwrap();
-        assert!(!view.is_empty());
 
         view.apply(ok("reset filter"), 6).unwrap();
         assert!(view.filter.is_none());
         assert!(view.select.is_some(), "the other slots are untouched");
+
+        view.apply(ok("sort name-"), 6).unwrap();
+        view.apply(ok("reset sort"), 6).unwrap();
+        assert!(view.sort.is_empty());
+        assert!(view.select.is_some());
 
         view.apply(ok("reset"), 6).unwrap();
         assert!(view.is_empty());
@@ -897,10 +933,13 @@ mod tests {
         view.apply(ok("select name count"), 6).unwrap();
         view.apply(ok("filter count > 10 and name ~ ^a"), 6)
             .unwrap();
-        view.apply(ok("sort count-"), 6).unwrap();
         assert_eq!(
             view.describe(&schema).unwrap(),
-            "select 2/6  count > 10 and name ~ ^a  sort count-"
+            "select 2/6  count > 10 and name ~ ^a"
         );
+
+        view.apply(ok("filter"), 6).unwrap();
+        view.apply(ok("sort count-"), 6).unwrap();
+        assert_eq!(view.describe(&schema).unwrap(), "select 2/6  sort count-");
     }
 }

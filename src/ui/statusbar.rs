@@ -28,6 +28,8 @@ pub struct StatusBar<'a> {
     pub selection: Option<(usize, usize)>,
     /// What the active view is doing, when it is doing anything.
     pub view: Option<String>,
+    /// A filter scan is still running, so the row count is still growing.
+    pub filtering: bool,
     pub pending_num: String,
     /// A multi-key prefix waiting for its second key, shown as `g-` or `z-`.
     pub pending_prefix: Option<char>,
@@ -78,6 +80,11 @@ impl Widget for StatusBar<'_> {
 
         if let Some(view) = &self.view {
             left.push_str(&format!("  {view}"));
+            if self.filtering {
+                // The row count beside it is still climbing; say so rather
+                // than let it look like the final answer.
+                left.push_str(SPINNER[(self.spinner_tick / 4) % SPINNER.len()].trim_end());
+            }
         }
 
         if let Some((rows, cols)) = self.selection {
