@@ -20,6 +20,10 @@ pub struct StatusBar<'a> {
     pub col_offset: usize,
     pub total_cols: usize,
     pub message: Option<String>,
+    /// Cells edited but not yet written. Shown as `[+n]` beside the file name.
+    pub dirty: usize,
+    /// Size of the visual selection as `(rows, columns)`, when there is one.
+    pub selection: Option<(usize, usize)>,
     pub pending_num: String,
     pub pending_z: bool,
     pub theme: &'a Theme,
@@ -36,24 +40,40 @@ pub struct StatusBar<'a> {
 
 impl Widget for StatusBar<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let base = Style::new().bg(self.theme.status_bg).fg(self.theme.status_fg);
+        let base = Style::new()
+            .bg(self.theme.status_bg)
+            .fg(self.theme.status_fg);
 
         if let Some(msg) = self.message {
             let text = format!(" {msg}");
             Paragraph::new(text)
-                .style(Style::new().bg(self.theme.message_bg).fg(self.theme.message_fg))
+                .style(
+                    Style::new()
+                        .bg(self.theme.message_bg)
+                        .fg(self.theme.message_fg),
+                )
                 .render(area, buf);
             return;
         }
 
+        let dirty = if self.dirty > 0 {
+            format!(" [+{}]", self.dirty)
+        } else {
+            String::new()
+        };
+
         let mut left = format!(
-            " {} | Row {}/{} | Col {}/{}",
+            " {}{dirty} | Row {}/{} | Col {}/{}",
             self.file_name,
             self.cursor_row + 1,
             self.total_rows,
             self.col_offset + 1,
             self.total_cols,
         );
+
+        if let Some((rows, cols)) = self.selection {
+            left.push_str(&format!("  {rows}\u{d7}{cols} sel"));
+        }
 
         if self.pending_z {
             left.push_str("  z-");
@@ -105,10 +125,8 @@ impl Widget for StatusBar<'_> {
                 + display_width(&search_text);
             let pad = width.saturating_sub(left_len + display_width(help));
 
-            let mut spans: Vec<Span<'static>> = vec![
-                Span::styled(left, base),
-                Span::styled(sort_prefix, base),
-            ];
+            let mut spans: Vec<Span<'static>> =
+                vec![Span::styled(left, base), Span::styled(sort_prefix, base)];
             for (i, ch) in SORT_WORD.chars().enumerate() {
                 let style = if i == bold_idx {
                     base.add_modifier(Modifier::BOLD)

@@ -144,7 +144,10 @@ mod tests {
     fn split_balances_columns() {
         let theme = Theme::catppuccin_mocha();
         let sections: &[Section] = &[("Move", A), ("Other", B)];
-        let help = Help { sections, theme: &theme };
+        let help = Help {
+            sections,
+            theme: &theme,
+        };
         let (left, right) = help.split();
         assert_eq!(left.len(), 1);
         assert_eq!(right.len(), 1);
@@ -154,7 +157,10 @@ mod tests {
     fn split_keeps_single_section_in_one_column() {
         let theme = Theme::catppuccin_mocha();
         let sections: &[Section] = &[("Move", A)];
-        let help = Help { sections, theme: &theme };
+        let help = Help {
+            sections,
+            theme: &theme,
+        };
         let (left, right) = help.split();
         assert_eq!(left.len(), 1);
         assert!(right.is_empty());

@@ -1,11 +1,16 @@
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread::{self, yield_now};
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use duckdb::Connection;
 use polars::prelude::*;
 
+use crate::data::edit::{Cell, Overlay};
 use crate::data::lake_db::{self, LakeSource};
+use crate::data::loader;
+use crate::data::writer::{self, Stamp};
 
 /// Where a store's rows come from.
 ///
@@ -23,6 +28,16 @@ struct LakeQuery {
     columns: Vec<String>,
 }
 
+/// A file plv can write edits back to.
+struct EditTarget {
+    path: PathBuf,
+    separator: u8,
+    /// How the file looked when it was opened. A write checks this first, so
+    /// it cannot clobber changes something else made in the meantime — the
+    /// buffer's row numbers describe the file as it was read.
+    stamp: Stamp,
+}
+
 pub struct Store {
     source: Source,
     pub schema: SchemaRef,
@@ -33,6 +48,11 @@ pub struct Store {
     /// Active sort keys in priority order: `(column_index, ascending)`.
     /// Empty = natural order. First entry is the primary sort key.
     pub sort: Vec<(usize, bool)>,
+    /// Present when the rows came from a delimited text file, which is the
+    /// only kind plv can write back.
+    edit: Option<EditTarget>,
+    /// Edits made but not yet written, keyed by position in the source file.
+    overlay: Overlay,
 }
 
 impl Store {
@@ -62,7 +82,25 @@ impl Store {
             viewport_rows,
             current_view,
             sort: Vec::new(),
+            edit: None,
+            overlay: Overlay::new(),
         })
+    }
+
+    /// Open a store over a file, remembering the path so edits can be written
+    /// back to it.
+    pub fn open_file(path: &Path, viewport_rows: usize) -> Result<Self> {
+        let mut store = Self::build(loader::load(path)?, viewport_rows, None)?;
+        // Only delimited text is editable. Parquet is genuinely typed, so a
+        // one-cell change would mean rewriting the whole file against a schema.
+        if let Some(separator) = loader::separator(path)? {
+            store.edit = Some(EditTarget {
+                path: path.to_path_buf(),
+                separator,
+                stamp: Stamp::of(path)?,
+            });
+        }
+        Ok(store)
     }
 
     /// Open a store over one table or partition of a lake.
@@ -94,6 +132,8 @@ impl Store {
             viewport_rows,
             current_view,
             sort: Vec::new(),
+            edit: None,
+            overlay: Overlay::new(),
         })
     }
 
@@ -127,7 +167,7 @@ impl Store {
     }
 
     fn fetch(&self, offset: usize, height: usize) -> Result<DataFrame> {
-        match &self.source {
+        let df = match &self.source {
             Source::Lazy(_) => {
                 let lf = self.effective_lf().expect("lazy source");
                 Self::fetch_lazy(&lf, offset, height)
@@ -139,7 +179,8 @@ impl Store {
                 offset,
                 height,
             ),
-        }
+        }?;
+        self.apply_overlay(df, offset)
     }
 
     /// Toggle sort direction on `col_idx`, or add it as a new ascending sort key.
@@ -168,7 +209,9 @@ impl Store {
             Source::Lake(query) => {
                 // A cloned handle shares the attached lake, so the background
                 // thread does not pay the ATTACH cost again.
-                let Ok(conn) = query.conn.try_clone() else { return rx };
+                let Ok(conn) = query.conn.try_clone() else {
+                    return rx;
+                };
                 let source = query.source.clone();
                 let keys = self.sort_keys();
                 thread::spawn(move || {
@@ -204,6 +247,269 @@ impl Store {
         Ok(())
     }
 
+    /// Replace the visible page with a frame produced off the main thread,
+    /// re-applying pending edits so a background fetch cannot drop them.
+    pub fn set_view(&mut self, df: DataFrame) {
+        if let Ok(df) = self.apply_overlay(df, self.row_offset) {
+            self.current_view = df;
+        }
+    }
+
+    /// Why this store cannot take an edit right now, or `None` when it can.
+    ///
+    /// The message lives here rather than in the key handler so the rule and
+    /// its explanation cannot drift apart.
+    pub fn edit_blocked(&self) -> Option<&'static str> {
+        if self.edit.is_none() {
+            return Some(match self.source {
+                Source::Lake(_) => "lake tables are read-only",
+                Source::Lazy(_) => "only csv, tsv, tab and txt files can be edited",
+            });
+        }
+        if !self.sort.is_empty() {
+            // A sorted page's rows are not the file's rows, so an edit could
+            // not be told which line it belongs to.
+            return Some("cannot edit a sorted view — clear the sort first");
+        }
+        None
+    }
+
+    /// Whether the rows came from a file plv can write back to.
+    ///
+    /// Unlike [`Store::edit_blocked`] this does not change with the sort, so it
+    /// is the right question for deciding what to advertise in the help.
+    pub fn is_editable(&self) -> bool {
+        self.edit.is_some()
+    }
+
+    /// The visible text of one cell, by absolute row and column index.
+    ///
+    /// `None` when the row is not on the current page. A null cell reads as
+    /// empty, which is also how an empty field is written back.
+    pub fn cell_text(&self, row: usize, col: usize) -> Option<String> {
+        let local = row.checked_sub(self.row_offset)?;
+        if local >= self.current_view.height() {
+            return None;
+        }
+        let column = self.current_view.columns().get(col)?;
+        let text = column.cast(&DataType::String).ok()?;
+        Some(text.str().ok()?.get(local).unwrap_or("").to_string())
+    }
+
+    /// Cells holding an edit that has not been written yet.
+    pub fn dirty(&self) -> usize {
+        self.overlay.len()
+    }
+
+    /// Apply `edits` — each keyed by row in the *source file* and column index
+    /// — as a single undoable change.
+    pub fn edit<I: IntoIterator<Item = (Cell, String)>>(&mut self, edits: I) -> Result<()> {
+        self.overlay.set(edits);
+        self.refresh()
+    }
+
+    pub fn undo(&mut self) -> Result<bool> {
+        let undone = self.overlay.undo();
+        if undone {
+            self.refresh()?;
+        }
+        Ok(undone)
+    }
+
+    pub fn redo(&mut self) -> Result<bool> {
+        let redone = self.overlay.redo();
+        if redone {
+            self.refresh()?;
+        }
+        Ok(redone)
+    }
+
+    /// Write pending edits back to the source file, or to `dst` for `:w path`.
+    ///
+    /// Refuses when the file has changed since it was opened unless `force`:
+    /// the buffer's row numbers describe the file as it was read, so writing
+    /// over a different one would put edits on the wrong lines.
+    ///
+    /// Writing elsewhere leaves the buffer dirty, as `:w path` does in vim —
+    /// the source file still lacks these changes.
+    pub fn save(&mut self, dst: Option<&Path>, force: bool) -> Result<PathBuf> {
+        let Some(target) = &self.edit else {
+            bail!("this view is read-only");
+        };
+        if !force && !target.stamp.still_matches(&target.path) {
+            bail!(
+                "{} has changed on disk — :w! overwrites it",
+                target.path.display()
+            );
+        }
+        let src = target.path.clone();
+        let separator = target.separator;
+        let dst = dst.unwrap_or(&src).to_path_buf();
+
+        // plv always reads a header row, so record 0 is never data.
+        let stamp = writer::save(&src, &dst, separator, true, &self.overlay, self.total_rows)?;
+
+        if dst == src {
+            self.overlay.clear();
+            if let Some(target) = &mut self.edit {
+                target.stamp = stamp;
+            }
+            self.reload()?;
+        }
+        Ok(dst)
+    }
+
+    /// Re-open the file after writing to it, in case an edit changed a
+    /// column's inferred type. The row count cannot have changed: a value
+    /// containing a newline is quoted, so it stays one record.
+    fn reload(&mut self) -> Result<()> {
+        let Some(path) = self.edit.as_ref().map(|t| t.path.clone()) else {
+            return Ok(());
+        };
+        let mut lf = loader::load(&path)?;
+        self.schema = lf.collect_schema()?;
+        self.source = Source::Lazy(lf);
+        self.refresh()
+    }
+
+    fn refresh(&mut self) -> Result<()> {
+        self.current_view = self.fetch(self.row_offset, self.viewport_rows)?;
+        Ok(())
+    }
+
+    /// Paint pending edits onto a freshly fetched page.
+    ///
+    /// A column carrying an edit is rendered as text, so the value is shown
+    /// exactly as it was typed whether or not it still parses as the column's
+    /// inferred type — the file itself is untyped, and pretending otherwise
+    /// would hide what is about to be written. Only the visible rows are
+    /// touched, so the cost follows the viewport and not the file.
+    fn apply_overlay(&self, mut df: DataFrame, offset: usize) -> Result<DataFrame> {
+        if self.overlay.is_empty() {
+            return Ok(df);
+        }
+        let height = df.height();
+
+        let mut by_column: BTreeMap<usize, Vec<(usize, &str)>> = BTreeMap::new();
+        for (local, cells) in self.edits_in_page(offset, height) {
+            for (&col, value) in cells {
+                by_column
+                    .entry(col)
+                    .or_default()
+                    .push((local, value.as_str()));
+            }
+        }
+
+        for (index, edits) in by_column {
+            let Some(column) = df.columns().get(index) else {
+                continue;
+            };
+            let patched = Self::patch_column(column, &edits)?;
+            df.with_column(patched)?;
+        }
+        Ok(df)
+    }
+
+    /// One column with its pending edits written in.
+    ///
+    /// The values are text, so the column has to go through text to take them.
+    /// It comes back if it can: typing `42` into a number is still a number,
+    /// and letting one edit turn the whole column into strings would change how
+    /// every other value in it is aligned and formatted. Only a value that
+    /// genuinely does not fit leaves the column as text — which is the honest
+    /// answer, because that is what the file will read as next time.
+    fn patch_column(column: &Column, edits: &[(usize, &str)]) -> Result<Column> {
+        let name = column.name().clone();
+        let dtype = column.dtype().clone();
+
+        let text = column.cast(&DataType::String)?;
+        let mut values: Vec<Option<String>> = text
+            .str()?
+            .into_iter()
+            .map(|v| v.map(str::to_string))
+            .collect();
+        for &(row, value) in edits {
+            // An empty field is a null, matching how it is read and written.
+            values[row] = (!value.is_empty()).then(|| value.to_string());
+        }
+
+        let patched = Column::new(name, values);
+        // Strict: a plain `cast` turns a value it cannot parse into a null,
+        // which would quietly swallow the edit instead of showing it.
+        match patched.strict_cast(&dtype) {
+            Ok(typed) => Ok(typed),
+            Err(_) => Ok(patched),
+        }
+    }
+
+    /// Pending edits falling inside a page of `height` rows starting at
+    /// `offset`, paired with the row's position within it.
+    ///
+    /// One window for every reader — the renderer marking edited cells and the
+    /// overlay painting them — so the two cannot disagree about which rows are
+    /// on screen.
+    fn edits_in_page(
+        &self,
+        offset: usize,
+        height: usize,
+    ) -> impl Iterator<Item = (usize, &BTreeMap<usize, String>)> {
+        self.overlay
+            .rows()
+            .skip_while(move |&(row, _)| row < offset)
+            // Rows ascend, so the first one past the page ends the search.
+            .map_while(move |(row, cells)| {
+                let local = row - offset;
+                (local < height).then_some((local, cells))
+            })
+    }
+
+    /// The displayed text of every cell in a block, pending edits included.
+    ///
+    /// Unlike [`Store::cell_text`] this is not limited to the visible page: a
+    /// selection can be taller than the viewport, and an operator that builds
+    /// on what is already in each cell has to see all of it. Indexed by
+    /// position within the block, and bounded by the caller — this materializes
+    /// every row it covers.
+    pub fn block_text(
+        &self,
+        rows: (usize, usize),
+        cols: (usize, usize),
+    ) -> Result<Vec<Vec<String>>> {
+        let height = rows.1.saturating_sub(rows.0) + 1;
+        let df = self.fetch(rows.0, height)?;
+
+        let columns: Vec<Option<Column>> = (cols.0..=cols.1)
+            .map(|index| {
+                df.columns()
+                    .get(index)
+                    .and_then(|c| c.cast(&DataType::String).ok())
+            })
+            .collect();
+
+        Ok((0..df.height())
+            .map(|row| {
+                columns
+                    .iter()
+                    .map(|column| {
+                        column
+                            .as_ref()
+                            .and_then(|c| c.str().ok()?.get(row))
+                            .unwrap_or("")
+                            .to_string()
+                    })
+                    .collect()
+            })
+            .collect())
+    }
+
+    /// Pending edits inside the current page, as `(row within the page,
+    /// column index)` — what the table needs in order to mark them.
+    pub fn edited_cells(&self) -> Vec<(usize, usize)> {
+        self.edits_in_page(self.row_offset, self.current_view.height())
+            .flat_map(|(local, cells)| cells.keys().map(move |&col| (local, col)))
+            .collect()
+    }
+
     fn fetch_lazy(lf: &LazyFrame, offset: usize, height: usize) -> Result<DataFrame> {
         Ok(lf.clone().slice(offset as i64, height as u32).collect()?)
     }
@@ -232,7 +538,9 @@ impl Store {
         col_name: Option<String>,
         tx: mpsc::Sender<Vec<usize>>,
     ) {
-        let Ok(conn) = query.conn.try_clone() else { return };
+        let Ok(conn) = query.conn.try_clone() else {
+            return;
+        };
         let source = query.source.clone();
         let columns = query.columns.clone();
         let keys = self.sort_keys();
@@ -254,7 +562,9 @@ impl Store {
                     &columns,
                 );
 
-                let Ok(mut stmt) = conn.prepare(&sql) else { break };
+                let Ok(mut stmt) = conn.prepare(&sql) else {
+                    break;
+                };
                 let Ok(mut rows) = stmt.query([]) else { break };
 
                 let mut batch = Vec::new();
@@ -277,13 +587,10 @@ impl Store {
         });
     }
 
-    fn search_lazy(
-        &self,
-        pattern: String,
-        col_name: Option<String>,
-        tx: mpsc::Sender<Vec<usize>>,
-    ) {
-        let Some(lf) = self.effective_lf() else { return };
+    fn search_lazy(&self, pattern: String, col_name: Option<String>, tx: mpsc::Sender<Vec<usize>>) {
+        let Some(lf) = self.effective_lf() else {
+            return;
+        };
         let schema = self.schema.clone();
         let total = self.total_rows;
 
@@ -349,5 +656,244 @@ impl Store {
     fn count_rows(lf: &LazyFrame) -> Result<usize> {
         let df = lf.clone().select([len().alias("n")]).collect()?;
         Ok(df.column("n")?.u32()?.get(0).unwrap_or(0) as usize)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_temp(name: &str, contents: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join("plv-store-tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    /// A cell of the visible page, read as text whatever its column's type.
+    fn cell(df: &DataFrame, col: usize, row: usize) -> Option<String> {
+        let column = df.columns().get(col)?.cast(&DataType::String).ok()?;
+        column.str().ok()?.get(row).map(str::to_string)
+    }
+
+    const SAMPLE: &str = "name,count\na,1\nb,2\nc,3\nd,4\n";
+
+    #[test]
+    fn an_edit_shows_in_the_page() {
+        let path = write_temp("shows.csv", SAMPLE);
+        let mut store = Store::open_file(&path, 10).unwrap();
+        assert_eq!(cell(&store.current_view, 0, 1).as_deref(), Some("b"));
+
+        store.edit([((1, 0), "edited".to_string())]).unwrap();
+        assert_eq!(cell(&store.current_view, 0, 1).as_deref(), Some("edited"));
+        assert_eq!(store.dirty(), 1);
+        // Its neighbours are untouched.
+        assert_eq!(cell(&store.current_view, 0, 0).as_deref(), Some("a"));
+        assert_eq!(cell(&store.current_view, 1, 1).as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn an_edit_is_keyed_to_the_file_and_not_the_viewport() {
+        let path = write_temp("scroll.csv", SAMPLE);
+        let mut store = Store::open_file(&path, 2).unwrap();
+        store.edit([((3, 0), "far".to_string())]).unwrap();
+
+        // Row 3 is off the page, so nothing in view changed.
+        assert_eq!(cell(&store.current_view, 0, 0).as_deref(), Some("a"));
+        assert_eq!(cell(&store.current_view, 0, 1).as_deref(), Some("b"));
+
+        // Scrolling to it finds the edit waiting.
+        store.scroll_to_offset(2).unwrap();
+        assert_eq!(cell(&store.current_view, 0, 0).as_deref(), Some("c"));
+        assert_eq!(cell(&store.current_view, 0, 1).as_deref(), Some("far"));
+    }
+
+    #[test]
+    fn a_value_that_does_not_fit_the_column_type_is_still_shown_as_typed() {
+        let path = write_temp("types.csv", SAMPLE);
+        let mut store = Store::open_file(&path, 10).unwrap();
+        assert!(matches!(
+            store.schema.get_at_index(1).unwrap().1,
+            DataType::Int64
+        ));
+
+        store.edit([((0, 1), "n/a".to_string())]).unwrap();
+        assert_eq!(cell(&store.current_view, 1, 0).as_deref(), Some("n/a"));
+        // The rest of the column survives the switch to text.
+        assert_eq!(cell(&store.current_view, 1, 1).as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn an_edit_that_still_reads_as_a_number_keeps_the_column_numeric() {
+        let path = write_temp("keeptype.csv", SAMPLE);
+        let mut store = Store::open_file(&path, 10).unwrap();
+
+        store.edit([((1, 1), "42".to_string())]).unwrap();
+        assert_eq!(cell(&store.current_view, 1, 1).as_deref(), Some("42"));
+        assert_eq!(
+            store.current_view.columns()[1].dtype(),
+            &DataType::Int64,
+            "one edit must not turn the whole column into text"
+        );
+    }
+
+    #[test]
+    fn an_edit_that_does_not_read_as_a_number_leaves_the_column_as_text() {
+        let path = write_temp("losetype.csv", SAMPLE);
+        let mut store = Store::open_file(&path, 10).unwrap();
+
+        store.edit([((1, 1), "n/a".to_string())]).unwrap();
+        assert_eq!(cell(&store.current_view, 1, 1).as_deref(), Some("n/a"));
+        assert_eq!(
+            store.current_view.columns()[1].dtype(),
+            &DataType::String,
+            "the column really will read as text next time it is opened"
+        );
+    }
+
+    #[test]
+    fn clearing_a_numeric_cell_leaves_a_null_rather_than_text() {
+        let path = write_temp("clearnum.csv", SAMPLE);
+        let mut store = Store::open_file(&path, 10).unwrap();
+
+        store.edit([((0, 1), String::new())]).unwrap();
+        assert_eq!(store.current_view.columns()[1].dtype(), &DataType::Int64);
+        assert!(
+            store.current_view.columns()[1].get(0).unwrap().is_null(),
+            "an empty field is a null, as it is on the way back out"
+        );
+    }
+
+    #[test]
+    fn untouched_values_in_an_edited_column_are_unchanged() {
+        // The column goes through text to take the edit, so the values that
+        // were not edited have to survive the round trip exactly.
+        let path = write_temp(
+            "floats.csv",
+            "name,ratio\na,0.1\nb,3.14159265358979\nc,2.5\n",
+        );
+        let mut store = Store::open_file(&path, 10).unwrap();
+        let before: Vec<Option<String>> = (0..3).map(|r| cell(&store.current_view, 1, r)).collect();
+
+        store.edit([((0, 1), "9.5".to_string())]).unwrap();
+        assert_eq!(store.current_view.columns()[1].dtype(), &DataType::Float64);
+        assert_eq!(cell(&store.current_view, 1, 0).as_deref(), Some("9.5"));
+        for row in 1..3 {
+            assert_eq!(cell(&store.current_view, 1, row), before[row], "row {row}");
+        }
+    }
+
+    #[test]
+    fn edited_cells_are_reported_relative_to_the_page() {
+        let path = write_temp("marks.csv", SAMPLE);
+        let mut store = Store::open_file(&path, 2).unwrap();
+        store
+            .edit([((0, 0), "x".to_string()), ((3, 1), "9".to_string())])
+            .unwrap();
+
+        // Only the edit on the current page is reported, positioned within it.
+        assert_eq!(store.edited_cells(), vec![(0, 0)]);
+
+        store.scroll_to_offset(2).unwrap();
+        assert_eq!(store.edited_cells(), vec![(1, 1)]);
+    }
+
+    #[test]
+    fn undo_and_redo_move_the_page_with_them() {
+        let path = write_temp("undo.csv", SAMPLE);
+        let mut store = Store::open_file(&path, 10).unwrap();
+        store.edit([((0, 0), "x".to_string())]).unwrap();
+
+        assert!(store.undo().unwrap());
+        assert_eq!(cell(&store.current_view, 0, 0).as_deref(), Some("a"));
+        assert_eq!(store.dirty(), 0);
+
+        assert!(store.redo().unwrap());
+        assert_eq!(cell(&store.current_view, 0, 0).as_deref(), Some("x"));
+        assert!(!store.redo().unwrap());
+    }
+
+    #[test]
+    fn a_sorted_view_refuses_edits() {
+        let path = write_temp("sorted.csv", SAMPLE);
+        let mut store = Store::open_file(&path, 10).unwrap();
+        assert_eq!(store.edit_blocked(), None);
+
+        let _rx = store.begin_sort(0);
+        let blocked = store.edit_blocked().expect("sorted views are not editable");
+        assert!(blocked.contains("sorted"), "{blocked}");
+
+        store.clear_sort().unwrap();
+        assert_eq!(store.edit_blocked(), None);
+    }
+
+    #[test]
+    fn a_store_without_a_file_behind_it_is_read_only() {
+        let path = write_temp("readonly.csv", SAMPLE);
+        let store = Store::new(loader::load(&path).unwrap(), 10).unwrap();
+        assert!(store.edit_blocked().is_some());
+    }
+
+    #[test]
+    fn saving_writes_the_file_and_empties_the_buffer() {
+        let path = write_temp("save.csv", SAMPLE);
+        let mut store = Store::open_file(&path, 10).unwrap();
+        store.edit([((1, 1), "99".to_string())]).unwrap();
+        store.save(None, false).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "name,count\na,1\nb,99\nc,3\nd,4\n"
+        );
+        assert_eq!(store.dirty(), 0);
+        // The reopened file shows the written value, not a stale overlay.
+        assert_eq!(cell(&store.current_view, 1, 1).as_deref(), Some("99"));
+    }
+
+    #[test]
+    fn a_second_save_is_not_refused_by_our_own_first_one() {
+        let path = write_temp("twice.csv", SAMPLE);
+        let mut store = Store::open_file(&path, 10).unwrap();
+        store.edit([((0, 0), "x".to_string())]).unwrap();
+        store.save(None, false).unwrap();
+
+        store.edit([((1, 0), "y".to_string())]).unwrap();
+        store
+            .save(None, false)
+            .expect("the stamp must follow the write");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "name,count\nx,1\ny,2\nc,3\nd,4\n"
+        );
+    }
+
+    #[test]
+    fn a_file_changed_underneath_the_buffer_is_not_overwritten() {
+        let path = write_temp("stale.csv", SAMPLE);
+        let mut store = Store::open_file(&path, 10).unwrap();
+        store.edit([((0, 0), "x".to_string())]).unwrap();
+
+        std::fs::write(&path, "name,count\nz,9\n").unwrap();
+        let err = store.save(None, false).unwrap_err().to_string();
+        assert!(err.contains("changed on disk"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "name,count\nz,9\n");
+        assert_eq!(store.dirty(), 1, "the edit is still pending");
+    }
+
+    #[test]
+    fn writing_elsewhere_leaves_the_buffer_dirty() {
+        let path = write_temp("source.csv", SAMPLE);
+        let other = write_temp("copy.csv", "placeholder\n");
+        let mut store = Store::open_file(&path, 10).unwrap();
+        store.edit([((0, 0), "x".to_string())]).unwrap();
+        store.save(Some(&other), false).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&other).unwrap(),
+            "name,count\nx,1\nb,2\nc,3\nd,4\n"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), SAMPLE);
+        assert_eq!(store.dirty(), 1, ":w path does not save the source file");
     }
 }

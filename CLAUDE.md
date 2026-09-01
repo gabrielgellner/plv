@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`plv` is a terminal UI viewer for CSV, TSV and Parquet files, built with Rust. It uses [Polars](https://pola.rs/) for lazy data loading (larger-than-memory files) and [ratatui](https://ratatui.rs/) + crossterm for the TUI. The goal is a csvlens-like viewer with vim navigation.
+`plv` is a terminal UI viewer and editor for CSV, TSV and Parquet files, built with Rust. It uses [Polars](https://pola.rs/) for lazy data loading (larger-than-memory files) and [ratatui](https://ratatui.rs/) + crossterm for the TUI. The goal is a csvlens-like viewer with vim navigation.
 
 ## Commands
 
@@ -30,6 +30,8 @@ src/
   data/
     loader.rs     detect format by extension, return LazyFrame
     store.rs      scroll state + data fetching (Polars or lake-backed)
+    edit.rs       the edit buffer: a sparse overlay + undo history
+    writer.rs     splice edits back into the file, byte-preserving
     lake_db.rs    DuckLake access via DuckDB's ducklake extension
   ui/
     table.rs      DataTable widget: renders DataFrame as a table
@@ -40,7 +42,7 @@ src/
 
 **Data layer (`src/data/`)**
 - `loader.rs`: detects `.csv`, `.tsv`/`.tab`, `.txt` and `.parquet` by extension and opens a `LazyFrame`. Delimited text goes through `LazyCsvReader` with an explicit `with_separator`. `.txt` names no delimiter, so `sniff_delimiter()` picks one: it counts tab/comma/semicolon/pipe outside quoted spans on the first few lines and takes the candidate that occurs the same non-zero number of times on every line, falling back to a tab. Paths are converted to `PlRefPath` for the polars 0.53 API.
-- `store.rs`: `Store` owns the `LazyFrame` and tracks `row_offset`/`viewport_rows`. Every scroll calls `lf.clone().slice(offset, height).collect()` — only the visible rows are ever materialized. Also exposes `schema: SchemaRef` for column metadata.
+- `store.rs`: `Store` owns the `LazyFrame` and tracks `row_offset`/`viewport_rows`. Every scroll calls `lf.clone().slice(offset, height).collect()` — only the visible rows are ever materialized. Also exposes `schema: SchemaRef` for column metadata, and owns the edit `Overlay` (see below).
 
 **UI layer (`src/ui/`)**
 - `DataTable`: computes per-column display widths from the current view, determines which columns fit given the terminal width (starting from `col_offset`), then renders a ratatui `Table` with a row-number column on the left. Alternating row background.
@@ -51,6 +53,69 @@ src/
 - `run()`: loads the file into a `Store` sized to the terminal, then enters the event loop.
 - `draw()`: updates `store.viewport_rows` on resize, then renders `DataTable` + `StatusBar` (or an error/usage message if no file is loaded).
 - Vim key bindings: `j/k` (±1 row), `Ctrl+d/u` (half page), `g/G` (top/bottom), `h/l` (±1 column), `H` (leftmost column), `q` (quit). Arrow keys mirror `j/k/h/l`.
+
+## Editing
+
+Delimited text — `.csv`, `.tsv`, `.tab`, `.txt` — can be edited in place.
+Parquet and lake tables stay read-only: Parquet is genuinely typed, so a
+one-cell change means rewriting the whole file against a schema.
+
+**Edits live in a buffer, not in a frame.** A `LazyFrame` cannot be mutated, and
+collecting the file to edit it would throw away the larger-than-memory property
+exactly when it matters. So `data/edit.rs` holds an `Overlay`: a sparse
+`BTreeMap<row, BTreeMap<col, String>>` keyed by position in the *source file*,
+grouped by row because that is the shape both readers want — the renderer asks
+for a page, the writer walks records in order. Memory follows the number of
+edits, not the size of the file. `Store::fetch` stamps the overlay onto every
+page it returns, so no scroll path can forget it.
+
+Undo history is a stack of **transactions**, not single cells, so one fill over
+a visual selection is one `u`. `Overlay::clear()` drops the history with the
+edits: undoing past a write would resurrect changes the user believes they saved.
+
+**Values are text.** The file on disk is untyped; the types plv shows are
+Polars' inference over it. A column takes an edit by going through text and
+comes back typed if it can — typing `42` into a number is still a number — and
+only a value that genuinely does not fit leaves the column as text, with a
+warning. Note `strict_cast` and not `cast`: a plain cast turns an unparseable
+value into a *null*, silently swallowing the edit.
+
+**Writing splices bytes** (`data/writer.rs`). Re-serializing the frame would
+reformat every line — float formatting, quoting style, nulls vs empty strings —
+turning a one-cell change into a whole-file diff. Instead a byte-at-a-time
+RFC 4180 scanner streams the original through and substitutes only the edited
+fields, so quoting, line endings, a BOM, a missing final newline and every
+untouched line survive exactly. It is O(1) in memory, for the same reason the
+read path is lazy.
+
+Two guards run before the rename: the record count must match the view's row
+count, and every edit must have found a field to land in (which catches ragged
+rows). The output is fsynced beside the target and moved into place, so a failed
+write leaves the original intact. An open-time `Stamp` (length + mtime) refuses a
+write to a file that changed underneath the buffer; `:w!` forces.
+
+**Polars does not skip blank lines** — it reads an empty line as a row of nulls,
+trailing ones included — so every line ending closes a record in the writer too.
+Getting this wrong puts edits one line off; `record_numbering_agrees_with_the_polars_reader`
+pins it against the real reader rather than against the assumption.
+
+**Editing is refused on a sorted view**, because a sorted page's rows are not the
+file's rows and an edit could not be told which line it belongs to.
+`Store::edit_blocked()` returns the reason as a string, so the rule and its
+explanation cannot drift apart.
+
+**Keys.** `i`/`a`/`c` open a cell (caret at the front, at the end, or empty), `x`
+clears it, `u`/`Ctrl+r` undo and redo, `y`/`p` yank and paste through an internal
+register (no system clipboard). `v` starts a visual selection whose shape follows
+the `Tab` mode — whole rows, whole columns, or a rectangle. Over a selection `c`
+replaces every cell while `i` and `a` prepend and append to what is already
+there, following vim's blockwise `I` and `A`; those two read the block first, so
+they see rows below the viewport. Block operators are capped at `MAX_BLOCK` cells,
+because a column-mode selection covers every row in the file.
+
+`:` opens an ex line: `:w`, `:w!`, `:w path`, `:q`, `:q!`, `:wq`, `:x`. Bare `q`
+and `:q` refuse while edits are unwritten. The status bar carries a `[+n]` count
+and edited cells render in red.
 
 ## Polars 0.53 API notes
 

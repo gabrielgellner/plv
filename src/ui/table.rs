@@ -37,6 +37,10 @@ pub struct DataTable<'a> {
     pub sort: &'a [(usize, bool)],
     /// `Some(tick)` while a background sort is in progress; drives the header animation.
     pub sort_tick: Option<usize>,
+    /// Cells with an unwritten edit, as `(row within the page, column index)`.
+    pub edited: &'a [(usize, usize)],
+    /// The visual selection, as absolute inclusive `(row range, column range)`.
+    pub selection: Option<((usize, usize), (usize, usize))>,
 }
 
 /// Dynamic row number column width based on the current viewport position.
@@ -89,14 +93,25 @@ fn redistribute(mut widths: Vec<usize>, naturals: &[usize], slack: usize) -> Vec
 
 /// Split `text` into styled spans, highlighting regex match ranges.
 /// The `base_style` is applied to non-matching text; `match_style` to matches.
-fn highlight_cell(text: &str, state: &SearchState, base_style: Style, match_style: Style) -> Line<'static> {
+fn highlight_cell(
+    text: &str,
+    state: &SearchState,
+    base_style: Style,
+    match_style: Style,
+) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut last = 0;
     for mat in state.query.regex.find_iter(text) {
         if mat.start() > last {
-            spans.push(Span::styled(text[last..mat.start()].to_string(), base_style));
+            spans.push(Span::styled(
+                text[last..mat.start()].to_string(),
+                base_style,
+            ));
         }
-        spans.push(Span::styled(text[mat.start()..mat.end()].to_string(), match_style));
+        spans.push(Span::styled(
+            text[mat.start()..mat.end()].to_string(),
+            match_style,
+        ));
         last = mat.end();
     }
     if last < text.len() {
@@ -155,8 +170,7 @@ impl Widget for DataTable<'_> {
         let final_widths = redistribute(capped, &vis_naturals, slack);
 
         // Actual pixels used by full columns (excluding the filler slot).
-        let used: usize =
-            row_num_w + final_widths.iter().map(|w| sp + w).sum::<usize>();
+        let used: usize = row_num_w + final_widths.iter().map(|w| sp + w).sum::<usize>();
 
         // Remaining space for a partial right-edge column.
         let remaining = inner_w.saturating_sub(used);
@@ -191,11 +205,20 @@ impl Widget for DataTable<'_> {
         let mut header_cells = vec![Cell::new(rn_hdr).style(hdr_style)];
 
         for (idx, &ci) in vis_cols.iter().enumerate() {
-            let is_cursor_col =
-                matches!(self.selection_mode, SelectionMode::Column | SelectionMode::Cell)
-                    && ci == self.cursor_col;
-            let cell_style = if is_cursor_col { col_hdr_style } else { hdr_style };
-            let fg = if is_cursor_col { self.theme.col_cursor_fg } else { self.theme.header };
+            let is_cursor_col = matches!(
+                self.selection_mode,
+                SelectionMode::Column | SelectionMode::Cell
+            ) && ci == self.cursor_col;
+            let cell_style = if is_cursor_col {
+                col_hdr_style
+            } else {
+                hdr_style
+            };
+            let fg = if is_cursor_col {
+                self.theme.col_cursor_fg
+            } else {
+                self.theme.header
+            };
 
             let sort_entry = self.sort.iter().enumerate().find(|(_, key)| key.0 == ci);
 
@@ -209,9 +232,14 @@ impl Widget for DataTable<'_> {
                 let name = truncate(cols[ci].name().as_str(), avail);
 
                 let bold_pos = (tick / 3) % 3; // 0="[", 1=arrow, 2="]"
-                let active = Style::new().fg(fg).bold().add_modifier(Modifier::UNDERLINED);
-                let quiet =
-                    Style::new().fg(fg).add_modifier(Modifier::UNDERLINED).remove_modifier(Modifier::BOLD);
+                let active = Style::new()
+                    .fg(fg)
+                    .bold()
+                    .add_modifier(Modifier::UNDERLINED);
+                let quiet = Style::new()
+                    .fg(fg)
+                    .add_modifier(Modifier::UNDERLINED)
+                    .remove_modifier(Modifier::BOLD);
 
                 let spans = vec![
                     Span::styled(format!("{:>width$}{}", "", name, width = sp), cell_style),
@@ -255,9 +283,15 @@ impl Widget for DataTable<'_> {
 
         // ── Data rows ────────────────────────────────────────────────────
         let match_style = Style::new().bg(self.theme.match_bg).fg(self.theme.match_fg);
-        let cursor_style = Style::new().bg(self.theme.cursor_bg).fg(self.theme.cursor_fg);
-        let col_cursor_style =
-            Style::new().bg(self.theme.col_cursor_bg).fg(self.theme.col_cursor_fg);
+        let cursor_style = Style::new()
+            .bg(self.theme.cursor_bg)
+            .fg(self.theme.cursor_fg);
+        let col_cursor_style = Style::new()
+            .bg(self.theme.col_cursor_bg)
+            .fg(self.theme.col_cursor_fg);
+        let selection_style = Style::new()
+            .bg(self.theme.selection_bg)
+            .fg(self.theme.selection_fg);
 
         // Absolute row index of the currently selected search match (if any).
         let current_match_row = self.search.and_then(|s| s.current_row());
@@ -283,10 +317,27 @@ impl Widget for DataTable<'_> {
                 //   2. Cursor position row        → cursor_style (same, so j/k are visible)
                 //   3. Selected column            → col_cursor_style
                 //   4. Everything else            → default
+                // A visual selection sits *under* the cursor highlights, so
+                // the cursor stays findable inside its own selection.
+                let unselected = |ci: usize| -> Style {
+                    let inside = self.selection.is_some_and(|((r0, r1), (c0, c1))| {
+                        (r0..=r1).contains(&abs_row) && (c0..=c1).contains(&ci)
+                    });
+                    if inside {
+                        selection_style
+                    } else {
+                        Style::default()
+                    }
+                };
+
                 let cell_style = |ci: usize| -> Style {
                     match self.selection_mode {
                         SelectionMode::Row => {
-                            if is_cursor { cursor_style } else { Style::default() }
+                            if is_cursor {
+                                cursor_style
+                            } else {
+                                unselected(ci)
+                            }
                         }
                         SelectionMode::Column => {
                             if is_match_row || is_cursor {
@@ -294,19 +345,18 @@ impl Widget for DataTable<'_> {
                             } else if ci == self.cursor_col {
                                 col_cursor_style
                             } else {
-                                Style::default()
+                                unselected(ci)
                             }
                         }
                         SelectionMode::Cell => {
                             if is_cursor && ci == self.cursor_col {
                                 cursor_style
                             } else {
-                                Style::default()
+                                unselected(ci)
                             }
                         }
                     }
                 };
-
 
                 // Row number with │ vertical separator at the right edge of slot.
                 let rn_str = format!("{:>w$}│", abs_row + 1, w = row_num_w - 1);
@@ -318,10 +368,25 @@ impl Widget for DataTable<'_> {
                         Err(_) => "null".to_string(),
                     };
                     let cs = cell_style(ci);
+                    // Call out an unwritten edit, so the state of the buffer is
+                    // visible in the grid and not only as a count in the status
+                    // bar. Foreground only, so it layers over the cursor and the
+                    // alternating row backgrounds rather than replacing them.
+                    let cs = if self.edited.contains(&(ri, ci)) {
+                        cs.fg(self.theme.edited_fg).add_modifier(Modifier::BOLD)
+                    } else {
+                        cs
+                    };
                     // Scope highlights to the searched column when set.
                     let search = match self.search_col {
                         None => self.search,
-                        Some(sc) => if ci == sc { self.search } else { None },
+                        Some(sc) => {
+                            if ci == sc {
+                                self.search
+                            } else {
+                                None
+                            }
+                        }
                     };
 
                     let cell = if let Some(s) = search {
@@ -351,7 +416,13 @@ impl Widget for DataTable<'_> {
                     let cs = cell_style(next_col_idx);
                     let search = match self.search_col {
                         None => self.search,
-                        Some(sc) => if next_col_idx == sc { self.search } else { None },
+                        Some(sc) => {
+                            if next_col_idx == sc {
+                                self.search
+                            } else {
+                                None
+                            }
+                        }
                     };
                     let cell = if let Some(s) = search {
                         Cell::new(highlight_cell(&display, s, cs, match_style)).style(cs)

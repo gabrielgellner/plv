@@ -126,7 +126,14 @@ impl Lake {
 
     pub fn headers(&self) -> &'static [&'static str] {
         match self.level {
-            Level::Tables => &["Table", "Rows", "Size", "Files", "Partitioned by", "Deletes"],
+            Level::Tables => &[
+                "Table",
+                "Rows",
+                "Size",
+                "Files",
+                "Partitioned by",
+                "Deletes",
+            ],
             Level::Partitions { .. } => &["Partition", "Rows", "Share"],
             Level::Snapshots => &["", "Snapshot", "Time", "Schema", "Changes"],
         }
