@@ -33,6 +33,8 @@ src/
     edit.rs       the edit buffer: a sparse overlay + undo history
     writer.rs     splice edits back into the file, byte-preserving
     lake_db.rs    DuckLake access via DuckDB's ducklake extension
+    rows.rs       row sets: which rows a :filter matched, and paging by index
+  view.rs         the view language: parse and check :select/:filter/:sort
   ui/
     table.rs      DataTable widget: renders DataFrame as a table
     browser.rs    Browser widget + cursor/scroll state for catalog lists
@@ -119,6 +121,61 @@ because a column-mode selection covers every row in the file.
 `:` opens an ex line: `:w`, `:w!`, `:w path`, `:q`, `:q!`, `:wq`, `:x`. Bare `q`
 and `:q` refuse while edits are unwritten. The status bar carries a `[+n]` count
 and edited cells render in red.
+
+## The view language (`src/view.rs`)
+
+`:select`, `:hide`, `:filter` and `:sort` shape what the viewer shows. The
+module parses and checks; nothing in it touches a `LazyFrame`.
+
+**Validation happens when the line is typed, not when the frame collects.**
+Polars is lazy, so `filter count > abc` does not fail where it was written — it
+fails inside a later `collect`, as a query-planner error naming nodes the user
+never typed. The schema is in hand at the prompt, so column names resolve to
+indices there (which also settles duplicate names) and literals are checked
+against the column's dtype there. Errors carry the byte span of the word that
+caused them, so the prompt can underline it.
+
+**The view is state, not a pipeline.** Each command replaces its own slot, so
+`:select a b` then `:select c` shows `c` rather than trying to select `c` from a
+frame already narrowed to `a b`. `:hide` writes to the same slot `:select` does.
+`Store::sort` already worked this way.
+
+Evaluation order is fixed independently of the order commands were typed:
+**filter → sort → select**, as in SQL, so a filter or sort can name a column
+that is not on show.
+
+**`:filter` does not go into the frame.** Polars pushes a projection into the
+scan and lets the slice follow it down, but a filter stops the slice pushdown
+dead — measured on a 400k-row CSV, the first page costs 18ms unfiltered and
+101ms filtered, and that gap grows with the file rather than staying put,
+because a filtered slice reads everything whatever offset it is asked for.
+Scrolling would pay it on every keypress.
+
+So a filter is resolved once into the sorted set of source rows it matches
+(`data/rows.rs`), and paging becomes a gather: read the span the page covers,
+take the wanted rows out of it. `Store::scan_rows` is the chunked background
+scan, shared with `/` search — both ask the same question of the file and both
+want the answer progressively. It buys a real row count, cancellation, and row
+identity, which is what lets the edit buffer survive a filter: a row picked out
+of a filtered view still knows which line of the file it came from.
+
+A filter and a sort are refused together for now: a sort puts the rows in an
+order the source row numbers no longer describe, so the set would have to be
+rebuilt on every sort.
+
+`Store` holds the `View` and converts at its own boundary: **its indices are
+source columns, everything above it counts display positions.** `source_column`
+/ `display_column` and `source_row` / `display_row` are the crossing points,
+and the edit overlay goes through them in both directions — an edit typed into a reordered view is stored against
+the file's column, and an edit on a column the view hides stays pending and is
+still written by `:w`, it just has nowhere on screen to be marked.
+
+Grammar, deliberately closed: `~` and `!~` are regex and read any column as text
+(as `/` search does); other comparisons require a literal matching the column's
+type; an empty literal `""` means the cells with nothing in them, matching how
+plv renders and writes empty fields elsewhere. Conditions join with `and` only —
+no `or` and no parentheses, because precedence cannot be introduced later
+without changing what already-written commands mean.
 
 ## Polars 0.53 API notes
 

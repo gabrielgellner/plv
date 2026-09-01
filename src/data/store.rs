@@ -10,7 +10,9 @@ use polars::prelude::*;
 use crate::data::edit::{Cell, Overlay};
 use crate::data::lake_db::{self, LakeSource};
 use crate::data::loader;
+use crate::data::rows::{self, RowSet};
 use crate::data::writer::{self, Stamp};
+use crate::view::View;
 
 /// Where a store's rows come from.
 ///
@@ -45,14 +47,20 @@ pub struct Store {
     pub row_offset: usize,
     pub viewport_rows: usize,
     pub current_view: DataFrame,
-    /// Active sort keys in priority order: `(column_index, ascending)`.
-    /// Empty = natural order. First entry is the primary sort key.
-    pub sort: Vec<(usize, bool)>,
+    /// What the viewer is showing: which columns, in what order, sorted how.
+    ///
+    /// Its indices are **source** columns, matching `schema`. Everything above
+    /// this layer counts in *display* positions instead, and `Store` converts
+    /// at its own boundary — see [`Store::source_column`].
+    pub view: View,
     /// Present when the rows came from a delimited text file, which is the
     /// only kind plv can write back.
     edit: Option<EditTarget>,
     /// Edits made but not yet written, keyed by position in the source file.
     overlay: Overlay,
+    /// The rows a `:filter` matched, when one is active. Present means the
+    /// viewer is paging through this set rather than through the file.
+    filter_rows: Option<RowSet>,
 }
 
 impl Store {
@@ -81,9 +89,10 @@ impl Store {
             row_offset: 0,
             viewport_rows,
             current_view,
-            sort: Vec::new(),
+            view: View::default(),
             edit: None,
             overlay: Overlay::new(),
+            filter_rows: None,
         })
     }
 
@@ -131,15 +140,101 @@ impl Store {
             row_offset: 0,
             viewport_rows,
             current_view,
-            sort: Vec::new(),
+            view: View::default(),
             edit: None,
             overlay: Overlay::new(),
+            filter_rows: None,
         })
+    }
+
+    // ── rows: a filter replaces the row space ────────────────────────────
+
+    /// Rows on show. Not `total_rows`, which stays the file's own count —
+    /// the writer needs that to check it is looking at the same file.
+    pub fn row_count(&self) -> usize {
+        match &self.filter_rows {
+            Some(set) => set.len(),
+            None => self.total_rows,
+        }
+    }
+
+    /// The source row behind a display position.
+    pub fn source_row(&self, display: usize) -> Option<usize> {
+        match &self.filter_rows {
+            Some(set) => set.source(display),
+            None => (display < self.total_rows).then_some(display),
+        }
+    }
+
+    /// Where a source row appears, if it survived the filter.
+    pub fn display_row(&self, source: usize) -> Option<usize> {
+        match &self.filter_rows {
+            Some(set) => set.display(source),
+            None => (source < self.total_rows).then_some(source),
+        }
+    }
+
+    /// Whether a filter is still scanning, for the spinner.
+    pub fn filtering(&self) -> bool {
+        self.filter_rows
+            .as_ref()
+            .is_some_and(|set| !set.is_complete())
+    }
+
+    // ── columns: source indices below, display positions above ───────────
+
+    /// Source column indices, in the order they are shown.
+    pub fn columns(&self) -> Vec<usize> {
+        self.view.columns(self.schema.len())
+    }
+
+    /// How many columns are on show. Not `schema.len()` once a view narrows
+    /// the frame — that is the file's column count, a different question.
+    pub fn column_count(&self) -> usize {
+        self.view
+            .select
+            .as_ref()
+            .map_or_else(|| self.schema.len(), Vec::len)
+    }
+
+    /// The source column behind a display position.
+    pub fn source_column(&self, display: usize) -> Option<usize> {
+        match &self.view.select {
+            Some(cols) => cols.get(display).copied(),
+            None => (display < self.schema.len()).then_some(display),
+        }
+    }
+
+    /// Where a source column appears, if it is on show at all.
+    pub fn display_column(&self, source: usize) -> Option<usize> {
+        match &self.view.select {
+            Some(cols) => cols.iter().position(|&c| c == source),
+            None => (source < self.schema.len()).then_some(source),
+        }
+    }
+
+    /// Name and type of the column at a display position.
+    pub fn column_info(&self, display: usize) -> Option<(String, DataType)> {
+        let source = self.source_column(display)?;
+        self.schema
+            .get_at_index(source)
+            .map(|(name, dtype)| (name.to_string(), dtype.clone()))
+    }
+
+    /// Sort keys as display positions, for the header indicators. A key on a
+    /// column the view has hidden simply does not appear.
+    pub fn sort_display(&self) -> Vec<(usize, bool)> {
+        self.view
+            .sort
+            .iter()
+            .filter_map(|&(source, asc)| self.display_column(source).map(|d| (d, asc)))
+            .collect()
     }
 
     /// Sort keys as `(column_name, ascending)`, dropping any stale indices.
     fn sort_keys(&self) -> Vec<(String, bool)> {
-        self.sort
+        self.view
+            .sort
             .iter()
             .filter_map(|&(ci, asc)| {
                 self.schema
@@ -149,28 +244,72 @@ impl Store {
             .collect()
     }
 
-    /// Effective lazy frame: base with all sort keys applied in priority order.
+    /// The frame the viewer actually reads: the base with the view composed
+    /// onto it.
+    ///
+    /// The order is fixed and does not follow the order the commands were
+    /// typed — **sort, then projection**, as in SQL — so a sort can name a
+    /// column the view is not showing. Filtering will join the front of the
+    /// same pipeline, but through a row-index set rather than here: a filter
+    /// stops Polars pushing the slice down into the scan, which would turn
+    /// every keypress into a full read of the file.
     fn effective_lf(&self) -> Option<LazyFrame> {
         let Source::Lazy(base) = &self.source else {
             return None;
         };
+        let mut lf = base.clone();
+
         let keys = self.sort_keys();
-        if keys.is_empty() {
-            return Some(base.clone());
+        if !keys.is_empty() {
+            let (names, descending): (Vec<String>, Vec<bool>) =
+                keys.into_iter().map(|(name, asc)| (name, !asc)).unzip();
+            lf = lf.sort(
+                names,
+                SortMultipleOptions::default().with_order_descending_multi(descending),
+            );
         }
-        let (names, descending): (Vec<String>, Vec<bool>) =
-            keys.into_iter().map(|(name, asc)| (name, !asc)).unzip();
-        Some(base.clone().sort(
-            names,
-            SortMultipleOptions::default().with_order_descending_multi(descending),
-        ))
+
+        if self.view.select.is_some() {
+            let shown: Vec<Expr> = self
+                .columns()
+                .into_iter()
+                .filter_map(|source| self.schema.get_at_index(source))
+                .map(|(name, _)| col(name.as_str()))
+                .collect();
+            if !shown.is_empty() {
+                lf = lf.select(shown);
+            }
+        }
+        Some(lf)
+    }
+
+    /// Adopt a new view, keeping the old one if the new one will not collect.
+    ///
+    /// The command was already checked against the schema when it was typed;
+    /// what can still fail is the frame. A viewer showing an error instead of
+    /// data because of one mistyped command would be worse than a refusal.
+    pub fn apply_view(&mut self, view: View) -> Result<()> {
+        let previous = std::mem::replace(&mut self.view, view);
+        match self.fetch(self.row_offset, self.viewport_rows) {
+            Ok(df) => {
+                self.current_view = df;
+                Ok(())
+            }
+            Err(e) => {
+                self.view = previous;
+                Err(e)
+            }
+        }
     }
 
     fn fetch(&self, offset: usize, height: usize) -> Result<DataFrame> {
         let df = match &self.source {
             Source::Lazy(_) => {
                 let lf = self.effective_lf().expect("lazy source");
-                Self::fetch_lazy(&lf, offset, height)
+                match &self.filter_rows {
+                    Some(set) => Self::gather(&lf, set, offset, height),
+                    None => Self::fetch_lazy(&lf, offset, height),
+                }
             }
             Source::Lake(query) => lake_db::page_with(
                 &query.conn,
@@ -183,19 +322,42 @@ impl Store {
         self.apply_overlay(df, offset)
     }
 
+    /// A page picked out of the frame by row index.
+    ///
+    /// Reads the span the page covers and takes the wanted rows from it. The
+    /// span is the unavoidable part — those rows have to be read — and Polars
+    /// still pushes that slice into the scan, so it costs what scrolling to
+    /// the same point unfiltered would.
+    fn gather(lf: &LazyFrame, set: &RowSet, offset: usize, height: usize) -> Result<DataFrame> {
+        let page = set.page(offset, height);
+        let (Some(&first), Some(&last)) = (page.first(), page.last()) else {
+            // No rows, but the caller still needs the right columns.
+            return Ok(lf.clone().slice(0, 0).collect()?);
+        };
+        let df = lf
+            .clone()
+            .slice(first as i64, (last - first + 1) as u32)
+            .collect()?;
+        let wanted: Vec<IdxSize> = page.iter().map(|&row| (row - first) as IdxSize).collect();
+        Ok(df.take(&IdxCa::from_vec(PlSmallStr::from_static("i"), wanted))?)
+    }
+
     /// Toggle sort direction on `col_idx`, or add it as a new ascending sort key.
     /// Updates sort state immediately and spawns a background thread to fetch
     /// the new first page. The caller should replace `current_view` when the
     /// DataFrame arrives on the returned receiver.
-    pub fn begin_sort(&mut self, col_idx: usize) -> mpsc::Receiver<DataFrame> {
-        if let Some(entry) = self.sort.iter_mut().find(|(ci, _)| *ci == col_idx) {
+    pub fn begin_sort(&mut self, display_col: usize) -> mpsc::Receiver<DataFrame> {
+        let (tx, rx) = mpsc::channel();
+        let Some(source_col) = self.source_column(display_col) else {
+            return rx;
+        };
+        if let Some(entry) = self.view.sort.iter_mut().find(|(ci, _)| *ci == source_col) {
             entry.1 = !entry.1;
         } else {
-            self.sort.push((col_idx, true));
+            self.view.sort.push((source_col, true));
         }
         self.row_offset = 0;
         let vp = self.viewport_rows;
-        let (tx, rx) = mpsc::channel();
 
         match &self.source {
             Source::Lazy(_) => {
@@ -226,14 +388,14 @@ impl Store {
 
     /// Clear all sort keys and return to natural order.
     pub fn clear_sort(&mut self) -> Result<()> {
-        self.sort.clear();
+        self.view.sort.clear();
         self.row_offset = 0;
         self.current_view = self.fetch(0, self.viewport_rows)?;
         Ok(())
     }
 
     pub fn scroll_to_offset(&mut self, offset: usize) -> Result<()> {
-        let max = self.total_rows.saturating_sub(self.viewport_rows);
+        let max = self.row_count().saturating_sub(self.viewport_rows);
         self.row_offset = offset.min(max);
         self.current_view = self.fetch(self.row_offset, self.viewport_rows)?;
         Ok(())
@@ -266,7 +428,7 @@ impl Store {
                 Source::Lazy(_) => "only csv, tsv, tab and txt files can be edited",
             });
         }
-        if !self.sort.is_empty() {
+        if !self.view.sort.is_empty() {
             // A sorted page's rows are not the file's rows, so an edit could
             // not be told which line it belongs to.
             return Some("cannot edit a sorted view — clear the sort first");
@@ -301,10 +463,21 @@ impl Store {
         self.overlay.len()
     }
 
-    /// Apply `edits` — each keyed by row in the *source file* and column index
-    /// — as a single undoable change.
+    /// Apply `edits` as a single undoable change. Both coordinates are
+    /// display positions.
     pub fn edit<I: IntoIterator<Item = (Cell, String)>>(&mut self, edits: I) -> Result<()> {
-        self.overlay.set(edits);
+        // Cells arrive in display coordinates, as everything above this layer
+        // counts them, and are stored against source columns — so an edit made
+        // through a narrowed or reordered view still lands on the right field
+        // of the file.
+        let mapped: Vec<(Cell, String)> = edits
+            .into_iter()
+            .filter_map(|((row, display), value)| {
+                let cell = (self.source_row(row)?, self.source_column(display)?);
+                Some((cell, value))
+            })
+            .collect();
+        self.overlay.set(mapped);
         self.refresh()
     }
 
@@ -390,13 +563,17 @@ impl Store {
         }
         let height = df.height();
 
+        // Keyed by display position: the overlay stores source columns, and a
+        // view can reorder them, hide them, or both.
         let mut by_column: BTreeMap<usize, Vec<(usize, &str)>> = BTreeMap::new();
         for (local, cells) in self.edits_in_page(offset, height) {
-            for (&col, value) in cells {
-                by_column
-                    .entry(col)
-                    .or_default()
-                    .push((local, value.as_str()));
+            for (&source, value) in cells {
+                if let Some(display) = self.display_column(source) {
+                    by_column
+                        .entry(display)
+                        .or_default()
+                        .push((local, value.as_str()));
+                }
             }
         }
 
@@ -453,14 +630,14 @@ impl Store {
         offset: usize,
         height: usize,
     ) -> impl Iterator<Item = (usize, &BTreeMap<usize, String>)> {
-        self.overlay
-            .rows()
-            .skip_while(move |&(row, _)| row < offset)
-            // Rows ascend, so the first one past the page ends the search.
-            .map_while(move |(row, cells)| {
-                let local = row - offset;
-                (local < height).then_some((local, cells))
-            })
+        // Every edit is considered rather than the run between two offsets: a
+        // filter can drop rows from between them, so "past the page" is no
+        // longer something the source row number can be asked directly. There
+        // are few edits and one page, so this is cheap either way.
+        self.overlay.rows().filter_map(move |(source, cells)| {
+            let local = self.display_row(source)?.checked_sub(offset)?;
+            (local < height).then_some((local, cells))
+        })
     }
 
     /// The displayed text of every cell in a block, pending edits included.
@@ -503,10 +680,16 @@ impl Store {
     }
 
     /// Pending edits inside the current page, as `(row within the page,
-    /// column index)` — what the table needs in order to mark them.
+    /// display position)` — what the table needs in order to mark them. Edits
+    /// on a column the view has hidden are not reported: there is nowhere on
+    /// screen to report them.
     pub fn edited_cells(&self) -> Vec<(usize, usize)> {
         self.edits_in_page(self.row_offset, self.current_view.height())
-            .flat_map(|(local, cells)| cells.keys().map(move |&col| (local, col)))
+            .flat_map(|(local, cells)| {
+                cells
+                    .keys()
+                    .filter_map(move |&source| Some((local, self.display_column(source)?)))
+            })
             .collect()
     }
 
@@ -592,29 +775,34 @@ impl Store {
             return;
         };
         let schema = self.schema.clone();
-        let total = self.total_rows;
-
-        thread::spawn(move || {
-            // Build the filter expression inside the thread so no non-Send Expr
-            // crosses a thread boundary.
-            let filter = if let Some(ref name) = col_name {
-                col(name.as_str())
-                    .cast(DataType::String)
-                    .str()
-                    .contains(lit(pattern.as_str()), false)
-            } else {
-                let f = schema
+        Self::scan_rows(lf, self.total_rows, tx, move || {
+            // Built inside the thread: an `Expr` is not `Send`.
+            match col_name {
+                Some(name) => Some(matches_pattern(&name, &pattern)),
+                None => schema
                     .iter_names()
-                    .map(|name| {
-                        col(name.as_str())
-                            .cast(DataType::String)
-                            .str()
-                            .contains(lit(pattern.as_str()), false)
-                    })
-                    .reduce(|acc: Expr, e: Expr| acc.or(e));
-                let Some(f) = f else { return };
-                f
-            };
+                    .map(|name| matches_pattern(name.as_str(), &pattern))
+                    .reduce(Expr::or),
+            }
+        });
+    }
+
+    /// Scan `lf` in chunks, streaming the absolute indices of the rows an
+    /// expression keeps.
+    ///
+    /// Shared by `/` search and `:filter`: both ask the same question of the
+    /// file, and both want the answer progressively rather than all at once,
+    /// because on a large file "all at once" means a frozen viewer.
+    ///
+    /// `build` runs on the worker thread — `Expr` is not `Send`, so the
+    /// expression cannot be handed across. Dropping the receiver cancels the
+    /// scan; the thread notices on its next send.
+    fn scan_rows<F>(lf: LazyFrame, total: usize, tx: mpsc::Sender<Vec<usize>>, build: F)
+    where
+        F: FnOnce() -> Option<Expr> + Send + 'static,
+    {
+        thread::spawn(move || {
+            let Some(predicate) = build() else { return };
 
             const CHUNK: usize = 10_000;
             let mut offset = 0usize;
@@ -626,7 +814,7 @@ impl Store {
                     .clone()
                     .slice(offset as i64, size as u32)
                     .with_row_index("__idx__", Some(offset as u32))
-                    .filter(filter.clone())
+                    .filter(predicate.clone())
                     .select([col("__idx__")])
                     .collect()
                 else {
@@ -641,22 +829,79 @@ impl Store {
                     .unwrap_or_default();
 
                 if !rows.is_empty() && tx.send(rows).is_err() {
-                    return; // receiver dropped — search cancelled
+                    return; // receiver dropped — cancelled
                 }
 
                 offset += CHUNK;
 
-                // Yield between chunks so the main thread's scroll queries
-                // can interleave with the background search without lag.
+                // Yield between chunks so the main thread's scroll queries can
+                // interleave without lag.
                 yield_now();
             }
         });
+    }
+
+    /// Bring the filtered row set in line with the view.
+    ///
+    /// Returns a receiver of matching-row batches when a scan has started.
+    /// `None` means there is nothing to filter by and the whole file is on
+    /// show again.
+    pub fn begin_filter(&mut self) -> Result<Option<mpsc::Receiver<Vec<usize>>>> {
+        let Some(filter) = self.view.filter.clone() else {
+            self.filter_rows = None;
+            self.row_offset = 0;
+            self.refresh()?;
+            return Ok(None);
+        };
+        let Source::Lazy(base) = &self.source else {
+            return Ok(None);
+        };
+
+        // The scan runs on the base frame, so the indices it reports are the
+        // file's own rows. That is what makes them usable as edit-buffer keys.
+        let lf = base.clone();
+        let schema = self.schema.clone();
+        let (tx, rx) = mpsc::channel();
+
+        self.filter_rows = Some(RowSet::new());
+        self.row_offset = 0;
+        self.refresh()?;
+
+        Self::scan_rows(lf, self.total_rows, tx, move || {
+            rows::predicate(&filter, &schema)
+        });
+        Ok(Some(rx))
+    }
+
+    /// Take a batch of matching rows from the scan.
+    pub fn extend_filter(&mut self, batch: Vec<usize>) -> Result<()> {
+        if let Some(set) = &mut self.filter_rows {
+            set.extend(batch);
+        }
+        self.refresh()
+    }
+
+    /// The scan has run out; what is here is all of it.
+    pub fn finish_filter(&mut self) -> Result<()> {
+        if let Some(set) = &mut self.filter_rows {
+            set.finish();
+        }
+        self.refresh()
     }
 
     fn count_rows(lf: &LazyFrame) -> Result<usize> {
         let df = lf.clone().select([len().alias("n")]).collect()?;
         Ok(df.column("n")?.u32()?.get(0).unwrap_or(0) as usize)
     }
+}
+
+/// A column rendered as text and matched against a pattern — how `/` search
+/// reads every column, and how `~` reads one.
+fn matches_pattern(column: &str, pattern: &str) -> Expr {
+    col(column)
+        .cast(DataType::String)
+        .str()
+        .contains(lit(pattern), false)
 }
 
 #[cfg(test)]
