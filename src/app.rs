@@ -479,6 +479,7 @@ impl App {
             (":select a b", "Show only these columns"),
             (":hide a b", "Drop these columns"),
             (":sort a b-", "Sort by columns, `-` for descending"),
+            (":select   :sort", "The verb alone puts it back"),
             (":reset [slot]", "Clear select, filter, sort, or all"),
         ];
         const VISUAL: &[(&str, &str)] = &[
@@ -2533,6 +2534,21 @@ mod tests {
         assert_eq!(shown_columns(&app), ["b"]);
 
         command(&mut app, "reset");
+        assert_eq!(shown_columns(&app), ["a", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn a_bare_select_puts_the_columns_back() {
+        let mut app = app_sized("bareselect.csv", FOURCOL, 60);
+        command(&mut app, "select c");
+        assert_eq!(shown_columns(&app), ["c"]);
+
+        command(&mut app, "select");
+        assert_eq!(shown_columns(&app), ["a", "b", "c", "d"]);
+        assert!(app.message.is_none(), "no complaint: {:?}", app.message);
+
+        command(&mut app, "hide a");
+        command(&mut app, "select *");
         assert_eq!(shown_columns(&app), ["a", "b", "c", "d"]);
     }
 

@@ -322,7 +322,18 @@ pub fn parse(line: &str, schema: &Schema) -> Result<Command, ParseError> {
         return Err(ParseError::new("nothing to do", 0..0));
     };
 
+    // A verb with nothing after it undoes itself. `:select` is where the hand
+    // goes to put the columns back, and no other reading of it is useful —
+    // selecting nothing is refused anyway.
+    if args.is_empty() {
+        if let Some(slot) = slot_of(verb.text) {
+            return Ok(Command::Reset(Some(slot)));
+        }
+    }
+
     match verb.text {
+        // `*` is the same thing said out loud, for anyone who reaches for SQL.
+        "select" if is_star(args) => Ok(Command::Reset(Some(Slot::Select))),
         "select" => Ok(Command::Select(columns(args, schema, verb, "select")?)),
         "hide" => Ok(Command::Hide(columns(args, schema, verb, "hide")?)),
         "sort" => parse_sort(args, schema, verb),
@@ -333,6 +344,21 @@ pub fn parse(line: &str, schema: &Schema) -> Result<Command, ParseError> {
             verb.span.clone(),
         )),
     }
+}
+
+/// The slot a verb writes to, for the bare form that clears it. `hide` narrows
+/// what `select` shows, so it clears the same slot.
+fn slot_of(verb: &str) -> Option<Slot> {
+    Some(match verb {
+        "select" | "hide" => Slot::Select,
+        "filter" => Slot::Filter,
+        "sort" => Slot::Sort,
+        _ => return None,
+    })
+}
+
+fn is_star(args: &[Token<'_>]) -> bool {
+    matches!(args, [only] if !only.quoted && only.text == "*")
 }
 
 /// A non-empty list of columns, each resolved to its index.
@@ -647,9 +673,15 @@ mod tests {
     }
 
     #[test]
-    fn a_column_list_cannot_be_empty() {
-        assert!(err("select").message.contains("at least one column"));
-        assert!(err("hide").message.contains("at least one column"));
+    fn a_bare_verb_clears_what_it_set() {
+        assert!(matches!(ok("select"), Command::Reset(Some(Slot::Select))));
+        assert!(matches!(ok("select *"), Command::Reset(Some(Slot::Select))));
+        assert!(matches!(ok("hide"), Command::Reset(Some(Slot::Select))));
+        assert!(matches!(ok("sort"), Command::Reset(Some(Slot::Sort))));
+        assert!(matches!(ok("filter"), Command::Reset(Some(Slot::Filter))));
+
+        // A column really called `*` is still reachable.
+        assert!(err(r#"select "*""#).message.contains("no column"));
     }
 
     // ── sort ─────────────────────────────────────────────────────────────
@@ -753,7 +785,6 @@ mod tests {
 
     #[test]
     fn a_malformed_condition_says_what_the_shape_should_be() {
-        assert!(err("filter").message.contains("column op value"));
         assert!(err("filter count").message.contains("column op value"));
         assert!(err("filter count >").message.contains("column op value"));
         assert!(
