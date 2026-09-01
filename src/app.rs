@@ -105,7 +105,8 @@ pub struct App {
     col_offset: usize,
     cursor_row: usize,
     pending_num: String,
-    pending_z: bool,
+    /// A multi-key prefix waiting for its second key: `g` or `z`.
+    pending_prefix: Option<char>,
     message: Option<String>,
     exit: bool,
     error: Option<String>,
@@ -165,7 +166,7 @@ impl App {
             col_offset: 0,
             cursor_row: 0,
             pending_num: String::new(),
-            pending_z: false,
+            pending_prefix: None,
             message: None,
             exit: false,
             error: None,
@@ -386,7 +387,7 @@ impl App {
                                 .visual_range()
                                 .map(|((r0, r1), (c0, c1))| (r1 - r0 + 1, c1 - c0 + 1)),
                             pending_num: self.pending_num.clone(),
-                            pending_z: self.pending_z,
+                            pending_prefix: self.pending_prefix,
                             theme: &self.theme,
                             search_info,
                             spinner_tick: self.spinner_tick,
@@ -436,9 +437,12 @@ impl App {
         const MOVE: &[(&str, &str)] = &[
             ("j / \u{2193}", "Move down"),
             ("k / \u{2191}", "Move up"),
-            ("Ctrl+d / Ctrl+u", "Half page down / up"),
-            ("g / G", "First / last row"),
-            ("{n}G", "Jump to row n"),
+            (
+                "Ctrl+d / Ctrl+u",
+                "Half a screen down / up, view and cursor",
+            ),
+            ("gg / G", "First / last row"),
+            ("{n}gg / {n}G", "Jump to row n"),
             ("zz / zt / zb", "Centre / top / bottom"),
             ("#", "Relative or absolute row numbers"),
         ];
@@ -966,15 +970,8 @@ impl App {
     fn handle_normal_key(&mut self, key: KeyEvent) -> anyhow::Result<()> {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
-        // Resolve pending z-prefix
-        if self.pending_z {
-            self.pending_z = false;
-            return match key.code {
-                KeyCode::Char('z') => self.scroll_center(),
-                KeyCode::Char('t') => self.scroll_cursor_top(),
-                KeyCode::Char('b') => self.scroll_cursor_bottom(),
-                _ => Ok(()),
-            };
+        if let Some(prefix) = self.pending_prefix.take() {
+            return self.resolve_prefix(prefix, key.code);
         }
 
         match key.code {
@@ -1002,15 +999,13 @@ impl App {
                 let n = self.take_count(1);
                 self.cursor_up(n)?;
             }
-            KeyCode::Char('d') if ctrl => {
-                let vp = self.store.as_ref().map_or(1, |s| s.viewport_rows);
-                self.cursor_down((vp / 2).max(1))?;
-            }
-            KeyCode::Char('u') if ctrl => {
-                let vp = self.store.as_ref().map_or(1, |s| s.viewport_rows);
-                self.cursor_up((vp / 2).max(1))?;
-            }
-            KeyCode::Char('g') | KeyCode::Home => {
+            KeyCode::Char('d') if ctrl => self.half_page(true)?,
+            KeyCode::Char('u') if ctrl => self.half_page(false)?,
+
+            // `g` waits for its second key. The count survives it, so `12gg`
+            // reads as one motion.
+            KeyCode::Char('g') => self.pending_prefix = Some('g'),
+            KeyCode::Home => {
                 self.pending_num.clear();
                 self.cursor_to(0)?;
             }
@@ -1027,10 +1022,10 @@ impl App {
                 }
             }
 
-            // z-prefix: zz (center), zt (top), zb (bottom)
+            // z-prefix: zz (centre), zt (top), zb (bottom)
             KeyCode::Char('z') => {
                 self.pending_num.clear();
-                self.pending_z = true;
+                self.pending_prefix = Some('z');
             }
 
             // Column navigation
@@ -1746,6 +1741,72 @@ impl App {
         self.exit = true;
     }
 
+    /// The second key of a `g` or `z` sequence. Anything else cancels it.
+    fn resolve_prefix(&mut self, prefix: char, code: KeyCode) -> anyhow::Result<()> {
+        match (prefix, code) {
+            ('z', KeyCode::Char('z')) => self.scroll_center(),
+            ('z', KeyCode::Char('t')) => self.scroll_cursor_top(),
+            ('z', KeyCode::Char('b')) => self.scroll_cursor_bottom(),
+            // `gg` is the first row, or the nth when a count precedes it.
+            ('g', KeyCode::Char('g')) => {
+                if self.pending_num.is_empty() {
+                    self.cursor_to(0)
+                } else {
+                    let count = std::mem::take(&mut self.pending_num);
+                    self.jump_to_line(&count)
+                }
+            }
+            _ => {
+                self.pending_num.clear();
+                Ok(())
+            }
+        }
+    }
+
+    /// `Ctrl+d` / `Ctrl+u`: half a screen, view and cursor together.
+    ///
+    /// vim moves both, keeping the cursor at the same height in the window,
+    /// rather than walking the cursor down until it falls off the edge — so
+    /// the view moves even when the cursor had room to spare. (The commands
+    /// that scroll the view and leave the cursor behind are `Ctrl+e` and
+    /// `Ctrl+y`, which plv does not have.)
+    ///
+    /// Against the ends of the file the view runs out of room first; the
+    /// cursor then carries on alone, as it does in vim.
+    fn half_page(&mut self, down: bool) -> anyhow::Result<()> {
+        let Some(store) = &self.store else {
+            return Ok(());
+        };
+        let viewport = store.viewport_rows.max(1);
+        let step = (viewport / 2).max(1);
+        let last_row = store.total_rows.saturating_sub(1);
+        let offset = store.row_offset;
+        let height_in_view = self.cursor_row.saturating_sub(offset);
+
+        let new_offset = if down {
+            (offset + step).min(store.total_rows.saturating_sub(viewport))
+        } else {
+            offset.saturating_sub(step)
+        };
+
+        if let Some(store) = &mut self.store {
+            store.scroll_to_offset(new_offset)?;
+        }
+        let settled = self.store.as_ref().map_or(0, |s| s.row_offset);
+
+        self.cursor_row = if settled == offset {
+            // The view could not move, so only the cursor does.
+            if down {
+                (self.cursor_row + step).min(last_row)
+            } else {
+                self.cursor_row.saturating_sub(step)
+            }
+        } else {
+            (settled + height_in_view).min(last_row)
+        };
+        Ok(())
+    }
+
     // ── cursor + scroll helpers ────────────────────────────────────────────
 
     /// Move cursor to `row` (0-based), scrolling the viewport only if needed.
@@ -2216,6 +2277,113 @@ mod tests {
         assert_ne!(app.col_position(), before);
     }
 
+    /// 40 rows, so a 10-row viewport has plenty of room to move.
+    fn tall_app(name: &str) -> App {
+        let mut rows = String::from("n\n");
+        for i in 0..40 {
+            rows.push_str(&format!("{i}\n"));
+        }
+        let (mut app, _) = app_with(name, &rows);
+        app.last_frame_width = 40;
+        app
+    }
+
+    fn offset(app: &App) -> usize {
+        app.store.as_ref().unwrap().row_offset
+    }
+
+    #[test]
+    fn it_takes_two_gs_to_reach_the_top() {
+        let mut app = tall_app("gg.csv");
+        app.cursor_to(20).unwrap();
+
+        press(&mut app, 'g');
+        assert_eq!(app.cursor_row, 20, "one g is only half a motion");
+        assert_eq!(app.pending_prefix, Some('g'));
+
+        press(&mut app, 'g');
+        assert_eq!(app.cursor_row, 0);
+        assert_eq!(app.pending_prefix, None);
+    }
+
+    #[test]
+    fn a_count_survives_the_first_g() {
+        let mut app = tall_app("countgg.csv");
+        press(&mut app, '1');
+        press(&mut app, '2');
+        press(&mut app, 'g');
+        assert_eq!(app.pending_num, "12", "the count outlives the prefix");
+        press(&mut app, 'g');
+        assert_eq!(app.cursor_row, 11, "12gg is the twelfth row, 1-based");
+    }
+
+    #[test]
+    fn an_unfinished_g_is_abandoned_rather_than_acted_on() {
+        let mut app = tall_app("gcancel.csv");
+        app.cursor_to(20).unwrap();
+
+        press(&mut app, 'g');
+        press(&mut app, 'x'); // not a g-command
+        assert_eq!(app.pending_prefix, None);
+        assert_eq!(app.cursor_row, 20);
+        assert_eq!(app.store.as_ref().unwrap().dirty(), 0, "and x did not fire");
+    }
+
+    #[test]
+    fn a_half_page_moves_the_view_even_when_the_cursor_has_room() {
+        let mut app = tall_app("halfpage.csv");
+        let viewport = app.store.as_ref().unwrap().viewport_rows;
+        assert_eq!(viewport, 10);
+
+        // Cursor at the very top of the window, with nine rows to spare.
+        assert_eq!((app.cursor_row, offset(&app)), (0, 0));
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL))
+            .unwrap();
+
+        // vim scrolls the window and takes the cursor with it, keeping its
+        // height in the window. Walking the cursor down alone would have left
+        // the view untouched.
+        assert_eq!(offset(&app), 5, "the view moved half a screen");
+        assert_eq!(app.cursor_row, 5, "and the cursor kept its place in it");
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL))
+            .unwrap();
+        assert_eq!((app.cursor_row, offset(&app)), (0, 0));
+    }
+
+    #[test]
+    fn at_the_end_of_the_file_the_cursor_carries_on_alone() {
+        let mut app = tall_app("halfend.csv");
+        press(&mut app, 'G');
+        let settled = offset(&app);
+        assert_eq!(app.cursor_row, 39);
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL))
+            .unwrap();
+        assert_eq!(offset(&app), settled, "the view has nowhere left to go");
+        assert_eq!(app.cursor_row, 39, "and the cursor is already at the end");
+    }
+
+    #[test]
+    fn z_commands_place_the_cursor_row_in_the_viewport() {
+        let mut app = tall_app("zcmd.csv");
+        assert_eq!(app.store.as_ref().unwrap().viewport_rows, 10);
+        app.cursor_to(20).unwrap();
+
+        press(&mut app, 'z');
+        press(&mut app, 't');
+        assert_eq!(offset(&app), 20, "zt puts the cursor at the top");
+
+        press(&mut app, 'z');
+        press(&mut app, 'z');
+        assert_eq!(offset(&app), 15, "zz centres it");
+
+        press(&mut app, 'z');
+        press(&mut app, 'b');
+        assert_eq!(offset(&app), 11, "zb puts it at the bottom");
+        assert_eq!(app.cursor_row, 20, "and none of them move the cursor");
+    }
+
     #[test]
     fn a_selection_grows_with_the_motions() {
         let (mut app, _) = app_with("visual.csv", SAMPLE);
@@ -2281,6 +2449,7 @@ mod tests {
 
         // Append over the same two cells — back to the top first, since the
         // cursor is left where the last selection ended.
+        press(&mut app, 'g');
         press(&mut app, 'g');
         press(&mut app, 'v');
         press(&mut app, 'j');

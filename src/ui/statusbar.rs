@@ -27,7 +27,8 @@ pub struct StatusBar<'a> {
     /// Size of the visual selection as `(rows, columns)`, when there is one.
     pub selection: Option<(usize, usize)>,
     pub pending_num: String,
-    pub pending_z: bool,
+    /// A multi-key prefix waiting for its second key, shown as `g-` or `z-`.
+    pub pending_prefix: Option<char>,
     pub theme: &'a Theme,
     /// Active search: `(pattern, current_1based, total, complete)`.
     /// When `complete` is false the scan is still running and total may grow.
@@ -77,8 +78,8 @@ impl Widget for StatusBar<'_> {
             left.push_str(&format!("  {rows}\u{d7}{cols} sel"));
         }
 
-        if self.pending_z {
-            left.push_str("  z-");
+        if let Some(prefix) = self.pending_prefix {
+            left.push_str(&format!("  {prefix}-"));
         } else if !self.pending_num.is_empty() {
             left.push_str(&format!("  [{}]", self.pending_num));
         }
