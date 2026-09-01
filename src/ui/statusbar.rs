@@ -17,7 +17,9 @@ pub struct StatusBar<'a> {
     pub file_name: String,
     pub cursor_row: usize,
     pub total_rows: usize,
-    pub col_offset: usize,
+    /// The column the readout names: the cursor's, or the leftmost
+    /// visible one when there is no column cursor.
+    pub col_position: usize,
     pub total_cols: usize,
     pub message: Option<String>,
     /// Cells edited but not yet written. Shown as `[+n]` beside the file name.
@@ -67,7 +69,7 @@ impl Widget for StatusBar<'_> {
             self.file_name,
             self.cursor_row + 1,
             self.total_rows,
-            self.col_offset + 1,
+            self.col_position + 1,
             self.total_cols,
         );
 
