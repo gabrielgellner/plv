@@ -46,6 +46,7 @@ src/
 
 **UI layer (`src/ui/`)**
 - `DataTable`: computes per-column display widths from the current view, determines which columns fit given the terminal width (starting from `col_offset`), then renders a ratatui `Table` with a row-number column on the left. Alternating row background.
+- The row-number gutter counts from the cursor by default, nvim's hybrid `number` + `relativenumber`: each row shows its distance and the cursor row shows its own number, so `{n}j` and `{n}G` can be read off rather than worked out. The current line is left-aligned where the distances are right-aligned, which is what makes it read as outdented — and both fill the same width, so the column does not shift as the cursor moves. `#` switches to plain absolute numbering. `row_num_width()` still sizes the column from `row_offset` and only grows at powers of ten.
 - `StatusBar`: single-line bar showing filename, row range, column position, and key help.
 
 **App layer (`src/app.rs`)**
