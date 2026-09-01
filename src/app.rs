@@ -152,6 +152,9 @@ pub struct App {
     last_vp: usize,
     /// The `?` key-binding overlay is showing.
     help_visible: bool,
+    /// Number rows by distance from the cursor, so `{n}j` and `{n}G` can be
+    /// read off the gutter instead of worked out.
+    relative_rows: bool,
 }
 
 impl App {
@@ -188,6 +191,7 @@ impl App {
             screen: Screen::Viewer,
             last_vp: 20,
             help_visible: false,
+            relative_rows: true,
         }
     }
 
@@ -304,6 +308,7 @@ impl App {
                     sort_tick: self.sort_rx.as_ref().map(|_| self.spinner_tick),
                     edited: &edited,
                     selection: self.visual_range(),
+                    relative_rows: self.relative_rows,
                 },
                 table_area,
             );
@@ -430,6 +435,7 @@ impl App {
             ("g / G", "First / last row"),
             ("{n}G", "Jump to row n"),
             ("zz / zt / zb", "Centre / top / bottom"),
+            ("#", "Relative or absolute row numbers"),
         ];
         const COLUMNS: &[(&str, &str)] = &[
             ("h / l", "Scroll columns left / right"),
@@ -1188,6 +1194,10 @@ impl App {
             }
             KeyCode::Char('x') | KeyCode::Char('d') if self.visual_anchor.is_some() => {
                 self.clear_selection()?
+            }
+            KeyCode::Char('#') => {
+                self.pending_num.clear();
+                self.relative_rows = !self.relative_rows;
             }
             KeyCode::Char('y') => self.yank()?,
             KeyCode::Char('p') => self.paste()?,
@@ -2432,6 +2442,17 @@ mod tests {
         command(&mut app, "nope");
         assert_eq!(app.message.as_deref(), Some("not a command: :nope"));
         assert!(!app.exit);
+    }
+
+    #[test]
+    fn hash_switches_between_relative_and_absolute_row_numbers() {
+        let (mut app, _) = app_with("gutter.csv", SAMPLE);
+        assert!(app.relative_rows, "counting from the cursor is the default");
+
+        press(&mut app, '#');
+        assert!(!app.relative_rows);
+        press(&mut app, '#');
+        assert!(app.relative_rows);
     }
 
     #[test]

@@ -41,6 +41,28 @@ pub struct DataTable<'a> {
     pub edited: &'a [(usize, usize)],
     /// The visual selection, as absolute inclusive `(row range, column range)`.
     pub selection: Option<((usize, usize), (usize, usize))>,
+    /// Number rows by their distance from the cursor rather than absolutely.
+    pub relative_rows: bool,
+}
+
+/// The row-number cell: each row's distance from the cursor, and on the cursor
+/// line the row's own number.
+///
+/// This is nvim's hybrid `number` + `relativenumber` gutter, and the alignment
+/// is the point of it. The current line is left-aligned where the distances are
+/// right-aligned, so it reads as outdented against the column beside it — and
+/// both branches fill the same width, so nothing shifts as the cursor moves.
+///
+/// `width` is the space before the `│`, which closes the column.
+fn gutter(abs_row: usize, cursor_row: usize, relative: bool, width: usize) -> String {
+    let body = if !relative {
+        format!("{:>width$}", abs_row + 1)
+    } else if abs_row == cursor_row {
+        format!("{:<width$}", abs_row + 1)
+    } else {
+        format!("{:>width$}", abs_row.abs_diff(cursor_row))
+    };
+    format!("{body}│")
 }
 
 /// Dynamic row number column width based on the current viewport position.
@@ -302,11 +324,14 @@ impl Widget for DataTable<'_> {
                 let is_cursor = abs_row == self.cursor_row;
                 let is_match_row = current_match_row == Some(abs_row);
 
-                // Style for the row-number cell.
+                // Style for the row-number cell. The gutter sits well back
+                // from the data, so the current line needs its own colour to
+                // stay findable among the distances.
                 let num_style = match self.selection_mode {
                     SelectionMode::Row if is_cursor => cursor_style,
                     SelectionMode::Column if is_match_row => cursor_style,
                     SelectionMode::Column if is_cursor => cursor_style,
+                    _ if is_cursor => Style::new().fg(self.theme.row_num_cursor),
                     _ => Style::new().fg(self.theme.row_num),
                 };
 
@@ -358,8 +383,7 @@ impl Widget for DataTable<'_> {
                     }
                 };
 
-                // Row number with │ vertical separator at the right edge of slot.
-                let rn_str = format!("{:>w$}│", abs_row + 1, w = row_num_w - 1);
+                let rn_str = gutter(abs_row, self.cursor_row, self.relative_rows, row_num_w - 1);
                 let mut cells = vec![Cell::new(rn_str).style(num_style)];
 
                 for (idx, &ci) in vis_cols.iter().enumerate() {
@@ -453,5 +477,122 @@ impl Widget for DataTable<'_> {
             .block(block)
             .column_spacing(0)
             .render(area, buf);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_gutter_counts_from_the_cursor() {
+        // Distances above and below, and the row's own number on the line
+        // itself. Width 3, so each cell is 4 characters with the separator.
+        assert_eq!(gutter(0, 2, true, 3), "  2│");
+        assert_eq!(gutter(1, 2, true, 3), "  1│");
+        assert_eq!(gutter(2, 2, true, 3), "3  │");
+        assert_eq!(gutter(3, 2, true, 3), "  1│");
+        assert_eq!(gutter(9, 2, true, 3), "  7│");
+    }
+
+    #[test]
+    fn the_current_line_is_outdented_against_the_distances() {
+        // The property that has to hold: both branches fill the same width, so
+        // the column does not shift as the cursor moves, and the current line
+        // reads as outdented because it alone is left-aligned.
+        let cursor = gutter(41, 41, true, 4);
+        let neighbour = gutter(42, 41, true, 4);
+        assert_eq!(cursor, "42  │");
+        assert_eq!(neighbour, "   1│");
+        assert_eq!(cursor.chars().count(), neighbour.chars().count());
+    }
+
+    #[test]
+    fn absolute_numbering_right_aligns_every_row() {
+        assert_eq!(gutter(0, 2, false, 3), "  1│");
+        assert_eq!(gutter(2, 2, false, 3), "  3│");
+        assert_eq!(gutter(41, 2, false, 3), " 42│");
+    }
+
+    #[test]
+    fn a_number_wider_than_the_gutter_still_closes_the_column() {
+        // Numbers overflow their field rather than being truncated: a wrong
+        // number would be worse than a wide one.
+        assert!(gutter(5000, 0, true, 3).ends_with('│'));
+        assert!(gutter(5000, 0, false, 3).ends_with('│'));
+    }
+
+    /// Every rendered line, so the gutter is read off the screen rather than
+    /// off the function that is supposed to produce it.
+    fn rendered(cursor_row: usize, relative: bool) -> Vec<String> {
+        let df = df! {
+            "name" => ["a", "b", "c", "d", "e"],
+            "n" => [1, 2, 3, 4, 5],
+        }
+        .unwrap();
+        let theme = Theme::catppuccin_mocha();
+        let last_vis = std::cell::Cell::new(0);
+        let area = Rect::new(0, 0, 40, 10);
+        let mut buf = Buffer::empty(area);
+
+        DataTable {
+            df: &df,
+            col_offset: 0,
+            cursor_col: 0,
+            row_offset: 0,
+            cursor_row,
+            selection_mode: SelectionMode::Cell,
+            theme: &theme,
+            search: None,
+            search_col: None,
+            last_vis_col_out: &last_vis,
+            sort: &[],
+            sort_tick: None,
+            edited: &[],
+            selection: None,
+            relative_rows: relative,
+        }
+        .render(area, &mut buf);
+
+        (0..area.height)
+            .map(|y| (0..area.width).map(|x| buf[(x, y)].symbol()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn the_rendered_gutter_counts_from_the_cursor_row() {
+        let lines = rendered(2, true);
+        let gutters: Vec<String> = lines
+            .iter()
+            // Field 0 is before the block's own left border, so the gutter
+            // is the next one along.
+            .filter_map(|line| line.split('\u{2502}').nth(1).map(|g| g.trim().to_string()))
+            .filter(|gutter| !gutter.is_empty()) // blank rows below the data
+            .collect();
+
+        // The header's "#", then the five data rows around a cursor on row 2.
+        assert_eq!(gutters, ["#", "2", "1", "3", "1", "2"], "{lines:#?}");
+    }
+
+    #[test]
+    fn the_rendered_gutter_can_be_switched_to_absolute() {
+        let lines = rendered(2, false);
+        let gutters: Vec<String> = lines
+            .iter()
+            // Field 0 is before the block's own left border, so the gutter
+            // is the next one along.
+            .filter_map(|line| line.split('\u{2502}').nth(1).map(|g| g.trim().to_string()))
+            .filter(|gutter| !gutter.is_empty()) // blank rows below the data
+            .collect();
+
+        assert_eq!(gutters, ["#", "1", "2", "3", "4", "5"], "{lines:#?}");
+    }
+
+    /// The width the gutter asks for only grows at powers of ten, so scrolling
+    /// does not make the whole table shuffle sideways.
+    #[test]
+    fn the_gutter_width_is_stable_between_orders_of_magnitude() {
+        assert_eq!(row_num_width(0, 20), row_num_width(30, 20));
+        assert!(row_num_width(0, 20) < row_num_width(100_000, 20));
     }
 }
