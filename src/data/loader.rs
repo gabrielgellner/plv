@@ -36,6 +36,20 @@ pub fn load(path: &Path) -> Result<LazyFrame> {
     }
 }
 
+/// The field separator plv reads `path` with, or `None` when the format is not
+/// delimited text and so cannot be edited in place.
+///
+/// Resolved the same way as [`load`], sniffing included, so the write path
+/// splits records exactly where the read path did.
+pub fn separator(path: &Path) -> Result<Option<u8>> {
+    match detect_format(path) {
+        FileFormat::Csv => Ok(Some(b',')),
+        FileFormat::Tsv => Ok(Some(b'\t')),
+        FileFormat::Text => Ok(Some(sniff_delimiter(&read_sample(path)?))),
+        FileFormat::Parquet | FileFormat::Unknown => Ok(None),
+    }
+}
+
 fn delimited(path: PlRefPath, separator: u8) -> PolarsResult<LazyFrame> {
     LazyCsvReader::new(path).with_separator(separator).finish()
 }

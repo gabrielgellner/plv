@@ -12,7 +12,7 @@ pub use statusbar::StatusBar;
 pub use table::DataTable;
 pub use theme::Theme;
 
-#[derive(Clone, Copy, PartialEq, Default)]
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
 pub enum SelectionMode {
     #[default]
     Row,

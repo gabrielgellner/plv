@@ -14,24 +14,32 @@ pub struct Theme {
     pub message_fg: Color,
     pub match_bg: Color,
     pub match_fg: Color,
+    /// Cells holding an edit that has not been written to the file yet.
+    pub edited_fg: Color,
+    /// Cells inside a visual selection.
+    pub selection_bg: Color,
+    pub selection_fg: Color,
 }
 
 impl Theme {
     pub fn catppuccin_mocha() -> Self {
         Self {
-            row_num: Color::Rgb(166, 173, 200),   // Subtext0
-            header: Color::Rgb(137, 180, 250),     // Blue
-            cursor_bg: Color::Rgb(69, 71, 90),       // Surface1
-            cursor_fg: Color::Rgb(205, 214, 244),   // Text
-            col_cursor_bg: Color::Rgb(88, 91, 112), // Surface2
+            row_num: Color::Rgb(166, 173, 200),       // Subtext0
+            header: Color::Rgb(137, 180, 250),        // Blue
+            cursor_bg: Color::Rgb(69, 71, 90),        // Surface1
+            cursor_fg: Color::Rgb(205, 214, 244),     // Text
+            col_cursor_bg: Color::Rgb(88, 91, 112),   // Surface2
             col_cursor_fg: Color::Rgb(205, 214, 244), // Text
-            border: Color::Rgb(88, 91, 112),        // Surface2
-            status_bg: Color::Rgb(49, 50, 68),     // Surface0
-            status_fg: Color::Rgb(205, 214, 244),  // Text
-            message_bg: Color::Rgb(250, 179, 135), // Peach
-            message_fg: Color::Rgb(30, 30, 46),    // Base
-            match_bg: Color::Rgb(249, 226, 175),   // Yellow
-            match_fg: Color::Rgb(30, 30, 46),      // Base
+            border: Color::Rgb(88, 91, 112),          // Surface2
+            status_bg: Color::Rgb(49, 50, 68),        // Surface0
+            status_fg: Color::Rgb(205, 214, 244),     // Text
+            message_bg: Color::Rgb(250, 179, 135),    // Peach
+            message_fg: Color::Rgb(30, 30, 46),       // Base
+            match_bg: Color::Rgb(249, 226, 175),      // Yellow
+            match_fg: Color::Rgb(30, 30, 46),         // Base
+            edited_fg: Color::Rgb(243, 139, 168),     // Red
+            selection_bg: Color::Rgb(88, 91, 112),    // Surface2
+            selection_fg: Color::Rgb(205, 214, 244),  // Text
         }
     }
 }
