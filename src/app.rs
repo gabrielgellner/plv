@@ -448,6 +448,7 @@ impl App {
         ];
         const COLUMNS: &[(&str, &str)] = &[
             ("h / l", "Scroll columns left / right"),
+            ("{n}h / {n}l", "Jump n columns"),
             ("H", "First column"),
             ("0 / $", "Scroll to the first / last column"),
             ("Tab", "Cycle row \u{2192} column \u{2192} cell"),
@@ -1028,44 +1029,14 @@ impl App {
                 self.pending_prefix = Some('z');
             }
 
-            // Column navigation
+            // Column navigation, counted the same way `j` and `k` are.
             KeyCode::Char('h') | KeyCode::Left => {
-                self.pending_num.clear();
-                match self.selection_mode {
-                    SelectionMode::Row => {
-                        self.col_offset = self.col_offset.saturating_sub(1);
-                    }
-                    SelectionMode::Column | SelectionMode::Cell => {
-                        self.cursor_col = self.cursor_col.saturating_sub(1);
-                        if self.cursor_col < self.col_offset {
-                            self.col_offset = self.cursor_col;
-                        }
-                    }
-                }
+                let n = self.take_count(1);
+                self.column_left(n);
             }
             KeyCode::Char('l') | KeyCode::Right => {
-                self.pending_num.clear();
-                match self.selection_mode {
-                    SelectionMode::Row => {
-                        // Stop where the last column sits at the right edge,
-                        // as the other modes do — scrolling further would pad
-                        // the view with empty space rather than show data.
-                        if self.col_offset < self.max_col_offset() {
-                            self.col_offset += 1;
-                        }
-                    }
-                    SelectionMode::Column | SelectionMode::Cell => {
-                        if let Some(store) = &self.store {
-                            let max_col = store.schema.len().saturating_sub(1);
-                            if self.cursor_col < max_col {
-                                self.cursor_col += 1;
-                                if self.cursor_col > self.last_vis_col {
-                                    self.col_offset += 1;
-                                }
-                            }
-                        }
-                    }
-                }
+                let n = self.take_count(1);
+                self.column_right(n);
             }
             // Jump to first column (all modes) or last column (Column/Cell via $).
             KeyCode::Char('H') => {
@@ -1934,6 +1905,38 @@ impl App {
         }
     }
 
+    /// `h`: `n` columns left, or `n` columns of scroll in row mode.
+    fn column_left(&mut self, n: usize) {
+        match self.selection_mode {
+            SelectionMode::Row => self.col_offset = self.col_offset.saturating_sub(n),
+            SelectionMode::Column | SelectionMode::Cell => {
+                self.cursor_col = self.cursor_col.saturating_sub(n);
+                self.col_offset = self.col_offset.min(self.cursor_col);
+            }
+        }
+    }
+
+    /// `l`: `n` columns right, stopping at the last column — or, in row mode,
+    /// where the last column reaches the right edge.
+    ///
+    /// The cursor modes only set the cursor; `draw` brings `col_offset` along
+    /// if that has taken it out of view. Nudging the offset by hand here was
+    /// only ever right for a single step.
+    fn column_right(&mut self, n: usize) {
+        match self.selection_mode {
+            SelectionMode::Row => {
+                self.col_offset = (self.col_offset + n).min(self.max_col_offset());
+            }
+            SelectionMode::Column | SelectionMode::Cell => {
+                let last = self
+                    .store
+                    .as_ref()
+                    .map_or(0, |s| s.schema.len().saturating_sub(1));
+                self.cursor_col = (self.cursor_col + n).min(last);
+            }
+        }
+    }
+
     /// The column the status bar names.
     ///
     /// Row mode has no column cursor, so it reports the leftmost visible
@@ -2257,6 +2260,57 @@ mod tests {
         press(&mut app, 'l');
         press(&mut app, '0');
         assert_eq!(app.cursor_col, 0);
+    }
+
+    #[test]
+    fn h_and_l_take_a_count_like_j_and_k() {
+        let mut app = app_sized("countcol.csv", WIDE, 40);
+        cell_mode(&mut app);
+
+        press(&mut app, '5');
+        press(&mut app, 'l');
+        assert_eq!(app.cursor_col, 5);
+        assert!(app.pending_num.is_empty(), "the count is spent");
+
+        press(&mut app, '3');
+        press(&mut app, 'h');
+        assert_eq!(app.cursor_col, 2);
+
+        // Uncounted, they are still single steps.
+        press(&mut app, 'l');
+        assert_eq!(app.cursor_col, 3);
+    }
+
+    #[test]
+    fn a_counted_column_jump_stops_at_the_ends() {
+        let mut app = app_sized("countclamp.csv", WIDE, 40);
+        cell_mode(&mut app);
+
+        press(&mut app, '9');
+        press(&mut app, '9');
+        press(&mut app, 'l');
+        assert_eq!(app.cursor_col, 7, "eight columns, so the last is 7");
+
+        press(&mut app, '9');
+        press(&mut app, '9');
+        press(&mut app, 'h');
+        assert_eq!(app.cursor_col, 0);
+    }
+
+    #[test]
+    fn a_counted_jump_scrolls_row_mode_without_overshooting() {
+        let mut app = app_sized("countrow.csv", WIDE, 40);
+        assert_eq!(app.selection_mode, SelectionMode::Row);
+
+        press(&mut app, '2');
+        press(&mut app, 'l');
+        assert_eq!(app.col_offset, 2);
+
+        // Past the end it settles where the last column reaches the edge,
+        // exactly where repeated single steps stop.
+        press(&mut app, '9');
+        press(&mut app, 'l');
+        assert_eq!(app.col_offset, app.max_col_offset());
     }
 
     #[test]
