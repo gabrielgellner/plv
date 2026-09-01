@@ -20,6 +20,9 @@ pub struct Theme {
     pub match_fg: Color,
     /// Cells holding an edit that has not been written to the file yet.
     pub edited_fg: Color,
+    /// Empty cells, which are shown as a marker rather than as the word
+    /// `null`: it has to read as "nothing here" and not as data.
+    pub null_fg: Color,
     /// Cells inside a visual selection.
     pub selection_bg: Color,
     pub selection_fg: Color,
@@ -43,6 +46,7 @@ impl Theme {
             match_bg: Color::Rgb(249, 226, 175),       // Yellow
             match_fg: Color::Rgb(30, 30, 46),          // Base
             edited_fg: Color::Rgb(243, 139, 168),      // Red
+            null_fg: Color::Rgb(108, 112, 134),        // Overlay0
             selection_bg: Color::Rgb(88, 91, 112),     // Surface2
             selection_fg: Color::Rgb(205, 214, 244),   // Text
         }
