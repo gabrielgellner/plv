@@ -2,7 +2,9 @@
 use plv::data::lake_db::{self, LakeDb};
 
 fn main() -> anyhow::Result<()> {
-    let arg = std::env::args().nth(1).expect("usage: lakedump <path> [snapshot]");
+    let arg = std::env::args()
+        .nth(1)
+        .expect("usage: lakedump <path> [snapshot]");
     let snapshot = std::env::args().nth(2).and_then(|s| s.parse().ok());
     let path = lake_db::detect(std::path::Path::new(&arg)).expect("no .ducklake found");
 
@@ -33,7 +35,10 @@ fn main() -> anyhow::Result<()> {
             println!("   {} — {} rows", p.label(), lake_db::human_count(p.rows));
         }
         let source = db.source(&table, None);
-        println!("   count = {}", lake_db::human_count(db.count(&source)? as u64));
+        println!(
+            "   count = {}",
+            lake_db::human_count(db.count(&source)? as u64)
+        );
         println!("{}", db.page(&source, &[], 0, 3)?);
     }
     Ok(())

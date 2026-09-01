@@ -118,7 +118,10 @@ mod tests {
 
     #[test]
     fn clamp_scroll_follows_cursor_both_ways() {
-        let mut s = BrowserState { selected: 9, ..Default::default() };
+        let mut s = BrowserState {
+            selected: 9,
+            ..Default::default()
+        };
         s.clamp_scroll(5);
         assert_eq!(s.offset, 5); // cursor at bottom of window
 

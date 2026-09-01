@@ -110,7 +110,11 @@ impl LakeSource {
             let keys: Vec<String> = sort
                 .iter()
                 .map(|(name, asc)| {
-                    format!("{} {}", quote_ident(name), if *asc { "ASC" } else { "DESC" })
+                    format!(
+                        "{} {}",
+                        quote_ident(name),
+                        if *asc { "ASC" } else { "DESC" }
+                    )
                 })
                 .collect();
             sql.push_str(&format!(" ORDER BY {}", keys.join(", ")));
@@ -222,7 +226,10 @@ impl LakeDb {
             return Ok(id);
         }
         Ok(self.conn.query_row(
-            &format!("SELECT id FROM ducklake_current_snapshot({})", sql_str(ALIAS)),
+            &format!(
+                "SELECT id FROM ducklake_current_snapshot({})",
+                sql_str(ALIAS)
+            ),
             [],
             |row| row.get(0),
         )?)
@@ -254,9 +261,11 @@ impl LakeDb {
             // even on a billion-row table.
             table.rows = self
                 .conn
-                .query_row(&format!("SELECT count(*) FROM {}", table.sql_ref()), [], |r| {
-                    r.get::<_, i64>(0)
-                })
+                .query_row(
+                    &format!("SELECT count(*) FROM {}", table.sql_ref()),
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
                 .unwrap_or(0)
                 .max(0) as u64;
 
@@ -315,7 +324,11 @@ impl LakeDb {
         if table.partition_cols.is_empty() {
             return Ok(Vec::new());
         }
-        let keys: Vec<String> = table.partition_cols.iter().map(|c| quote_ident(c)).collect();
+        let keys: Vec<String> = table
+            .partition_cols
+            .iter()
+            .map(|c| quote_ident(c))
+            .collect();
         let sql = format!(
             "SELECT {}, count(*) FROM {} GROUP BY ALL ORDER BY count(*) DESC",
             keys.join(", "),
