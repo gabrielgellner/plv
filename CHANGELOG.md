@@ -2,6 +2,31 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.0] - 2026-09-01
+
+### Bug Fixes
+
+- Stop rendering text cells in quotes ([`8b4c3d6`](https://gitlab.com/gabrielgellner/plv/-/commit/8b4c3d6cbba0956462cd2417f3a83593a90eefcc))
+- Show an empty cell as a marker rather than the word "null" ([`ecce3d0`](https://gitlab.com/gabrielgellner/plv/-/commit/ecce3d09d2c8acebd6892011c52ddcea21a7483e))
+- Fit and finish for horizontal layout and movement ([`4ab5cd0`](https://gitlab.com/gabrielgellner/plv/-/commit/4ab5cd00b2bd2aa71d9763d31f88c640aa35729f))
+- `gg` for the first row, and vim's half-screen scroll ([`4fec0ab`](https://gitlab.com/gabrielgellner/plv/-/commit/4fec0ab82c4d156bf9b31bec82269093861e32a7))
+
+### Documentation
+
+- Describe the edit buffer in CLAUDE.md ([`f0882ac`](https://gitlab.com/gabrielgellner/plv/-/commit/f0882ac77c647e36c0c82b20e975e824fd0fc733))
+- Note how cells and empty fields are rendered ([`fff8e42`](https://gitlab.com/gabrielgellner/plv/-/commit/fff8e42ec293f833196641b698ed3b567c1c91e4))
+
+### Features
+
+- Read TSV, .tab and .txt files ([`2a3328c`](https://gitlab.com/gabrielgellner/plv/-/commit/2a3328ce2164c5226f39b8c4334bc0107892e8a2))
+- Edit delimited files in a buffer, written with :w ([`c562559`](https://gitlab.com/gabrielgellner/plv/-/commit/c56255976772d329ff0dbee2af706bfe8cd3fbcb))
+- Count row numbers from the cursor ([`0061fe4`](https://gitlab.com/gabrielgellner/plv/-/commit/0061fe4c350eae9c73f5b2a73c9620ee8d40c2f3))
+- Count h and l, like j and k ([`d88c384`](https://gitlab.com/gabrielgellner/plv/-/commit/d88c3845bfcd79fe28c167ed724dfdd09e9c439b))
+
+### Styling
+
+- Format the repo with cargo fmt ([`a738036`](https://gitlab.com/gabrielgellner/plv/-/commit/a73803646d94afb9a808565ec1131fbf6d8a8623))
+
 ## [0.4.1] - 2026-08-27
 
 ### Bug Fixes
@@ -67,6 +92,8 @@ All notable changes to this project will be documented in this file.
 ### Styling
 
 - Fix clippy warnings ([`5cb0dba`](https://gitlab.com/gabrielgellner/plv/-/commit/5cb0dba5f5d4bc0be4d3d3b09fd1e7cd00ff7722))
+
+[0.5.0]: https://gitlab.com/gabrielgellner/plv/-/compare/v0.4.1...v0.5.0
 
 [0.4.1]: https://gitlab.com/gabrielgellner/plv/-/compare/v0.4.0...v0.4.1
 
