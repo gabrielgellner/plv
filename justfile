@@ -66,8 +66,10 @@ release:
     git push origin HEAD
     git push origin "$TAG"
 
-    # Release notes = this tag's section from the changelog (header/footer stripped)
-    NOTES=$(git-cliff --latest --strip all)
+    # Release notes = this tag's section from the changelog, from the first
+    # group heading on. The version heading is dropped: the release is already
+    # titled for its version, so repeating it inside the notes is noise.
+    NOTES=$(git-cliff --latest --strip all | awk 'f || /^###/ { f = 1; print }')
 
     glab release create "$TAG" \
         --name "Release $TAG" \
