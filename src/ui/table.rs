@@ -185,6 +185,45 @@ fn truncate(s: &str, max_chars: usize) -> String {
     }
 }
 
+/// The `col_offset` that puts `target` at the right edge: the leftmost start
+/// that still shows `target` in full.
+///
+/// Lives beside the renderer that has to agree with it. The app layer used to
+/// keep its own copy of this arithmetic, and the two drifted — the copy was
+/// still measuring quoted strings in bytes after the renderer had stopped.
+pub fn col_offset_showing(
+    df: &DataFrame,
+    row_offset: usize,
+    frame_width: u16,
+    target: usize,
+) -> usize {
+    let cols = df.columns();
+    if cols.is_empty() {
+        return 0;
+    }
+    let target = target.min(cols.len() - 1);
+
+    let inner_w = (frame_width as usize).saturating_sub(2);
+    let max_col = ((inner_w as f32 * MAX_COL_FRAC) as usize).max(MIN_COL_WIDTH);
+    let row_num_w = row_num_width(row_offset, df.height());
+    let slot = |ci: usize| COLUMN_SPACING + natural_col_width(&cols[ci]).min(max_col);
+
+    let Some(mut budget) = inner_w.saturating_sub(row_num_w).checked_sub(slot(target)) else {
+        return target; // the target alone does not fit — show it at the left edge
+    };
+
+    // Walk left from the target, taking every column that still fits.
+    let mut offset = target;
+    for ci in (0..target).rev() {
+        if budget < slot(ci) {
+            break;
+        }
+        budget -= slot(ci);
+        offset = ci;
+    }
+    offset
+}
+
 impl Widget for DataTable<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let cols = self.df.columns();
@@ -228,8 +267,11 @@ impl Widget for DataTable<'_> {
         // Remaining space for a partial right-edge column.
         let remaining = inner_w.saturating_sub(used);
         let next_col_idx = vis_cols.last().map(|&i| i + 1).unwrap_or(self.col_offset);
-        let has_partial = remaining >= MIN_COL_WIDTH && next_col_idx < cols.len();
-        let partial_width = if has_partial { remaining } else { 0 };
+        // The partial column carries the same lead-in as a full one. Without
+        // it the last full column's header runs straight into this one's and
+        // the two read as a single strange name.
+        let has_partial = remaining >= sp + MIN_COL_WIDTH && next_col_idx < cols.len();
+        let partial_width = if has_partial { remaining - sp } else { 0 };
 
         // ── Build ratatui constraints ─────────────────────────────────────
         // Spacing baked into constraints → cursor bg fills the full row.
@@ -328,7 +370,7 @@ impl Widget for DataTable<'_> {
             } else {
                 name.to_string()
             };
-            header_cells.push(Cell::new(display).style(hdr_style));
+            header_cells.push(Cell::new(format!("{:>sp$}{display}", "")).style(hdr_style));
         } else {
             header_cells.push(Cell::new("").style(hdr_style));
         }
@@ -477,6 +519,7 @@ impl Widget for DataTable<'_> {
                     } else {
                         val
                     };
+                    let display = format!("{:>sp$}{display}", "");
                     let cs = cell_style(next_col_idx);
                     let search = match self.search_col {
                         None => self.search,
@@ -676,6 +719,62 @@ mod tests {
         let df = df! { "s" => ["alpha"] }.unwrap();
         // "alpha" is five characters; the quotes used to make it seven.
         assert_eq!(natural_col_width(&df.columns()[0]), 5);
+    }
+
+    fn draw_narrow(df: &DataFrame, width: u16, col_offset: usize) -> Buffer {
+        let theme = Theme::catppuccin_mocha();
+        let last_vis = std::cell::Cell::new(0);
+        let area = Rect::new(0, 0, width, 4);
+        let mut buf = Buffer::empty(area);
+        DataTable {
+            df,
+            col_offset,
+            cursor_col: col_offset,
+            row_offset: 0,
+            cursor_row: 0,
+            selection_mode: SelectionMode::Cell,
+            theme: &theme,
+            search: None,
+            search_col: None,
+            last_vis_col_out: &last_vis,
+            sort: &[],
+            sort_tick: None,
+            edited: &[],
+            selection: None,
+            relative_rows: true,
+        }
+        .render(area, &mut buf);
+        buf
+    }
+
+    /// A column that only partly fits still has to start clear of the one
+    /// before it, or the two headers run together and read as one odd name.
+    #[test]
+    fn a_partial_column_keeps_its_distance_from_the_last_full_one() {
+        let names = ["verdict", "shared", "our_tracks", "their_tracks", "matched"];
+        let df = df! {
+            "verdict" => ["weak"],
+            "shared" => ["0.733"],
+            "our_tracks" => ["15"],
+            "their_tracks" => ["11"],
+            "matched" => ["Adele"],
+        }
+        .unwrap();
+
+        // Sweep the widths where the last column is cut off part way.
+        for width in 40..70 {
+            let rendered = lines(&draw_narrow(&df, width, 0))[1].clone();
+            // Field 0 is the block border and field 1 the gutter; the headers
+            // are what follows.
+            let header = rendered.split('\u{2502}').nth(2).unwrap_or("").to_string();
+            for token in header.split_whitespace() {
+                let bare = token.trim_end_matches('\u{2026}');
+                assert!(
+                    names.iter().any(|name| name.starts_with(bare)),
+                    "at width {width}, {token:?} is not a column name: {rendered:?}"
+                );
+            }
+        }
     }
 
     #[test]

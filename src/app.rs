@@ -18,7 +18,7 @@ use crate::data::Store;
 use crate::data::lake_db::{self, LakeDb};
 use crate::lake::{Lake, Level, Scope};
 use crate::search::{SearchQuery, SearchState, SearchStatus};
-use crate::ui::{Browser, DataTable, Help, Prompt, Section, SelectionMode, StatusBar, Theme};
+use crate::ui::{self, Browser, DataTable, Help, Prompt, Section, SelectionMode, StatusBar, Theme};
 use polars::prelude::DataType;
 
 enum AppMode {
@@ -247,6 +247,11 @@ impl App {
             return;
         }
 
+        // A resize can leave row mode scrolled past what now fits.
+        if matches!(self.selection_mode, SelectionMode::Row) {
+            self.col_offset = self.col_offset.min(self.max_col_offset());
+        }
+
         // In Column/Cell mode keep cursor_col within [col_offset, last_vis_col].
         // Must be correct in a single pass: handle_events blocks on event::read
         // when no search is active, so multi-frame convergence never fires.
@@ -373,7 +378,7 @@ impl App {
                             file_name,
                             cursor_row,
                             total_rows: store.total_rows,
-                            col_offset,
+                            col_position: self.col_position(),
                             total_cols: store.schema.len(),
                             message: self.message.clone(),
                             dirty: store.dirty(),
@@ -440,7 +445,7 @@ impl App {
         const COLUMNS: &[(&str, &str)] = &[
             ("h / l", "Scroll columns left / right"),
             ("H", "First column"),
-            ("0 / $", "First / last column (column mode)"),
+            ("0 / $", "Scroll to the first / last column"),
             ("Tab", "Cycle row \u{2192} column \u{2192} cell"),
             ("s", "Sort by cursor column"),
         ];
@@ -975,16 +980,10 @@ impl App {
         match key.code {
             KeyCode::Char('q') | KeyCode::Char('Q') => self.quit(false),
 
-            // In column/cell mode '0' jumps to the first column (vim-style).
-            // Must come before the digit-accumulation arm.
-            KeyCode::Char('0')
-                if !ctrl
-                    && matches!(
-                        self.selection_mode,
-                        SelectionMode::Column | SelectionMode::Cell
-                    ) =>
-            {
-                self.pending_num.clear();
+            // '0' scrolls to the first column, leaving it at the left edge.
+            // Must come before the digit-accumulation arm — but only when no
+            // count is being typed, or `10j` would lose its zero.
+            KeyCode::Char('0') if !ctrl && self.pending_num.is_empty() => {
                 self.col_offset = 0;
                 self.cursor_col = 0;
             }
@@ -1053,11 +1052,11 @@ impl App {
                 self.pending_num.clear();
                 match self.selection_mode {
                     SelectionMode::Row => {
-                        if let Some(store) = &self.store {
-                            let max_col = store.schema.len().saturating_sub(1);
-                            if self.col_offset < max_col {
-                                self.col_offset += 1;
-                            }
+                        // Stop where the last column sits at the right edge,
+                        // as the other modes do — scrolling further would pad
+                        // the view with empty space rather than show data.
+                        if self.col_offset < self.max_col_offset() {
+                            self.col_offset += 1;
                         }
                     }
                     SelectionMode::Column | SelectionMode::Cell => {
@@ -1079,17 +1078,14 @@ impl App {
                 self.col_offset = 0;
                 self.cursor_col = 0;
             }
-            KeyCode::Char('$')
-                if matches!(
-                    self.selection_mode,
-                    SelectionMode::Column | SelectionMode::Cell
-                ) =>
-            {
+            // '$' scrolls until the last column sits at the right edge.
+            KeyCode::Char('$') => {
                 self.pending_num.clear();
-                if let Some(store) = &self.store {
-                    self.cursor_col = store.schema.len().saturating_sub(1);
-                    // col_offset will be corrected in draw() before the next render.
-                }
+                self.cursor_col = self
+                    .store
+                    .as_ref()
+                    .map_or(0, |s| s.schema.len().saturating_sub(1));
+                self.col_offset = self.max_col_offset();
             }
 
             // Sort by cursor column (Column/Cell mode only). Toggles asc ↔ desc;
@@ -1866,64 +1862,39 @@ impl App {
     /// Mirrors the Phase-1 width logic in `DataTable::render` (no redistribution
     /// needed — only visibility matters here).
     fn col_offset_to_show_at_right(&self, cursor_col: usize) -> usize {
-        const SP: usize = 4; // COLUMN_SPACING
-        const MAX_COL_FRAC: f32 = 0.3;
-        const MIN_COL_WIDTH: usize = 3;
-
-        let store = match &self.store {
-            Some(s) => s,
-            None => return 0,
-        };
-        let df = &store.current_view;
-        let cols = df.columns();
-        if cols.is_empty() {
-            return 0;
+        match &self.store {
+            Some(store) => ui::col_offset_showing(
+                &store.current_view,
+                store.row_offset,
+                self.last_frame_width,
+                cursor_col,
+            ),
+            None => 0,
         }
-        let cursor_col = cursor_col.min(cols.len() - 1);
+    }
 
-        let inner_w = (self.last_frame_width as usize).saturating_sub(2);
-        let max_col = ((inner_w as f32 * MAX_COL_FRAC) as usize).max(MIN_COL_WIDTH);
-
-        // row_num_w — same formula as DataTable::row_num_width
-        let horizon = (store.row_offset + df.height() * 3).max(99);
-        let mut p: usize = 10;
-        while p <= horizon {
-            p *= 10;
+    /// The column the status bar names.
+    ///
+    /// Row mode has no column cursor, so it reports the leftmost visible
+    /// column — which is exactly what `h` and `l` move there. The other modes
+    /// move a cursor, so the readout follows that instead. Either way the
+    /// number moves when the keys that move sideways are pressed.
+    fn col_position(&self) -> usize {
+        match self.selection_mode {
+            SelectionMode::Row => self.col_offset,
+            _ => self.cursor_col,
         }
-        let row_num_w = (p.to_string().len() - 1) + 2;
+    }
 
-        // Natural width for a column (header vs data max).
-        let nat = |ci: usize| -> usize {
-            let c = &cols[ci];
-            let header_w = c.name().len();
-            let data_w = (0..c.len())
-                .map(|i| c.get(i).map(|v| format!("{v}").len()).unwrap_or(0))
-                .max()
-                .unwrap_or(0);
-            header_w.max(data_w).max(MIN_COL_WIDTH)
-        };
-
-        // Budget: space after the row-number column and cursor_col's slot.
-        let cursor_w = nat(cursor_col).min(max_col);
-        let used_by_cursor = SP + cursor_w;
-        let Some(mut budget) = inner_w
-            .saturating_sub(row_num_w)
-            .checked_sub(used_by_cursor)
-        else {
-            return cursor_col; // cursor alone doesn't fit — show it at left edge
-        };
-
-        // Walk left from cursor_col, fitting as many columns as possible.
-        let mut offset = cursor_col;
-        for ci in (0..cursor_col).rev() {
-            let w = nat(ci).min(max_col);
-            if budget < SP + w {
-                break;
-            }
-            budget -= SP + w;
-            offset = ci;
-        }
-        offset
+    /// The furthest right the view can scroll: the offset that leaves the last
+    /// column at the right edge. Going past it pads the view with empty space
+    /// instead of data, which is what row mode used to do.
+    fn max_col_offset(&self) -> usize {
+        let last = self
+            .store
+            .as_ref()
+            .map_or(0, |s| s.schema.len().saturating_sub(1));
+        self.col_offset_to_show_at_right(last)
     }
 }
 
@@ -2155,6 +2126,94 @@ mod tests {
         key(app, KeyCode::Tab);
         key(app, KeyCode::Tab);
         assert_eq!(app.selection_mode, SelectionMode::Cell);
+    }
+
+    /// Eight narrow columns: more than fit, so scrolling has somewhere to go.
+    const WIDE: &str = "a,b,c,d,e,f,g,h\n1,2,3,4,5,6,7,8\n";
+
+    /// `last_frame_width` is normally set by `draw`, which tests do not run.
+    fn app_sized(name: &str, contents: &str, width: u16) -> App {
+        let (mut app, _) = app_with(name, contents);
+        app.last_frame_width = width;
+        app
+    }
+
+    #[test]
+    fn row_mode_stops_where_the_last_column_reaches_the_right_edge() {
+        let mut app = app_sized("wide.csv", WIDE, 40);
+        assert_eq!(app.selection_mode, SelectionMode::Row);
+
+        for _ in 0..20 {
+            press(&mut app, 'l');
+        }
+        let last = 7;
+        assert_eq!(app.col_offset, app.max_col_offset());
+        assert!(
+            app.col_offset < last,
+            "row mode padded the view with empty columns: offset {} of {last}",
+            app.col_offset
+        );
+    }
+
+    #[test]
+    fn dollar_and_zero_move_the_viewport_in_every_mode() {
+        for enter_cell_mode in [false, true] {
+            let mut app = app_sized("ends.csv", WIDE, 40);
+            if enter_cell_mode {
+                cell_mode(&mut app);
+            }
+
+            press(&mut app, '$');
+            assert_eq!(
+                app.col_offset,
+                app.max_col_offset(),
+                "cell={enter_cell_mode}"
+            );
+            assert_eq!(app.cursor_col, 7, "cell={enter_cell_mode}");
+
+            press(&mut app, '0');
+            assert_eq!(app.col_offset, 0, "cell={enter_cell_mode}");
+            assert_eq!(app.cursor_col, 0, "cell={enter_cell_mode}");
+        }
+    }
+
+    #[test]
+    fn zero_stays_a_digit_while_a_count_is_being_typed() {
+        let mut rows = String::from("a,b\n");
+        for i in 0..20 {
+            rows.push_str(&format!("{i},{i}\n"));
+        }
+        let mut app = app_sized("count.csv", &rows, 40);
+        cell_mode(&mut app);
+
+        press(&mut app, '1');
+        press(&mut app, '0');
+        assert_eq!(app.pending_num, "10", "'0' continued the count");
+        press(&mut app, 'j');
+        assert_eq!(app.cursor_row, 10);
+
+        // On its own it is still the jump to the first column.
+        press(&mut app, 'l');
+        press(&mut app, '0');
+        assert_eq!(app.cursor_col, 0);
+    }
+
+    #[test]
+    fn the_column_readout_follows_whatever_is_moving() {
+        let mut app = app_sized("readout.csv", WIDE, 40);
+
+        // Row mode moves the viewport, so the readout tracks that.
+        press(&mut app, 'l');
+        assert_eq!(app.col_offset, 1);
+        assert_eq!(app.col_position(), 1);
+
+        // Cell mode moves a cursor, so it tracks that instead — it used to
+        // sit still while the cursor walked across the screen.
+        cell_mode(&mut app);
+        let before = app.col_position();
+        press(&mut app, 'l');
+        assert_eq!(app.col_position(), app.cursor_col);
+        assert_ne!(app.col_position(), before);
     }
 
     #[test]

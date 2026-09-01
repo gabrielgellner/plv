@@ -9,7 +9,7 @@ pub use browser::{Browser, BrowserState};
 pub use help::{Help, Section};
 pub use prompt::Prompt;
 pub use statusbar::StatusBar;
-pub use table::DataTable;
+pub use table::{DataTable, col_offset_showing};
 pub use theme::Theme;
 
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
