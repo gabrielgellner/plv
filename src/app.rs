@@ -19,6 +19,7 @@ use crate::data::lake_db::{self, LakeDb};
 use crate::lake::{Lake, Level, Scope};
 use crate::search::{SearchQuery, SearchState, SearchStatus};
 use crate::ui::{self, Browser, DataTable, Help, Prompt, Section, SelectionMode, StatusBar, Theme};
+use crate::view;
 use polars::prelude::DataType;
 
 enum AppMode {
@@ -297,6 +298,7 @@ impl App {
                 _ => self.cursor_col,
             };
             let edited = store.edited_cells();
+            let sort_display = store.sort_display();
 
             frame.render_widget(
                 DataTable {
@@ -310,7 +312,7 @@ impl App {
                     search: self.search_state.as_ref(),
                     search_col: self.search_state.as_ref().and_then(|s| s.col_idx),
                     last_vis_col_out: &vis_col_cell,
-                    sort: &store.sort,
+                    sort: &sort_display,
                     sort_tick: self.sort_rx.as_ref().map(|_| self.spinner_tick),
                     edited: &edited,
                     selection: self.visual_range(),
@@ -356,7 +358,7 @@ impl App {
                         ),
                         None => self
                             .edit_cell
-                            .and_then(|(_, col)| store.schema.get_at_index(col))
+                            .and_then(|(_, col)| store.column_info(col))
                             .map_or_else(|| " ".to_string(), |(name, _)| format!(" {name}: ")),
                     };
                     frame.render_widget(
@@ -379,8 +381,9 @@ impl App {
                             file_name,
                             cursor_row,
                             total_rows: store.total_rows,
+                            view: store.view.describe(&store.schema),
                             col_position: self.col_position(),
-                            total_cols: store.schema.len(),
+                            total_cols: store.column_count(),
                             message: self.message.clone(),
                             dirty: store.dirty(),
                             selection: self
@@ -472,6 +475,12 @@ impl App {
             (":w   :w!   :w path", "Write (force / elsewhere)"),
             (":q   :q!   :wq", "Quit (discarding / writing)"),
         ];
+        const VIEWS: &[(&str, &str)] = &[
+            (":select a b", "Show only these columns"),
+            (":hide a b", "Drop these columns"),
+            (":sort a b-", "Sort by columns, `-` for descending"),
+            (":reset [slot]", "Clear select, filter, sort, or all"),
+        ];
         const VISUAL: &[(&str, &str)] = &[
             ("v", "Start or cancel a selection"),
             ("", "Its shape follows the Tab mode"),
@@ -516,6 +525,7 @@ impl App {
             ("Search", SEARCH),
             ("Edit", EDIT),
             ("Visual", VISUAL),
+            ("Views", VIEWS),
             ("General", GENERAL),
         ];
         const BROWSER: &[Section<'static>] = &[("Catalog", BROWSE), ("General", GENERAL)];
@@ -941,10 +951,9 @@ impl App {
                     Ok(query) => {
                         if let Some(store) = &self.store {
                             let col_name = match self.selection_mode {
-                                SelectionMode::Column | SelectionMode::Cell => store
-                                    .schema
-                                    .get_at_index(self.cursor_col)
-                                    .map(|(name, _)| name.to_string()),
+                                SelectionMode::Column | SelectionMode::Cell => {
+                                    store.column_info(self.cursor_col).map(|(name, _)| name)
+                                }
                                 SelectionMode::Row => None,
                             };
                             let (tx, rx) = mpsc::channel();
@@ -1050,7 +1059,7 @@ impl App {
                 self.cursor_col = self
                     .store
                     .as_ref()
-                    .map_or(0, |s| s.schema.len().saturating_sub(1));
+                    .map_or(0, |s| s.column_count().saturating_sub(1));
                 self.col_offset = self.max_col_offset();
             }
 
@@ -1184,7 +1193,7 @@ impl App {
                 self.search_rx = None; // dropping rx cancels background scan
                 self.pending_num.clear();
                 if let Some(store) = &mut self.store
-                    && !store.sort.is_empty()
+                    && !store.view.sort.is_empty()
                 {
                     let _ = store.clear_sort();
                     self.cursor_row = 0;
@@ -1286,7 +1295,7 @@ impl App {
             anchor_col.max(self.cursor_col),
         );
         let all_rows = (0, store.total_rows.saturating_sub(1));
-        let all_cols = (0, store.schema.len().saturating_sub(1));
+        let all_cols = (0, store.column_count().saturating_sub(1));
         Some(match self.selection_mode {
             SelectionMode::Row => (rows, all_cols),
             SelectionMode::Column => (all_rows, cols),
@@ -1372,7 +1381,7 @@ impl App {
             return Ok(());
         };
         let last_row = store.total_rows.saturating_sub(1);
-        let last_col = store.schema.len().saturating_sub(1);
+        let last_col = store.column_count().saturating_sub(1);
 
         let mut edits = Vec::new();
         let mut clipped = 0usize;
@@ -1571,7 +1580,7 @@ impl App {
         let last = self
             .store
             .as_ref()
-            .map_or(0, |s| s.schema.len().saturating_sub(1));
+            .map_or(0, |s| s.column_count().saturating_sub(1));
         let next = self.cursor_col as isize + delta;
         self.end_edit();
         if next < 0 || next as usize > last {
@@ -1591,8 +1600,8 @@ impl App {
         if value.is_empty() {
             return None; // an empty field is a null, which any column takes
         }
-        let (name, dtype) = self.store.as_ref()?.schema.get_at_index(col)?;
-        let fits = match dtype {
+        let (name, dtype) = self.store.as_ref()?.column_info(col)?;
+        let fits = match &dtype {
             d if d.is_integer() => value.parse::<i64>().is_ok(),
             d if d.is_float() => value.parse::<f64>().is_ok(),
             DataType::Boolean => matches!(value, "true" | "false"),
@@ -1671,7 +1680,69 @@ impl App {
                 }
             }
             "q" => self.quit(force),
-            other => self.message = Some(format!("not a command: :{other}")),
+            // Anything else is the view language, which reports its own
+            // unknown-command error against the word that caused it.
+            _ => self.run_view_command(line)?,
+        }
+        Ok(())
+    }
+
+    /// `:select`, `:hide`, `:filter`, `:sort`, `:reset`.
+    ///
+    /// Parsed and checked against the schema first, then tried on the frame:
+    /// a view that will not collect is refused rather than adopted, so one
+    /// mistyped command cannot leave the viewer showing an error.
+    fn run_view_command(&mut self, line: &str) -> anyhow::Result<()> {
+        let Some(store) = &self.store else {
+            self.message = Some("no file open".to_string());
+            return Ok(());
+        };
+        let command = match view::parse(line, &store.schema) {
+            Ok(command) => command,
+            Err(e) => {
+                self.message = Some(e.message);
+                return Ok(());
+            }
+        };
+
+        let mut next = store.view.clone();
+        let was_sorted = next.sort.clone();
+        if let Err(e) = next.apply(command, store.schema.len()) {
+            self.message = Some(e);
+            return Ok(());
+        }
+        let reordered = next.sort != was_sorted;
+
+        if let Some(store) = &mut self.store
+            && let Err(e) = store.apply_view(next)
+        {
+            self.message = Some(e.to_string());
+            return Ok(());
+        }
+        self.after_view_change(reordered)?;
+        Ok(())
+    }
+
+    /// Put the cursor back inside a view that may have fewer columns, and drop
+    /// what was pinned to the old numbering.
+    fn after_view_change(&mut self, reordered: bool) -> anyhow::Result<()> {
+        let last = self
+            .store
+            .as_ref()
+            .map_or(0, |s| s.column_count().saturating_sub(1));
+        self.cursor_col = self.cursor_col.min(last);
+        self.col_offset = self.col_offset.min(last);
+
+        // A selection, and a search's match rows and scoped column, all refer
+        // to the view that has just been replaced.
+        self.visual_anchor = None;
+        self.search_state = None;
+        self.search_rx = None;
+
+        if reordered {
+            // The rows are in a different order, so the cursor's row number no
+            // longer means what it did.
+            self.cursor_to(0)?;
         }
         Ok(())
     }
@@ -1931,7 +2002,7 @@ impl App {
                 let last = self
                     .store
                     .as_ref()
-                    .map_or(0, |s| s.schema.len().saturating_sub(1));
+                    .map_or(0, |s| s.column_count().saturating_sub(1));
                 self.cursor_col = (self.cursor_col + n).min(last);
             }
         }
@@ -1957,7 +2028,7 @@ impl App {
         let last = self
             .store
             .as_ref()
-            .map_or(0, |s| s.schema.len().saturating_sub(1));
+            .map_or(0, |s| s.column_count().saturating_sub(1));
         self.col_offset_to_show_at_right(last)
     }
 }
@@ -2436,6 +2507,142 @@ mod tests {
         press(&mut app, 'b');
         assert_eq!(offset(&app), 11, "zb puts it at the bottom");
         assert_eq!(app.cursor_row, 20, "and none of them move the cursor");
+    }
+
+    const FOURCOL: &str = "a,b,c,d\n1,2,3,4\n5,6,7,8\n";
+
+    fn shown_columns(app: &App) -> Vec<String> {
+        let store = app.store.as_ref().unwrap();
+        store
+            .current_view
+            .get_column_names()
+            .iter()
+            .map(|n| n.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn select_narrows_the_view_to_the_named_columns_in_order() {
+        let mut app = app_sized("select.csv", FOURCOL, 60);
+        command(&mut app, "select c a");
+        assert_eq!(shown_columns(&app), ["c", "a"]);
+        assert_eq!(app.store.as_ref().unwrap().column_count(), 2);
+
+        // Each command replaces the slot rather than narrowing further.
+        command(&mut app, "select b");
+        assert_eq!(shown_columns(&app), ["b"]);
+
+        command(&mut app, "reset");
+        assert_eq!(shown_columns(&app), ["a", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn hide_drops_columns_from_what_is_on_show() {
+        let mut app = app_sized("hide.csv", FOURCOL, 60);
+        command(&mut app, "hide b d");
+        assert_eq!(shown_columns(&app), ["a", "c"]);
+    }
+
+    #[test]
+    fn a_bad_view_command_is_reported_and_changes_nothing() {
+        let mut app = app_sized("badview.csv", FOURCOL, 60);
+        command(&mut app, "select nope");
+        assert!(app.message.clone().unwrap().contains("no column called"));
+        assert_eq!(shown_columns(&app), ["a", "b", "c", "d"], "untouched");
+
+        command(&mut app, "hide a b c d");
+        assert!(app.message.clone().unwrap().contains("hide every column"));
+        assert_eq!(shown_columns(&app), ["a", "b", "c", "d"]);
+    }
+
+    /// The overlay is keyed by source column, so an edit made through a
+    /// reordered view has to land on the right field of the file.
+    #[test]
+    fn editing_through_a_narrowed_view_writes_the_right_column() {
+        let (mut app, path) = app_with("viewedit.csv", FOURCOL);
+        app.last_frame_width = 60;
+        command(&mut app, "select d a");
+        cell_mode(&mut app);
+
+        // Display column 0 is the file's column `d`.
+        press(&mut app, 'c');
+        typed(&mut app, "X");
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(shown_columns(&app), ["d", "a"]);
+        assert_eq!(shown(&app, 0, 0).as_deref(), Some("X"));
+
+        command(&mut app, "w");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "a,b,c,d\n1,2,3,X\n5,6,7,8\n",
+            "the edit belongs to column d, not to column a"
+        );
+    }
+
+    #[test]
+    fn an_edit_hidden_by_a_view_is_still_pending_and_still_written() {
+        let (mut app, path) = app_with("viewhidden.csv", FOURCOL);
+        app.last_frame_width = 60;
+        cell_mode(&mut app);
+        press(&mut app, 'c');
+        typed(&mut app, "Z");
+        key(&mut app, KeyCode::Enter);
+
+        command(&mut app, "select c d");
+        assert!(
+            app.store.as_ref().unwrap().edited_cells().is_empty(),
+            "nowhere on screen to mark it"
+        );
+        assert_eq!(app.store.as_ref().unwrap().dirty(), 1, "but still pending");
+
+        command(&mut app, "w");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "a,b,c,d\nZ,2,3,4\n5,6,7,8\n"
+        );
+    }
+
+    #[test]
+    fn a_narrowing_view_brings_the_cursor_back_inside_it() {
+        let mut app = app_sized("clampview.csv", FOURCOL, 60);
+        cell_mode(&mut app);
+        press(&mut app, '$');
+        assert_eq!(app.cursor_col, 3);
+
+        command(&mut app, "select a b");
+        assert_eq!(app.cursor_col, 1, "the cursor cannot point past the view");
+    }
+
+    #[test]
+    fn sort_from_the_command_line_agrees_with_the_s_key() {
+        let mut app = app_sized("viewsort.csv", FOURCOL, 60);
+        command(&mut app, "sort b-");
+        let store = app.store.as_ref().unwrap();
+        assert_eq!(store.view.sort, [(1, false)]);
+        assert_eq!(store.sort_display(), [(1, false)]);
+        assert_eq!(
+            app.cursor_row, 0,
+            "a reorder puts the cursor back at the top"
+        );
+
+        // And a sort still blocks editing, whichever way it was asked for.
+        assert!(
+            app.store
+                .as_ref()
+                .unwrap()
+                .edit_blocked()
+                .is_some_and(|r| r.contains("sorted"))
+        );
+    }
+
+    #[test]
+    fn a_sort_key_on_a_hidden_column_keeps_working_but_is_not_drawn() {
+        let mut app = app_sized("hiddensort.csv", FOURCOL, 60);
+        command(&mut app, "sort d");
+        command(&mut app, "select a b");
+        let store = app.store.as_ref().unwrap();
+        assert_eq!(store.view.sort, [(3, true)], "the sort still applies");
+        assert!(store.sort_display().is_empty(), "but has no header to mark");
     }
 
     #[test]

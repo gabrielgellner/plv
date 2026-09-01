@@ -143,6 +143,13 @@ Evaluation order is fixed independently of the order commands were typed:
 **filter → sort → select**, as in SQL, so a filter or sort can name a column
 that is not on show.
 
+`Store` holds the `View` and converts at its own boundary: **its indices are
+source columns, everything above it counts display positions.** `source_column`
+/ `display_column` are the crossing points, and the edit overlay goes through
+them in both directions — an edit typed into a reordered view is stored against
+the file's column, and an edit on a column the view hides stays pending and is
+still written by `:w`, it just has nowhere on screen to be marked.
+
 Grammar, deliberately closed: `~` and `!~` are regex and read any column as text
 (as `/` search does); other comparisons require a literal matching the column's
 type; an empty literal `""` means the cells with nothing in them, matching how

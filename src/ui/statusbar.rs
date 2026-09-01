@@ -26,6 +26,8 @@ pub struct StatusBar<'a> {
     pub dirty: usize,
     /// Size of the visual selection as `(rows, columns)`, when there is one.
     pub selection: Option<(usize, usize)>,
+    /// What the active view is doing, when it is doing anything.
+    pub view: Option<String>,
     pub pending_num: String,
     /// A multi-key prefix waiting for its second key, shown as `g-` or `z-`.
     pub pending_prefix: Option<char>,
@@ -73,6 +75,10 @@ impl Widget for StatusBar<'_> {
             self.col_position + 1,
             self.total_cols,
         );
+
+        if let Some(view) = &self.view {
+            left.push_str(&format!("  {view}"));
+        }
 
         if let Some((rows, cols)) = self.selection {
             left.push_str(&format!("  {rows}\u{d7}{cols} sel"));

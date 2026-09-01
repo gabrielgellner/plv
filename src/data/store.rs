@@ -11,6 +11,7 @@ use crate::data::edit::{Cell, Overlay};
 use crate::data::lake_db::{self, LakeSource};
 use crate::data::loader;
 use crate::data::writer::{self, Stamp};
+use crate::view::View;
 
 /// Where a store's rows come from.
 ///
@@ -45,9 +46,12 @@ pub struct Store {
     pub row_offset: usize,
     pub viewport_rows: usize,
     pub current_view: DataFrame,
-    /// Active sort keys in priority order: `(column_index, ascending)`.
-    /// Empty = natural order. First entry is the primary sort key.
-    pub sort: Vec<(usize, bool)>,
+    /// What the viewer is showing: which columns, in what order, sorted how.
+    ///
+    /// Its indices are **source** columns, matching `schema`. Everything above
+    /// this layer counts in *display* positions instead, and `Store` converts
+    /// at its own boundary — see [`Store::source_column`].
+    pub view: View,
     /// Present when the rows came from a delimited text file, which is the
     /// only kind plv can write back.
     edit: Option<EditTarget>,
@@ -81,7 +85,7 @@ impl Store {
             row_offset: 0,
             viewport_rows,
             current_view,
-            sort: Vec::new(),
+            view: View::default(),
             edit: None,
             overlay: Overlay::new(),
         })
@@ -131,15 +135,66 @@ impl Store {
             row_offset: 0,
             viewport_rows,
             current_view,
-            sort: Vec::new(),
+            view: View::default(),
             edit: None,
             overlay: Overlay::new(),
         })
     }
 
+    // ── columns: source indices below, display positions above ───────────
+
+    /// Source column indices, in the order they are shown.
+    pub fn columns(&self) -> Vec<usize> {
+        self.view.columns(self.schema.len())
+    }
+
+    /// How many columns are on show. Not `schema.len()` once a view narrows
+    /// the frame — that is the file's column count, a different question.
+    pub fn column_count(&self) -> usize {
+        self.view
+            .select
+            .as_ref()
+            .map_or_else(|| self.schema.len(), Vec::len)
+    }
+
+    /// The source column behind a display position.
+    pub fn source_column(&self, display: usize) -> Option<usize> {
+        match &self.view.select {
+            Some(cols) => cols.get(display).copied(),
+            None => (display < self.schema.len()).then_some(display),
+        }
+    }
+
+    /// Where a source column appears, if it is on show at all.
+    pub fn display_column(&self, source: usize) -> Option<usize> {
+        match &self.view.select {
+            Some(cols) => cols.iter().position(|&c| c == source),
+            None => (source < self.schema.len()).then_some(source),
+        }
+    }
+
+    /// Name and type of the column at a display position.
+    pub fn column_info(&self, display: usize) -> Option<(String, DataType)> {
+        let source = self.source_column(display)?;
+        self.schema
+            .get_at_index(source)
+            .map(|(name, dtype)| (name.to_string(), dtype.clone()))
+    }
+
+    /// Sort keys as display positions, for the header indicators. A key on a
+    /// column the view has hidden simply does not appear.
+    pub fn sort_display(&self) -> Vec<(usize, bool)> {
+        self.view
+            .sort
+            .iter()
+            .filter_map(|&(source, asc)| self.display_column(source).map(|d| (d, asc)))
+            .collect()
+    }
+
     /// Sort keys as `(column_name, ascending)`, dropping any stale indices.
     fn sort_keys(&self) -> Vec<(String, bool)> {
-        self.sort
+        self.view
+            .sort
             .iter()
             .filter_map(|&(ci, asc)| {
                 self.schema
@@ -149,21 +204,62 @@ impl Store {
             .collect()
     }
 
-    /// Effective lazy frame: base with all sort keys applied in priority order.
+    /// The frame the viewer actually reads: the base with the view composed
+    /// onto it.
+    ///
+    /// The order is fixed and does not follow the order the commands were
+    /// typed — **sort, then projection**, as in SQL — so a sort can name a
+    /// column the view is not showing. Filtering will join the front of the
+    /// same pipeline, but through a row-index set rather than here: a filter
+    /// stops Polars pushing the slice down into the scan, which would turn
+    /// every keypress into a full read of the file.
     fn effective_lf(&self) -> Option<LazyFrame> {
         let Source::Lazy(base) = &self.source else {
             return None;
         };
+        let mut lf = base.clone();
+
         let keys = self.sort_keys();
-        if keys.is_empty() {
-            return Some(base.clone());
+        if !keys.is_empty() {
+            let (names, descending): (Vec<String>, Vec<bool>) =
+                keys.into_iter().map(|(name, asc)| (name, !asc)).unzip();
+            lf = lf.sort(
+                names,
+                SortMultipleOptions::default().with_order_descending_multi(descending),
+            );
         }
-        let (names, descending): (Vec<String>, Vec<bool>) =
-            keys.into_iter().map(|(name, asc)| (name, !asc)).unzip();
-        Some(base.clone().sort(
-            names,
-            SortMultipleOptions::default().with_order_descending_multi(descending),
-        ))
+
+        if self.view.select.is_some() {
+            let shown: Vec<Expr> = self
+                .columns()
+                .into_iter()
+                .filter_map(|source| self.schema.get_at_index(source))
+                .map(|(name, _)| col(name.as_str()))
+                .collect();
+            if !shown.is_empty() {
+                lf = lf.select(shown);
+            }
+        }
+        Some(lf)
+    }
+
+    /// Adopt a new view, keeping the old one if the new one will not collect.
+    ///
+    /// The command was already checked against the schema when it was typed;
+    /// what can still fail is the frame. A viewer showing an error instead of
+    /// data because of one mistyped command would be worse than a refusal.
+    pub fn apply_view(&mut self, view: View) -> Result<()> {
+        let previous = std::mem::replace(&mut self.view, view);
+        match self.fetch(self.row_offset, self.viewport_rows) {
+            Ok(df) => {
+                self.current_view = df;
+                Ok(())
+            }
+            Err(e) => {
+                self.view = previous;
+                Err(e)
+            }
+        }
     }
 
     fn fetch(&self, offset: usize, height: usize) -> Result<DataFrame> {
@@ -187,15 +283,18 @@ impl Store {
     /// Updates sort state immediately and spawns a background thread to fetch
     /// the new first page. The caller should replace `current_view` when the
     /// DataFrame arrives on the returned receiver.
-    pub fn begin_sort(&mut self, col_idx: usize) -> mpsc::Receiver<DataFrame> {
-        if let Some(entry) = self.sort.iter_mut().find(|(ci, _)| *ci == col_idx) {
+    pub fn begin_sort(&mut self, display_col: usize) -> mpsc::Receiver<DataFrame> {
+        let (tx, rx) = mpsc::channel();
+        let Some(source_col) = self.source_column(display_col) else {
+            return rx;
+        };
+        if let Some(entry) = self.view.sort.iter_mut().find(|(ci, _)| *ci == source_col) {
             entry.1 = !entry.1;
         } else {
-            self.sort.push((col_idx, true));
+            self.view.sort.push((source_col, true));
         }
         self.row_offset = 0;
         let vp = self.viewport_rows;
-        let (tx, rx) = mpsc::channel();
 
         match &self.source {
             Source::Lazy(_) => {
@@ -226,7 +325,7 @@ impl Store {
 
     /// Clear all sort keys and return to natural order.
     pub fn clear_sort(&mut self) -> Result<()> {
-        self.sort.clear();
+        self.view.sort.clear();
         self.row_offset = 0;
         self.current_view = self.fetch(0, self.viewport_rows)?;
         Ok(())
@@ -266,7 +365,7 @@ impl Store {
                 Source::Lazy(_) => "only csv, tsv, tab and txt files can be edited",
             });
         }
-        if !self.sort.is_empty() {
+        if !self.view.sort.is_empty() {
             // A sorted page's rows are not the file's rows, so an edit could
             // not be told which line it belongs to.
             return Some("cannot edit a sorted view — clear the sort first");
@@ -301,10 +400,20 @@ impl Store {
         self.overlay.len()
     }
 
-    /// Apply `edits` — each keyed by row in the *source file* and column index
-    /// — as a single undoable change.
+    /// Apply `edits` as a single undoable change. Rows are source rows;
+    /// columns are display positions.
     pub fn edit<I: IntoIterator<Item = (Cell, String)>>(&mut self, edits: I) -> Result<()> {
-        self.overlay.set(edits);
+        // Cells arrive in display coordinates, as everything above this layer
+        // counts them, and are stored against source columns — so an edit made
+        // through a narrowed or reordered view still lands on the right field
+        // of the file.
+        let mapped: Vec<(Cell, String)> = edits
+            .into_iter()
+            .filter_map(|((row, display), value)| {
+                self.source_column(display).map(|col| ((row, col), value))
+            })
+            .collect();
+        self.overlay.set(mapped);
         self.refresh()
     }
 
@@ -390,13 +499,17 @@ impl Store {
         }
         let height = df.height();
 
+        // Keyed by display position: the overlay stores source columns, and a
+        // view can reorder them, hide them, or both.
         let mut by_column: BTreeMap<usize, Vec<(usize, &str)>> = BTreeMap::new();
         for (local, cells) in self.edits_in_page(offset, height) {
-            for (&col, value) in cells {
-                by_column
-                    .entry(col)
-                    .or_default()
-                    .push((local, value.as_str()));
+            for (&source, value) in cells {
+                if let Some(display) = self.display_column(source) {
+                    by_column
+                        .entry(display)
+                        .or_default()
+                        .push((local, value.as_str()));
+                }
             }
         }
 
@@ -503,10 +616,16 @@ impl Store {
     }
 
     /// Pending edits inside the current page, as `(row within the page,
-    /// column index)` — what the table needs in order to mark them.
+    /// display position)` — what the table needs in order to mark them. Edits
+    /// on a column the view has hidden are not reported: there is nowhere on
+    /// screen to report them.
     pub fn edited_cells(&self) -> Vec<(usize, usize)> {
         self.edits_in_page(self.row_offset, self.current_view.height())
-            .flat_map(|(local, cells)| cells.keys().map(move |&col| (local, col)))
+            .flat_map(|(local, cells)| {
+                cells
+                    .keys()
+                    .filter_map(move |&source| Some((local, self.display_column(source)?)))
+            })
             .collect()
     }
 
