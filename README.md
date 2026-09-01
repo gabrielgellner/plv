@@ -1,8 +1,8 @@
 # plv
 
-A terminal viewer for CSV, Parquet and [DuckLake](https://ducklake.select/) data, inspired by [csvlens](https://github.com/YS-L/csvlens). Built with [Polars](https://pola.rs/) and [ratatui](https://ratatui.rs/).
+A terminal viewer for CSV, TSV, Parquet and [DuckLake](https://ducklake.select/) data, inspired by [csvlens](https://github.com/YS-L/csvlens). Built with [Polars](https://pola.rs/) and [ratatui](https://ratatui.rs/).
 
-- Supports CSV, Parquet, and DuckLake lakes
+- Supports CSV, tab-separated text, Parquet, and DuckLake lakes
 - Larger-than-memory files via Polars lazy evaluation
 - Browse a lake's tables, partition files and snapshots — including time travel
 - Vim-style navigation
@@ -11,6 +11,7 @@ A terminal viewer for CSV, Parquet and [DuckLake](https://ducklake.select/) data
 
 ```
 plv <file.csv>
+plv <file.tsv>          # also .tab; .txt sniffs its delimiter
 plv <file.parquet>
 plv <lake.ducklake>      # a DuckLake catalog
 plv <bundle-dir>/        # a directory containing one
@@ -108,7 +109,7 @@ Lake tables are read through DuckDB's `ducklake` extension — DuckLake's own
 reference reader. That means what you see is the **logical** table: rows that
 DuckLake has inlined into the catalog database are included, delete files are
 applied, and schema evolution is handled by the format's implementation rather
-than by plv. CSV and Parquet files still go through Polars.
+than by plv. CSV, TSV and Parquet files still go through Polars.
 
 Notes:
 
