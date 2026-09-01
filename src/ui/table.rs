@@ -79,10 +79,28 @@ fn row_num_width(row_offset: usize, viewport_rows: usize) -> usize {
     (p.to_string().len() - 1) + 2 // +2: one left-padding space + the │ char
 }
 
+/// One cell as the viewer shows it.
+///
+/// `AnyValue`'s own `Display` wraps strings in quotes — it is written for
+/// debugging, where telling `1` from `"1"` matters. In a viewer over a file
+/// that is text to begin with, the quotes are noise that also costs two
+/// columns of width per cell. `str_value` gives the bare text for strings and
+/// categoricals, `null` for nulls, and `Display` for everything else, so
+/// numbers, booleans and dates are unchanged.
+fn cell_text(value: AnyValue) -> String {
+    value.str_value().into_owned()
+}
+
 fn natural_col_width(col: &Column) -> usize {
-    let header_w = col.name().len();
+    // Counted in characters, because that is what `truncate` and the column
+    // layout work in — bytes would over-size any column holding non-ASCII.
+    let header_w = col.name().chars().count();
     let data_w = (0..col.len())
-        .map(|i| col.get(i).map(|v| format!("{v}").len()).unwrap_or(0))
+        .map(|i| {
+            col.get(i)
+                .map(|v| cell_text(v).chars().count())
+                .unwrap_or(0)
+        })
         .max()
         .unwrap_or(0);
     header_w.max(data_w).max(MIN_COL_WIDTH)
@@ -388,7 +406,7 @@ impl Widget for DataTable<'_> {
 
                 for (idx, &ci) in vis_cols.iter().enumerate() {
                     let val = match cols[ci].get(ri) {
-                        Ok(v) => truncate(&format!("{v}"), final_widths[idx]),
+                        Ok(v) => truncate(&cell_text(v), final_widths[idx]),
                         Err(_) => "null".to_string(),
                     };
                     let cs = cell_style(ci);
@@ -427,7 +445,7 @@ impl Widget for DataTable<'_> {
                 // Partial right-edge column — only truncate+ellipsis when needed.
                 if has_partial && next_col_idx < cols.len() {
                     let val = match cols[next_col_idx].get(ri) {
-                        Ok(v) => format!("{v}"),
+                        Ok(v) => cell_text(v),
                         Err(_) => "null".to_string(),
                     };
                     let display = if val.chars().count() >= partial_width {
@@ -586,6 +604,43 @@ mod tests {
             .collect();
 
         assert_eq!(gutters, ["#", "1", "2", "3", "4", "5"], "{lines:#?}");
+    }
+
+    #[test]
+    fn text_cells_are_shown_without_the_debug_quoting() {
+        let lines = rendered(0, true);
+        let body = lines.join("\n");
+        assert!(
+            body.contains(" a ") && !body.contains("\"a\""),
+            "strings should render bare:\n{body}"
+        );
+    }
+
+    #[test]
+    fn cell_text_quotes_nothing_and_still_names_a_null() {
+        assert_eq!(cell_text(AnyValue::String("alpha")), "alpha");
+        assert_eq!(cell_text(AnyValue::StringOwned("beta".into())), "beta");
+        // A string that looks like a number is still shown as it reads in the
+        // file; the column header and its alignment say what the type is.
+        assert_eq!(cell_text(AnyValue::String("1")), "1");
+        assert_eq!(cell_text(AnyValue::Int64(42)), "42");
+        assert_eq!(cell_text(AnyValue::Float64(1.5)), "1.5");
+        assert_eq!(cell_text(AnyValue::Boolean(true)), "true");
+        assert_eq!(cell_text(AnyValue::Null), "null");
+    }
+
+    #[test]
+    fn a_column_is_measured_in_characters_not_bytes() {
+        // Bytes would make this column three wider than it renders.
+        let df = df! { "n" => ["éàü"] }.unwrap();
+        assert_eq!(natural_col_width(&df.columns()[0]), MIN_COL_WIDTH.max(3));
+    }
+
+    #[test]
+    fn quoting_no_longer_pads_the_column_width() {
+        let df = df! { "s" => ["alpha"] }.unwrap();
+        // "alpha" is five characters; the quotes used to make it seven.
+        assert_eq!(natural_col_width(&df.columns()[0]), 5);
     }
 
     /// The width the gutter asks for only grows at powers of ten, so scrolling
