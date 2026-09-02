@@ -161,6 +161,23 @@ want the answer progressively. It buys a real row count, cancellation, and row
 identity, which is what lets the edit buffer survive a filter: a row picked out
 of a filtered view still knows which line of the file it came from.
 
+**A sort is held, not redone.** Sorting cannot be lazy — nothing can know which
+row comes first without reading them all — so a lazily sorted page costs a full
+read of the file, *every page*. `Store::resort()` does it once instead and keeps
+the whole sorted frame, which costs about what one of those pages cost: measured
+on 2M rows, 102ms to sort and then 5µs for four pages. The frame carries a
+`__src__` column added *before* the sort, so every displayed row knows its line
+in the file — which is what lets a sorted view be edited at all.
+
+Past `SORT_CELL_CAP` plv **refuses to sort at all** rather than falling back to
+a lazy sort. Falling back looks like the kindness and is not: Polars has to read
+and rank every row either way, so a lazy sort of a table that does not fit does
+not degrade, it fails slowly. Measured against an 842M-row census parquet, the
+lazy path reached 12.5GB resident in 45 seconds without producing a page; the
+refusal peaks at 125MB. `Store::sort_blocked()` is asked *before* a key is
+recorded, so a refusal leaves the view as it was. Lake tables sort through
+DuckDB, which spills, and are not capped.
+
 A filter and a sort are refused together for now: a sort puts the rows in an
 order the source row numbers no longer describe, so the set would have to be
 rebuilt on every sort.

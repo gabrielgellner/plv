@@ -14,6 +14,25 @@ use crate::data::rows::{self, RowSet};
 use crate::data::writer::{self, Stamp};
 use crate::view::View;
 
+/// The column a materialised sort carries to remember where each row came
+/// from in the file. Added before the sort, so it records the file's order.
+const SOURCE_ROW: &str = "__src__";
+
+/// A sorted frame is kept in memory, so there has to be a point past which it
+/// is not — and past which plv declines to sort at all.
+///
+/// Falling back to a lazy sort was the obvious kindness and is the wrong one.
+/// Polars has to read and rank every row either way, so a lazy sort of a table
+/// that does not fit does not degrade, it just fails slowly: measured against
+/// an 842M-row census parquet, the lazy path reached **12.5GB resident in 45
+/// seconds** without producing a page. Refusing is the honest answer.
+///
+/// Cells rather than bytes, because it is the only size knowable before
+/// reading anything. It is a rough proxy — a table of long strings weighs far
+/// more per cell than one of integers — so this is set where a miss is
+/// survivable rather than where it is exact.
+const SORT_CELL_CAP: usize = 50_000_000;
+
 /// Where a store's rows come from.
 ///
 /// CSV and Parquet are read lazily by Polars. Lake tables go through DuckDB's
@@ -61,6 +80,15 @@ pub struct Store {
     /// The rows a `:filter` matched, when one is active. Present means the
     /// viewer is paging through this set rather than through the file.
     filter_rows: Option<RowSet>,
+    /// The whole sorted table, held in memory, carrying [`SOURCE_ROW`].
+    ///
+    /// Sorting cannot be lazy — nothing can know which row comes first
+    /// without reading them all — so a lazily sorted page costs a full read
+    /// of the file, *every page*. Doing it once and keeping the answer costs
+    /// the same as one of those pages and makes the rest free. It is also
+    /// what gives a sorted view row identity, which is what lets it be
+    /// edited.
+    sorted: Option<DataFrame>,
 }
 
 impl Store {
@@ -93,6 +121,7 @@ impl Store {
             edit: None,
             overlay: Overlay::new(),
             filter_rows: None,
+            sorted: None,
         })
     }
 
@@ -144,6 +173,7 @@ impl Store {
             edit: None,
             overlay: Overlay::new(),
             filter_rows: None,
+            sorted: None,
         })
     }
 
@@ -152,25 +182,45 @@ impl Store {
     /// Rows on show. Not `total_rows`, which stays the file's own count —
     /// the writer needs that to check it is looking at the same file.
     pub fn row_count(&self) -> usize {
-        match &self.filter_rows {
-            Some(set) => set.len(),
-            None => self.total_rows,
+        match (&self.sorted, &self.filter_rows) {
+            (Some(sorted), _) => sorted.height(),
+            (None, Some(set)) => set.len(),
+            (None, None) => self.total_rows,
         }
     }
 
     /// The source row behind a display position.
     pub fn source_row(&self, display: usize) -> Option<usize> {
+        if let Some(sorted) = &self.sorted {
+            // The sort carried the file's row numbers along with it.
+            return sorted
+                .column(SOURCE_ROW)
+                .ok()?
+                .u32()
+                .ok()?
+                .get(display)
+                .map(|row| row as usize);
+        }
         match &self.filter_rows {
             Some(set) => set.source(display),
             None => (display < self.total_rows).then_some(display),
         }
     }
 
-    /// Where a source row appears, if it survived the filter.
-    pub fn display_row(&self, source: usize) -> Option<usize> {
+    /// Turn a row index reported by a background search into a display
+    /// position.
+    ///
+    /// The search reads whatever frame the viewer is reading, so under a sort
+    /// it already reports display positions. Under a filter it reads the file
+    /// and reports the file's rows, which have to be looked up — and a row the
+    /// filter dropped has nowhere to go.
+    pub fn search_row_to_display(&self, reported: usize) -> Option<usize> {
+        if self.sorted.is_some() {
+            return Some(reported);
+        }
         match &self.filter_rows {
-            Some(set) => set.display(source),
-            None => (source < self.total_rows).then_some(source),
+            Some(set) => set.display(reported),
+            None => (reported < self.total_rows).then_some(reported),
         }
     }
 
@@ -303,6 +353,10 @@ impl Store {
     }
 
     fn fetch(&self, offset: usize, height: usize) -> Result<DataFrame> {
+        if let Some(sorted) = &self.sorted {
+            let df = self.page_of_sorted(sorted, offset, height)?;
+            return self.apply_overlay(df, offset);
+        }
         let df = match &self.source {
             Source::Lazy(_) => {
                 let lf = self.effective_lf().expect("lazy source");
@@ -328,6 +382,24 @@ impl Store {
     /// span is the unavoidable part — those rows have to be read — and Polars
     /// still pushes that slice into the scan, so it costs what scrolling to
     /// the same point unfiltered would.
+    /// A page of the materialised sorted frame: sliced, with the bookkeeping
+    /// column dropped and the view's projection applied.
+    fn page_of_sorted(
+        &self,
+        sorted: &DataFrame,
+        offset: usize,
+        height: usize,
+    ) -> Result<DataFrame> {
+        let page = sorted.slice(offset as i64, height);
+        let shown: Vec<PlSmallStr> = self
+            .columns()
+            .into_iter()
+            .filter_map(|source| self.schema.get_at_index(source))
+            .map(|(name, _)| name.clone())
+            .collect();
+        Ok(page.select(shown)?)
+    }
+
     fn gather(lf: &LazyFrame, set: &RowSet, offset: usize, height: usize) -> Result<DataFrame> {
         let page = set.page(offset, height);
         let (Some(&first), Some(&last)) = (page.first(), page.last()) else {
@@ -356,14 +428,38 @@ impl Store {
         } else {
             self.view.sort.push((source_col, true));
         }
+        drop(tx);
+        drop(rx);
+        self.resort()
+    }
+
+    /// Rebuild whatever the current sort needs, off the main thread.
+    ///
+    /// For a frame that fits, that is the whole sorted table: paying one full
+    /// read once instead of one per page. Past the cap, and for lake tables,
+    /// it stays the old first-page fetch — the sort is redone per page, which
+    /// is slow but works.
+    pub fn resort(&mut self) -> mpsc::Receiver<DataFrame> {
+        let (tx, rx) = mpsc::channel();
+        self.sorted = None;
         self.row_offset = 0;
+
+        if self.view.sort.is_empty() {
+            let _ = self.refresh();
+            return rx;
+        }
+
         let vp = self.viewport_rows;
+        let keys = self.sort_keys();
 
         match &self.source {
-            Source::Lazy(_) => {
-                let lf = self.effective_lf().expect("lazy source");
+            // Held or not at all: see `SORT_CELL_CAP`. Callers ask
+            // `sort_blocked` first, so reaching here past the cap would be a
+            // bug rather than a slow path.
+            Source::Lazy(base) => {
+                let base = base.clone();
                 thread::spawn(move || {
-                    if let Ok(df) = Self::fetch_lazy(&lf, 0, vp) {
+                    if let Ok(df) = Self::materialise(base, &keys) {
                         let _ = tx.send(df);
                     }
                 });
@@ -375,7 +471,6 @@ impl Store {
                     return rx;
                 };
                 let source = query.source.clone();
-                let keys = self.sort_keys();
                 thread::spawn(move || {
                     if let Ok(df) = lake_db::page_with(&conn, &source, &keys, 0, vp) {
                         let _ = tx.send(df);
@@ -386,9 +481,64 @@ impl Store {
         rx
     }
 
+    /// Whether the sorted frame is small enough to keep.
+    fn sort_fits(&self) -> bool {
+        sort_fits(self.total_rows, self.schema.len())
+    }
+
+    /// Why this store will not sort, or `None` when it will.
+    ///
+    /// Asked *before* a sort key is recorded, so a refusal leaves the view as
+    /// it was rather than in an order nothing can produce.
+    pub fn sort_blocked(&self) -> Option<String> {
+        if matches!(self.source, Source::Lazy(_)) && !self.sort_fits() {
+            return Some(format!(
+                "{} rows across {} columns is too much to sort — it has to be held in memory",
+                self.total_rows,
+                self.schema.len()
+            ));
+        }
+        None
+    }
+
+    /// Sort the whole frame, carrying the file's row numbers through it.
+    ///
+    /// The row index goes on *before* the sort, so it records where each row
+    /// came from rather than where it ended up.
+    fn materialise(base: LazyFrame, keys: &[(String, bool)]) -> Result<DataFrame> {
+        let (names, descending): (Vec<String>, Vec<bool>) = keys
+            .iter()
+            .cloned()
+            .map(|(name, ascending)| (name, !ascending))
+            .unzip();
+        Ok(base
+            .with_row_index(SOURCE_ROW, None)
+            .sort(
+                names,
+                SortMultipleOptions::default().with_order_descending_multi(descending),
+            )
+            .collect()?)
+    }
+
+    /// Take the result of a sort.
+    ///
+    /// A frame carrying [`SOURCE_ROW`] is the whole sorted table and is kept;
+    /// anything else is one page, fetched the old way because the table was
+    /// too big to hold.
+    pub fn adopt_sorted(&mut self, df: DataFrame) -> Result<()> {
+        if df.column(SOURCE_ROW).is_ok() {
+            self.sorted = Some(df);
+            self.refresh()
+        } else {
+            self.current_view = self.apply_overlay(df, self.row_offset)?;
+            Ok(())
+        }
+    }
+
     /// Clear all sort keys and return to natural order.
     pub fn clear_sort(&mut self) -> Result<()> {
         self.view.sort.clear();
+        self.sorted = None;
         self.row_offset = 0;
         self.current_view = self.fetch(0, self.viewport_rows)?;
         Ok(())
@@ -428,10 +578,13 @@ impl Store {
                 Source::Lazy(_) => "only csv, tsv, tab and txt files can be edited",
             });
         }
-        if !self.view.sort.is_empty() {
-            // A sorted page's rows are not the file's rows, so an edit could
-            // not be told which line it belongs to.
-            return Some("cannot edit a sorted view — clear the sort first");
+        if !self.view.sort.is_empty() && self.sorted.is_none() {
+            // Without the sorted frame there is no record of where each row
+            // came from, so an edit could not be told which line it belongs
+            // to. Which of the two reasons it is matters: one passes.
+            // Sorting past the cap is refused outright, so a sort that is
+            // set but not held can only be one still being built.
+            return Some("still sorting");
         }
         None
     }
@@ -542,6 +695,8 @@ impl Store {
         let mut lf = loader::load(&path)?;
         self.schema = lf.collect_schema()?;
         self.source = Source::Lazy(lf);
+        // The held sort describes the file as it was before the write.
+        self.sorted = None;
         self.refresh()
     }
 
@@ -600,11 +755,8 @@ impl Store {
         let dtype = column.dtype().clone();
 
         let text = column.cast(&DataType::String)?;
-        let mut values: Vec<Option<String>> = text
-            .str()?
-            .iter()
-            .map(|v| v.map(str::to_string))
-            .collect();
+        let mut values: Vec<Option<String>> =
+            text.str()?.iter().map(|v| v.map(str::to_string)).collect();
         for &(row, value) in edits {
             // An empty field is a null, matching how it is read and written.
             values[row] = (!value.is_empty()).then(|| value.to_string());
@@ -630,13 +782,13 @@ impl Store {
         offset: usize,
         height: usize,
     ) -> impl Iterator<Item = (usize, &BTreeMap<usize, String>)> {
-        // Every edit is considered rather than the run between two offsets: a
-        // filter can drop rows from between them, so "past the page" is no
-        // longer something the source row number can be asked directly. There
-        // are few edits and one page, so this is cheap either way.
-        self.overlay.rows().filter_map(move |(source, cells)| {
-            let local = self.display_row(source)?.checked_sub(offset)?;
-            (local < height).then_some((local, cells))
+        // Asked row by row rather than edit by edit. A filter or a sort can
+        // put any file row at any display position, so going the other way
+        // would mean searching for each edit; going this way is one lookup per
+        // row on screen, whatever the view is doing.
+        (0..height).filter_map(move |local| {
+            let source = self.source_row(offset + local)?;
+            Some((local, self.overlay.row(source)?))
         })
     }
 
@@ -771,11 +923,17 @@ impl Store {
     }
 
     fn search_lazy(&self, pattern: String, col_name: Option<String>, tx: mpsc::Sender<Vec<usize>>) {
-        let Some(lf) = self.effective_lf() else {
-            return;
+        // A held sort is both the frame on screen and much the faster thing to
+        // scan; without one, fall back to the lazy pipeline.
+        let (lf, total) = match &self.sorted {
+            Some(sorted) => (sorted.clone().lazy(), sorted.height()),
+            None => match self.effective_lf() {
+                Some(lf) => (lf, self.total_rows),
+                None => return,
+            },
         };
         let schema = self.schema.clone();
-        Self::scan_rows(lf, self.total_rows, tx, move || {
+        Self::scan_rows(lf, total, tx, move || {
             // Built inside the thread: an `Expr` is not `Send`.
             match col_name {
                 Some(name) => Some(matches_pattern(&name, &pattern)),
@@ -893,6 +1051,11 @@ impl Store {
         let df = lf.clone().select([len().alias("n")]).collect()?;
         Ok(df.column("n")?.u32()?.get(0).unwrap_or(0) as usize)
     }
+}
+
+/// Whether a table of this shape can be sorted at all — see [`SORT_CELL_CAP`].
+fn sort_fits(rows: usize, columns: usize) -> bool {
+    rows.saturating_mul(columns) <= SORT_CELL_CAP
 }
 
 /// A column rendered as text and matched against a pattern — how `/` search
@@ -1059,18 +1222,94 @@ mod tests {
         assert!(!store.redo().unwrap());
     }
 
+    /// Sorting runs off the main thread; wait for it and take the result.
+    fn settle_sort(store: &mut Store, rx: std::sync::mpsc::Receiver<DataFrame>) {
+        let df = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the sort never finished");
+        store.adopt_sorted(df).unwrap();
+    }
+
     #[test]
-    fn a_sorted_view_refuses_edits() {
+    fn a_table_too_big_to_hold_is_not_sorted_at_all() {
+        // Measured against an 842M-row census parquet: sorting it lazily
+        // reached 12.5GB resident in 45s without producing a page, so the
+        // answer past the cap is no rather than "slowly".
+        assert!(sort_fits(1_000_000, 20), "a million rows of twenty is fine");
+        assert!(sort_fits(SORT_CELL_CAP, 1));
+        assert!(!sort_fits(SORT_CELL_CAP + 1, 1));
+        assert!(!sort_fits(842_209_475, 20), "the census parquet");
+        // Multiplying the shape must not wrap into a false yes.
+        assert!(!sort_fits(usize::MAX, 20));
+    }
+
+    #[test]
+    fn an_ordinary_file_is_sortable() {
+        let path = write_temp("sortable.csv", SAMPLE);
+        let store = Store::open_file(&path, 10).unwrap();
+        assert_eq!(store.sort_blocked(), None);
+    }
+
+    #[test]
+    fn a_held_sort_keeps_the_rows_identifiable_and_editable() {
         let path = write_temp("sorted.csv", SAMPLE);
         let mut store = Store::open_file(&path, 10).unwrap();
         assert_eq!(store.edit_blocked(), None);
 
-        let _rx = store.begin_sort(0);
-        let blocked = store.edit_blocked().expect("sorted views are not editable");
-        assert!(blocked.contains("sorted"), "{blocked}");
+        let rx = store.begin_sort(0);
+        // Until it lands there is no record of where the rows came from.
+        assert_eq!(store.edit_blocked(), Some("still sorting"));
+        settle_sort(&mut store, rx);
+
+        // Held, so every displayed row knows its line in the file — which is
+        // what editing a sorted view needs.
+        assert_eq!(store.edit_blocked(), None);
+        assert_eq!(store.row_count(), 4);
+        for display in 0..4 {
+            assert!(store.source_row(display).is_some(), "row {display}");
+        }
 
         store.clear_sort().unwrap();
         assert_eq!(store.edit_blocked(), None);
+    }
+
+    #[test]
+    fn a_descending_sort_reverses_the_page_and_remembers_the_file_order() {
+        let path = write_temp("sortorder.csv", SAMPLE);
+        let mut store = Store::open_file(&path, 10).unwrap();
+
+        let rx = store.begin_sort(0); // ascending by name
+        settle_sort(&mut store, rx);
+        assert_eq!(cell(&store.current_view, 0, 0).as_deref(), Some("a"));
+        assert_eq!(store.source_row(0), Some(0));
+
+        let rx = store.begin_sort(0); // pressing again reverses it
+        settle_sort(&mut store, rx);
+        assert_eq!(cell(&store.current_view, 0, 0).as_deref(), Some("d"));
+        assert_eq!(store.source_row(0), Some(3), "d is the file's fourth row");
+
+        // The bookkeeping column is not something the viewer shows.
+        assert_eq!(store.current_view.width(), 2);
+    }
+
+    #[test]
+    fn an_edit_through_a_sorted_view_lands_on_the_right_line() {
+        let path = write_temp("sortedit.csv", SAMPLE);
+        let mut store = Store::open_file(&path, 10).unwrap();
+        let rx = store.begin_sort(0);
+        settle_sort(&mut store, rx);
+        let rx = store.begin_sort(0); // descending: d, c, b, a
+        settle_sort(&mut store, rx);
+
+        // Display row 0 is `d`, the file's fourth row.
+        store.edit([((0, 1), "99".to_string())]).unwrap();
+        assert_eq!(cell(&store.current_view, 1, 0).as_deref(), Some("99"));
+
+        store.save(None, false).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "name,count\na,1\nb,2\nc,3\nd,99\n"
+        );
     }
 
     #[test]
