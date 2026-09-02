@@ -166,22 +166,8 @@ impl View {
                 }
                 self.select = Some(kept);
             }
-            Command::Filter(filter) => {
-                // A filter is resolved to a set of source rows; a sort puts the
-                // rows in an order those numbers no longer describe. Carrying
-                // both would mean re-deriving the set on every sort, so for now
-                // the two are exclusive and say so.
-                if !self.sort.is_empty() {
-                    return Err("cannot filter a sorted view — :sort clears it".to_string());
-                }
-                self.filter = Some(filter);
-            }
-            Command::Sort(keys) => {
-                if self.filter.is_some() && !keys.is_empty() {
-                    return Err("cannot sort a filtered view — :filter clears it".to_string());
-                }
-                self.sort = keys;
-            }
+            Command::Filter(filter) => self.filter = Some(filter),
+            Command::Sort(keys) => self.sort = keys,
             Command::Reset(None) => *self = Self::default(),
             Command::Reset(Some(Slot::Select)) => self.select = None,
             Command::Reset(Some(Slot::Filter)) => self.filter = None,
@@ -887,20 +873,15 @@ mod tests {
     }
 
     #[test]
-    fn a_filter_and_a_sort_are_refused_together() {
+    fn a_filter_and_a_sort_hold_at_the_same_time() {
         let mut view = View::default();
         view.apply(ok("sort name"), 6).unwrap();
-        let e = view.apply(ok("filter count > 1"), 6).unwrap_err();
-        assert!(e.contains("sorted view"), "{e}");
-        assert!(view.filter.is_none(), "and the sort is left alone");
-
-        view.apply(ok("sort"), 6).unwrap();
         view.apply(ok("filter count > 1"), 6).unwrap();
-        let e = view.apply(ok("sort name"), 6).unwrap_err();
-        assert!(e.contains("filtered view"), "{e}");
+        assert!(view.filter.is_some() && !view.sort.is_empty());
 
-        // Clearing either one is always allowed.
+        // And each still clears on its own.
         view.apply(ok("sort"), 6).unwrap();
+        assert!(view.filter.is_some(), "clearing one leaves the other");
         view.apply(ok("filter"), 6).unwrap();
         assert!(view.is_empty());
     }

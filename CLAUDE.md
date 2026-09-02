@@ -178,9 +178,17 @@ refusal peaks at 125MB. `Store::sort_blocked()` is asked *before* a key is
 recorded, so a refusal leaves the view as it was. Lake tables sort through
 DuckDB, which spills, and are not capped.
 
-A filter and a sort are refused together for now: a sort puts the rows in an
-order the source row numbers no longer describe, so the set would have to be
-rebuilt on every sort.
+**A filter and a sort compose, and only one mechanism runs at a time.** With a
+sort held the whole table is already in memory, so the filter is applied as part
+of building that frame — `with_row_index` first so the row numbers are the
+file's, then the filter, then the sort — and no row-set scan is started, because
+it would be re-reading a file that has already been read. Without a sort the
+scan is the cheaper answer, since it materialises nothing.
+
+That also sharpens the sort cap: a filter that has finished resolving has
+already narrowed the table, so `sort_fits` asks how many rows are on show rather
+than how many the file holds. A small slice of a table far too big to sort whole
+can still be sorted.
 
 `Store` holds the `View` and converts at its own boundary: **its indices are
 source columns, everything above it counts display positions.** `source_column`

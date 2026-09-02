@@ -1167,11 +1167,6 @@ impl App {
                 ) =>
             {
                 self.visual_anchor = None;
-                if self.store.as_ref().is_some_and(|s| s.view.filter.is_some()) {
-                    self.message =
-                        Some("cannot sort a filtered view — :filter clears it".to_string());
-                    return Ok(());
-                }
                 if let Some(reason) = self.store.as_ref().and_then(Store::sort_blocked) {
                     self.message = Some(reason);
                     return Ok(());
@@ -1894,21 +1889,34 @@ impl App {
             self.message = Some(e.to_string());
             return Ok(());
         }
-        if reordered && let Some(store) = &mut self.store {
-            // A sort has to be rebuilt whichever way it was asked for, so the
-            // command line and the `s` key go through the same path.
-            self.sort_rx = Some(store.resort());
+        if reordered || refiltered {
+            self.rebuild_view();
         }
-        if refiltered && let Some(store) = &mut self.store {
-            // Dropping the old receiver cancels a scan still running.
-            self.filter_rx = None;
+        self.after_view_change(reordered || refiltered)?;
+        Ok(())
+    }
+
+    /// Rebuild whatever backs the view, after a sort or a filter changed.
+    ///
+    /// The two are never both running. A held sort has the whole table in
+    /// memory and applies the filter as part of building it, so a row-set scan
+    /// would be re-reading a file that is already read. Without a sort the
+    /// scan is the cheaper answer, because it never materialises anything.
+    fn rebuild_view(&mut self) {
+        // Dropping the receivers cancels whatever was still running.
+        self.sort_rx = None;
+        self.filter_rx = None;
+        let Some(store) = &mut self.store else {
+            return;
+        };
+        if store.view.sort.is_empty() {
             match store.begin_filter() {
                 Ok(rx) => self.filter_rx = rx,
                 Err(e) => self.message = Some(e.to_string()),
             }
+        } else {
+            self.sort_rx = Some(store.resort());
         }
-        self.after_view_change(reordered || refiltered)?;
-        Ok(())
     }
 
     /// Put the cursor back inside a view that may have fewer columns, and drop
@@ -2804,19 +2812,68 @@ mod tests {
     }
 
     #[test]
-    fn a_filter_and_a_sort_are_refused_together() {
+    fn a_filter_and_a_sort_hold_at_the_same_time() {
         let mut app = app_sized("filtersort.csv", CATS, 60);
         filter(&mut app, "filter cat = a");
+        assert_eq!(app.store.as_ref().unwrap().row_count(), 3);
 
-        command(&mut app, "sort id");
-        assert!(app.message.clone().unwrap().contains("filtered view"));
-        assert_eq!(app.store.as_ref().unwrap().row_count(), 3, "filter intact");
+        // Sorting a filtered view keeps the filter, and the `s` key agrees.
+        command(&mut app, "sort id-");
+        settle_sort(&mut app);
+        let store = app.store.as_ref().unwrap();
+        assert_eq!(store.row_count(), 3, "still only the rows that matched");
+        assert_eq!(store.view.sort, [(0, false)]);
+        assert!(store.view.filter.is_some());
 
-        // The `s` key is refused for the same reason, in the same words.
+        // Descending by id: 4, 2, 0 — the matching rows, reversed.
+        assert_eq!(shown(&app, 0, 0).as_deref(), Some("4"));
+        assert_eq!(shown(&app, 0, 1).as_deref(), Some("2"));
+        assert_eq!(shown(&app, 0, 2).as_deref(), Some("0"));
+        assert_eq!(store.edit_blocked(), None, "and it is still editable");
+    }
+
+    /// Both narrowings at once, and an edit through them still has to reach
+    /// the right line of the file.
+    #[test]
+    fn editing_through_a_filtered_and_sorted_view_writes_the_right_line() {
+        let (mut app, path) = app_with("filtersortedit.csv", CATS);
+        app.last_frame_width = 60;
+        filter(&mut app, "filter cat = a");
+        command(&mut app, "sort id-");
+        settle_sort(&mut app);
+
+        // Display row 0 is id 4, the file's fifth row.
         cell_mode(&mut app);
-        press(&mut app, 's');
-        assert!(app.message.clone().unwrap().contains("filtered view"));
-        assert!(app.store.as_ref().unwrap().view.sort.is_empty());
+        press(&mut app, 'c');
+        typed(&mut app, "99");
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(shown(&app, 0, 0).as_deref(), Some("99"));
+
+        command(&mut app, "w");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "id,cat\n0,a\n1,b\n2,a\n3,b\n99,a\n"
+        );
+    }
+
+    #[test]
+    fn clearing_one_of_them_leaves_the_other_working() {
+        let mut app = app_sized("filtersortclear.csv", CATS, 60);
+        filter(&mut app, "filter cat = a");
+        command(&mut app, "sort id-");
+        settle_sort(&mut app);
+
+        // Dropping the sort falls back to the row-set scan, filter intact.
+        command(&mut app, "sort");
+        settle(&mut app);
+        let store = app.store.as_ref().unwrap();
+        assert_eq!(store.row_count(), 3);
+        assert_eq!(shown(&app, 0, 0).as_deref(), Some("0"), "file order again");
+
+        // Dropping the filter leaves the whole file.
+        command(&mut app, "filter");
+        settle(&mut app);
+        assert_eq!(app.store.as_ref().unwrap().row_count(), 5);
     }
 
     #[test]

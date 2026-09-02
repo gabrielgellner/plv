@@ -442,6 +442,9 @@ impl Store {
     pub fn resort(&mut self) -> mpsc::Receiver<DataFrame> {
         let (tx, rx) = mpsc::channel();
         self.sorted = None;
+        // A held frame carries its own filter, so the row set has nothing left
+        // to save: the table it would spare us re-reading is already in memory.
+        self.filter_rows = None;
         self.row_offset = 0;
 
         if self.view.sort.is_empty() {
@@ -458,8 +461,12 @@ impl Store {
             // bug rather than a slow path.
             Source::Lazy(base) => {
                 let base = base.clone();
+                let filter = self.view.filter.clone();
+                let schema = self.schema.clone();
                 thread::spawn(move || {
-                    if let Ok(df) = Self::materialise(base, &keys) {
+                    // Built on the worker: an `Expr` is not `Send`.
+                    let predicate = filter.and_then(|f| rows::predicate(&f, &schema));
+                    if let Ok(df) = Self::materialise(base, &keys, predicate) {
                         let _ = tx.send(df);
                     }
                 });
@@ -482,8 +489,17 @@ impl Store {
     }
 
     /// Whether the sorted frame is small enough to keep.
+    ///
+    /// A filter that has finished resolving has already narrowed the table, so
+    /// the question is how many rows are on show rather than how many the file
+    /// holds — which is what lets a sort be applied to a small slice of a table
+    /// far too big to sort whole.
     fn sort_fits(&self) -> bool {
-        sort_fits(self.total_rows, self.schema.len())
+        let rows = match &self.filter_rows {
+            Some(set) if set.is_complete() => set.len(),
+            _ => self.total_rows,
+        };
+        sort_fits(rows, self.schema.len())
     }
 
     /// Why this store will not sort, or `None` when it will.
@@ -505,14 +521,24 @@ impl Store {
     ///
     /// The row index goes on *before* the sort, so it records where each row
     /// came from rather than where it ended up.
-    fn materialise(base: LazyFrame, keys: &[(String, bool)]) -> Result<DataFrame> {
+    /// The row index goes on *before* the filter, so it records where each
+    /// row came from rather than where it survived to; the filter goes on
+    /// before the sort, matching the order the view language documents.
+    fn materialise(
+        base: LazyFrame,
+        keys: &[(String, bool)],
+        predicate: Option<Expr>,
+    ) -> Result<DataFrame> {
         let (names, descending): (Vec<String>, Vec<bool>) = keys
             .iter()
             .cloned()
             .map(|(name, ascending)| (name, !ascending))
             .unzip();
-        Ok(base
-            .with_row_index(SOURCE_ROW, None)
+        let mut lf = base.with_row_index(SOURCE_ROW, None);
+        if let Some(predicate) = predicate {
+            lf = lf.filter(predicate);
+        }
+        Ok(lf
             .sort(
                 names,
                 SortMultipleOptions::default().with_order_descending_multi(descending),
@@ -1005,6 +1031,9 @@ impl Store {
     /// `None` means there is nothing to filter by and the whole file is on
     /// show again.
     pub fn begin_filter(&mut self) -> Result<Option<mpsc::Receiver<Vec<usize>>>> {
+        // This is the no-sort path, so any held frame is in an order the view
+        // no longer asks for.
+        self.sorted = None;
         let Some(filter) = self.view.filter.clone() else {
             self.filter_rows = None;
             self.row_offset = 0;
