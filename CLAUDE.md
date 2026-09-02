@@ -161,6 +161,18 @@ want the answer progressively. It buys a real row count, cancellation, and row
 identity, which is what lets the edit buffer survive a filter: a row picked out
 of a filtered view still knows which line of the file it came from.
 
+**A sort is held, not redone.** Sorting cannot be lazy — nothing can know which
+row comes first without reading them all — so a lazily sorted page costs a full
+read of the file, *every page*. `Store::resort()` does it once instead and keeps
+the whole sorted frame, which costs about what one of those pages cost: measured
+on 2M rows, 102ms to sort and then 5µs for four pages. The frame carries a
+`__src__` column added *before* the sort, so every displayed row knows its line
+in the file — which is what lets a sorted view be edited at all.
+
+Past `SORT_CELL_CAP` the frame is not held: sorting falls back to the lazy path,
+which is slower and has no row identity, so editing is refused there and says
+which of the two reasons it is. Lake tables also stay on the lazy path.
+
 A filter and a sort are refused together for now: a sort puts the rows in an
 order the source row numbers no longer describe, so the set would have to be
 rebuilt on every sort.

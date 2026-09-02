@@ -893,12 +893,11 @@ impl App {
             };
             match result {
                 Ok(rows) => {
-                    // The search scans the file, so it reports the file's own
-                    // rows; a filter means not all of them are on show.
+                    // What the search reports depends on the frame it read.
                     let shown: Vec<usize> = match &self.store {
                         Some(store) => rows
                             .into_iter()
-                            .filter_map(|r| store.display_row(r))
+                            .filter_map(|r| store.search_row_to_display(r))
                             .collect(),
                         None => rows,
                     };
@@ -990,7 +989,7 @@ impl App {
             Ok(df) => {
                 self.sort_rx = None;
                 if let Some(store) = &mut self.store {
-                    store.set_view(df);
+                    let _ = store.adopt_sorted(df);
                 }
                 true
             }
@@ -1880,6 +1879,11 @@ impl App {
         {
             self.message = Some(e.to_string());
             return Ok(());
+        }
+        if reordered && let Some(store) = &mut self.store {
+            // A sort has to be rebuilt whichever way it was asked for, so the
+            // command line and the `s` key go through the same path.
+            self.sort_rx = Some(store.resort());
         }
         if refiltered && let Some(store) = &mut self.store {
             // Dropping the old receiver cancels a scan still running.
@@ -3005,6 +3009,7 @@ mod tests {
     fn sort_from_the_command_line_agrees_with_the_s_key() {
         let mut app = app_sized("viewsort.csv", FOURCOL, 60);
         command(&mut app, "sort b-");
+        settle_sort(&mut app);
         let store = app.store.as_ref().unwrap();
         assert_eq!(store.view.sort, [(1, false)]);
         assert_eq!(store.sort_display(), [(1, false)]);
@@ -3013,14 +3018,9 @@ mod tests {
             "a reorder puts the cursor back at the top"
         );
 
-        // And a sort still blocks editing, whichever way it was asked for.
-        assert!(
-            app.store
-                .as_ref()
-                .unwrap()
-                .edit_blocked()
-                .is_some_and(|r| r.contains("sorted"))
-        );
+        // `:sort` goes through the same rebuild the `s` key does, so the rows
+        // stay identifiable and the view stays editable.
+        assert_eq!(store.edit_blocked(), None);
     }
 
     #[test]
@@ -3346,17 +3346,41 @@ mod tests {
         assert!(app.help_visible, "and opens the overlay in normal mode");
     }
 
-    #[test]
-    fn a_sorted_view_says_why_it_will_not_take_an_edit() {
-        let (mut app, _) = app_with("sorted.csv", SAMPLE);
-        if let Some(store) = &mut app.store {
-            let _rx = store.begin_sort(0);
+    /// Sorting runs off the main thread; drain it the way the event loop does.
+    fn settle_sort(app: &mut App) {
+        for _ in 0..2000 {
+            if app.sort_rx.is_none() {
+                return;
+            }
+            if !app.poll_sort() {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
         }
+        panic!("the sort never finished");
+    }
 
-        press(&mut app, 'i');
-        assert!(matches!(app.mode, AppMode::Normal));
-        let message = app.message.clone().unwrap();
-        assert!(message.contains("sorted"), "{message}");
+    #[test]
+    fn a_sorted_view_can_be_edited_once_the_sort_is_held() {
+        let (mut app, path) = app_with("sorted.csv", SAMPLE);
+        app.last_frame_width = 60;
+        cell_mode(&mut app);
+        press(&mut app, 's'); // by name, ascending
+        settle_sort(&mut app);
+        press(&mut app, 's'); // and again: descending, so `d` is on top
+        settle_sort(&mut app);
+
+        press(&mut app, 'l');
+        press(&mut app, 'c');
+        typed(&mut app, "99");
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(shown(&app, 1, 0).as_deref(), Some("99"));
+
+        command(&mut app, "w");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "name,count\na,1\nb,2\nc,99\n",
+            "the top row of a descending sort is the file's last line"
+        );
     }
 
     #[test]
