@@ -133,13 +133,10 @@ impl RowIndex {
             reader.consume(read);
         }
 
-        // A file whose last line has no terminator still ends a record.
-        if started && scan.in_record() {
-            if past_header {
-                rows += 1;
-            } else {
-                past_header = true;
-            }
+        // A file whose last line has no terminator still ends a record — but
+        // only a data one; a file that is nothing but a header has no rows.
+        if started && scan.in_record() && past_header {
+            rows += 1;
         }
 
         Ok(Self {

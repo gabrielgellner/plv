@@ -7,6 +7,7 @@ use anyhow::{Result, bail};
 use duckdb::Connection;
 use polars::prelude::*;
 
+use crate::data::budget;
 use crate::data::edit::{Cell, Overlay};
 use crate::data::index::{self, RowIndex};
 use crate::data::lake_db::{self, LakeSource};
@@ -20,7 +21,8 @@ use crate::view::View;
 const SOURCE_ROW: &str = "__src__";
 
 /// A sorted frame is kept in memory, so there has to be a point past which it
-/// is not — and past which plv declines to sort at all.
+/// is not — and past which plv declines to sort at all. The size of that point
+/// comes from [`budget`], which asks the machine rather than assuming one.
 ///
 /// Falling back to a lazy sort was the obvious kindness and is the wrong one.
 /// Polars has to read and rank every row either way, so a lazy sort of a table
@@ -28,12 +30,6 @@ const SOURCE_ROW: &str = "__src__";
 /// an 842M-row census parquet, the lazy path reached **12.5GB resident in 45
 /// seconds** without producing a page. Refusing is the honest answer.
 ///
-/// Cells rather than bytes, because it is the only size knowable before
-/// reading anything. It is a rough proxy — a table of long strings weighs far
-/// more per cell than one of integers — so this is set where a miss is
-/// survivable rather than where it is exact.
-const SORT_CELL_CAP: usize = 50_000_000;
-
 /// Where a store's rows come from.
 ///
 /// CSV and Parquet are read lazily by Polars. Lake tables go through DuckDB's
@@ -514,7 +510,7 @@ impl Store {
         let keys = self.sort_keys();
 
         match &self.source {
-            // Held or not at all: see `SORT_CELL_CAP`. Callers ask
+            // Held or not at all: see `budget::sort_cells`. Callers ask
             // `sort_blocked` first, so reaching here past the cap would be a
             // bug rather than a slow path.
             Source::Lazy(base) => {
@@ -567,8 +563,8 @@ impl Store {
     pub fn sort_blocked(&self) -> Option<String> {
         if matches!(self.source, Source::Lazy(_)) && !self.sort_fits() {
             return Some(format!(
-                "{} rows across {} columns is too much to sort — it has to be held in memory",
-                self.total_rows,
+                "{} rows across {} columns is more than there is memory to sort",
+                self.row_count(),
                 self.schema.len()
             ));
         }
@@ -1108,7 +1104,7 @@ impl Store {
         let schema = self.schema.clone();
         let (tx, rx) = mpsc::channel();
 
-        self.filter_rows = Some(RowSet::new());
+        self.filter_rows = Some(RowSet::new(budget::filter_rows()));
         self.row_offset = 0;
         self.refresh()?;
 
@@ -1119,11 +1115,23 @@ impl Store {
     }
 
     /// Take a batch of matching rows from the scan.
-    pub fn extend_filter(&mut self, batch: Vec<usize>) -> Result<()> {
-        if let Some(set) = &mut self.filter_rows {
-            set.extend(batch);
-        }
-        self.refresh()
+    /// Take a batch of matching rows from the scan.
+    ///
+    /// Returns whether the scan is still wanted: once the set is as large as
+    /// the budget allows, it keeps what it has and the caller drops the
+    /// receiver, which stops the thread.
+    pub fn extend_filter(&mut self, batch: Vec<usize>) -> Result<bool> {
+        let wanted = match &mut self.filter_rows {
+            Some(set) => set.extend(batch),
+            None => false,
+        };
+        self.refresh()?;
+        Ok(wanted)
+    }
+
+    /// Whether the filter stopped short of every match.
+    pub fn filter_truncated(&self) -> bool {
+        self.filter_rows.as_ref().is_some_and(RowSet::is_truncated)
     }
 
     /// The scan has run out; what is here is all of it.
@@ -1140,9 +1148,10 @@ impl Store {
     }
 }
 
-/// Whether a table of this shape can be sorted at all — see [`SORT_CELL_CAP`].
+/// Whether a table of this shape can be sorted at all: whether holding it
+/// would fit the memory budget.
 fn sort_fits(rows: usize, columns: usize) -> bool {
-    rows.saturating_mul(columns) <= SORT_CELL_CAP
+    rows.saturating_mul(columns) <= budget::sort_cells()
 }
 
 /// A column rendered as text and matched against a pattern — how `/` search
@@ -1368,9 +1377,9 @@ mod tests {
         // Measured against an 842M-row census parquet: sorting it lazily
         // reached 12.5GB resident in 45s without producing a page, so the
         // answer past the cap is no rather than "slowly".
-        assert!(sort_fits(1_000_000, 20), "a million rows of twenty is fine");
-        assert!(sort_fits(SORT_CELL_CAP, 1));
-        assert!(!sort_fits(SORT_CELL_CAP + 1, 1));
+        let cap = budget::sort_cells();
+        assert!(sort_fits(cap, 1));
+        assert!(!sort_fits(cap + 1, 1));
         assert!(!sort_fits(842_209_475, 20), "the census parquet");
         // Multiplying the shape must not wrap into a false yes.
         assert!(!sort_fits(usize::MAX, 20));
