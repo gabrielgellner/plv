@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.0] - 2026-09-02
+
+### Features
+
+- parse and check the view language ([`cc8ea46`](https://gitlab.com/gabrielgellner/plv/-/commit/cc8ea469ebb836e89dba3ea29f8848abbbc2526a))
+- wire :select, :hide, :sort and :reset into the viewer ([`241da1c`](https://gitlab.com/gabrielgellner/plv/-/commit/241da1cc9a9e5fcf94aebce21aff84f95460bbdf))
+- a bare verb clears the slot it set ([`5871407`](https://gitlab.com/gabrielgellner/plv/-/commit/5871407bb22bc7be105c1e2227f4b1a3eba354c0))
+- :filter, resolved to a set of rows rather than composed ([`352cab9`](https://gitlab.com/gabrielgellner/plv/-/commit/352cab9d563a27ede465689ca07c2ccf96afea6e))
+- Tab completion on the `:` line, with a candidate panel ([`e0f31e6`](https://gitlab.com/gabrielgellner/plv/-/commit/e0f31e62c92d9b631771ad0ef44318df60c16979))
+
+### Miscellaneous
+
+- keep commit subjects as written in the changelog ([`a70a1e7`](https://gitlab.com/gabrielgellner/plv/-/commit/a70a1e7bdd302b8a4942e711a08ab6986adc6b52))
+- drop the version heading from release notes ([`d4ba738`](https://gitlab.com/gabrielgellner/plv/-/commit/d4ba7385bb33f61dbb04341ae74cc2c922a10f53))
+
 ## [0.5.0] - 2026-09-01
 
 ### Bug Fixes
@@ -92,6 +107,8 @@ All notable changes to this project will be documented in this file.
 ### Styling
 
 - fix clippy warnings ([`5cb0dba`](https://gitlab.com/gabrielgellner/plv/-/commit/5cb0dba5f5d4bc0be4d3d3b09fd1e7cd00ff7722))
+
+[0.6.0]: https://gitlab.com/gabrielgellner/plv/-/compare/v0.5.0...v0.6.0
 
 [0.5.0]: https://gitlab.com/gabrielgellner/plv/-/compare/v0.4.1...v0.5.0
 
