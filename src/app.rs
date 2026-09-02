@@ -14,11 +14,14 @@ use ratatui::{
     widgets::Paragraph,
 };
 
+use crate::complete::{self, Completion};
 use crate::data::Store;
 use crate::data::lake_db::{self, LakeDb};
 use crate::lake::{Lake, Level, Scope};
 use crate::search::{SearchQuery, SearchState, SearchStatus};
-use crate::ui::{self, Browser, DataTable, Help, Prompt, Section, SelectionMode, StatusBar, Theme};
+use crate::ui::{
+    self, Browser, DataTable, Help, Panel, Prompt, Section, SelectionMode, StatusBar, Theme,
+};
 use crate::view;
 use polars::prelude::DataType;
 
@@ -138,6 +141,10 @@ pub struct App {
     /// Caret position in `edit_buf`, counted in characters.
     edit_cursor: usize,
     command_buf: String,
+    /// Candidates from the last Tab on the command line, and which of them is
+    /// currently applied. Cleared by any key that changes the line.
+    completion: Option<Completion>,
+    completion_index: Option<usize>,
     search_buf: String,
     search_state: Option<SearchState>,
     /// Receives batches of matching row indices from the background search thread.
@@ -187,6 +194,8 @@ impl App {
             edit_buf: String::new(),
             edit_cursor: 0,
             command_buf: String::new(),
+            completion: None,
+            completion_index: None,
             search_buf: String::new(),
             search_state: None,
             search_rx: None,
@@ -204,7 +213,7 @@ impl App {
     pub fn run(&mut self, terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
         if let Some(path) = self.file_path.clone() {
             let size = terminal.size()?;
-            let vp = Self::viewport_rows(size.height);
+            let vp = Self::viewport_rows(size.height, 0);
             self.last_vp = vp;
 
             if let Some(lake_path) = lake_db::detect(&path) {
@@ -230,16 +239,26 @@ impl App {
         Ok(())
     }
 
-    // status bar (1) + block borders (2) + header row (1) = 4 overhead
-    fn viewport_rows(terminal_height: u16) -> usize {
-        (terminal_height as usize).saturating_sub(4)
+    /// status bar (1) + block borders (2) + header row (1) = 4 overhead,
+    /// plus whatever the candidate panel is taking.
+    fn viewport_rows(terminal_height: u16, panel: u16) -> usize {
+        (terminal_height as usize).saturating_sub(4 + panel as usize)
+    }
+
+    /// Rows the candidate panel wants right now.
+    fn panel_height(&self, width: u16) -> u16 {
+        match &self.completion {
+            Some(completion) => ui::panel_height(&completion.options, width),
+            None => 0,
+        }
     }
 
     fn draw(&mut self, frame: &mut Frame) {
         let area = frame.area();
         self.last_frame_width = area.width;
 
-        let vp = Self::viewport_rows(area.height);
+        let panel = self.panel_height(area.width);
+        let vp = Self::viewport_rows(area.height, panel);
         self.last_vp = vp;
         if let Some(s) = &mut self.store
             && s.viewport_rows != vp
@@ -271,8 +290,12 @@ impl App {
             }
         }
 
-        let [table_area, status_area] =
-            Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(area);
+        let [table_area, panel_area, status_area] = Layout::vertical([
+            Constraint::Min(3),
+            Constraint::Length(panel),
+            Constraint::Length(1),
+        ])
+        .areas(area);
 
         let file_name = self
             .lake
@@ -423,6 +446,17 @@ impl App {
             );
         }
 
+        if let Some(completion) = &self.completion {
+            frame.render_widget(
+                Panel {
+                    items: &completion.options,
+                    selected: self.completion_index,
+                    theme: &self.theme,
+                },
+                panel_area,
+            );
+        }
+
         self.draw_help(frame, area);
         self.last_vis_col = vis_col_cell.get();
     }
@@ -488,6 +522,10 @@ impl App {
             (":sort a b-", "Sort by columns, `-` for descending"),
             (":select   :sort", "The verb alone puts it back"),
             (":reset [slot]", "Clear select, filter, sort, or all"),
+            (
+                "Tab / Shift+Tab",
+                "Complete, then step through the candidates",
+            ),
         ];
         const VISUAL: &[(&str, &str)] = &[
             ("v", "Start or cancel a selection"),
@@ -1704,22 +1742,72 @@ impl App {
             KeyCode::Esc => {
                 self.mode = AppMode::Normal;
                 self.command_buf.clear();
+                self.forget_completion();
             }
             KeyCode::Enter => {
                 let line = std::mem::take(&mut self.command_buf);
                 self.mode = AppMode::Normal;
+                self.forget_completion();
                 self.run_command(line.trim())?;
             }
             KeyCode::Backspace => {
+                self.forget_completion();
                 if self.command_buf.pop().is_none() {
                     // Backspacing off the `:` leaves the command line, as in vim.
                     self.mode = AppMode::Normal;
                 }
             }
-            KeyCode::Char(c) if !ctrl => self.command_buf.push(c),
+            KeyCode::Tab => return self.complete_command(false),
+            KeyCode::BackTab => return self.complete_command(true),
+            KeyCode::Char(c) if !ctrl => {
+                self.command_buf.push(c);
+                self.forget_completion();
+            }
             _ => {}
         }
         Ok(())
+    }
+
+    /// Tab on the command line: extend as far as the candidates agree, then
+    /// step through them.
+    ///
+    /// Extending first is what makes it predictable — the line only ever grows
+    /// towards something real. Stepping is what makes it useful once the
+    /// common prefix has run out, which for column names is most of the time.
+    fn complete_command(&mut self, backwards: bool) -> anyhow::Result<()> {
+        if let Some(completion) = &self.completion
+            && completion.options.len() > 1
+        {
+            let count = completion.options.len();
+            let next = match self.completion_index {
+                Some(index) if backwards => (index + count - 1) % count,
+                Some(index) => (index + 1) % count,
+                None if backwards => count - 1,
+                None => 0,
+            };
+            self.command_buf = completion.with(next);
+            self.completion_index = Some(next);
+            return Ok(());
+        }
+
+        let Some(store) = &self.store else {
+            return Ok(());
+        };
+        let Some(found) = complete::complete(&self.command_buf, &store.schema) else {
+            self.forget_completion();
+            return Ok(());
+        };
+        self.command_buf = found.extended();
+        self.completion_index = None;
+        // A single candidate has been applied in full; there is nothing left
+        // to show or to step through.
+        self.completion = (found.options.len() > 1).then_some(found);
+        Ok(())
+    }
+
+    fn forget_completion(&mut self) {
+        self.completion = None;
+        self.completion_index = None;
     }
 
     /// `w` writes the buffer and `q` quits; a trailing `!` forces past the
@@ -2735,6 +2823,90 @@ mod tests {
         assert_eq!(shown_columns(&app), ["cat"]);
         assert_eq!(app.store.as_ref().unwrap().row_count(), 3);
         assert_eq!(shown(&app, 0, 0).as_deref(), Some("a"));
+    }
+
+    fn tab(app: &mut App) {
+        key(app, KeyCode::Tab);
+    }
+
+    #[test]
+    fn tab_completes_a_verb_then_a_column() {
+        let mut app = app_sized("tabcomplete.csv", FOURCOL, 60);
+        press(&mut app, ':');
+        typed(&mut app, "sel");
+        tab(&mut app);
+        assert_eq!(app.command_buf, "select ");
+        assert!(app.completion.is_none(), "one candidate needs no panel");
+
+        typed(&mut app, "c");
+        tab(&mut app);
+        assert_eq!(app.command_buf, "select c ");
+    }
+
+    #[test]
+    fn several_candidates_open_the_panel_and_tab_steps_through_them() {
+        let mut app = app_sized("tabcycle.csv", "alpha,beta,gamma\n1,2,3\n", 60);
+        press(&mut app, ':');
+        typed(&mut app, "select ");
+
+        tab(&mut app);
+        let options = app.completion.as_ref().expect("a panel").options.clone();
+        assert_eq!(options, ["alpha", "beta", "gamma"]);
+        assert_eq!(app.panel_height(60), 1, "the panel takes a row");
+
+        // Nothing to extend — the three share no prefix — so Tab steps.
+        assert_eq!(app.command_buf, "select ");
+        tab(&mut app);
+        assert_eq!(app.command_buf, "select alpha ");
+        tab(&mut app);
+        assert_eq!(app.command_buf, "select beta ");
+        key(&mut app, KeyCode::BackTab);
+        assert_eq!(app.command_buf, "select alpha ");
+    }
+
+    #[test]
+    fn the_panel_takes_its_rows_from_the_table() {
+        let mut app = app_sized("panelroom.csv", "alpha,beta,gamma\n1,2,3\n", 60);
+        let before = App::viewport_rows(24, 0);
+        press(&mut app, ':');
+        typed(&mut app, "select ");
+        tab(&mut app);
+        let after = App::viewport_rows(24, app.panel_height(60));
+        assert_eq!(
+            after,
+            before - 1,
+            "the table gives up exactly the panel's row"
+        );
+    }
+
+    #[test]
+    fn typing_or_leaving_puts_the_panel_away() {
+        let mut app = app_sized("panelgone.csv", "alpha,beta,gamma\n1,2,3\n", 60);
+        press(&mut app, ':');
+        typed(&mut app, "select ");
+        tab(&mut app);
+        assert!(app.completion.is_some());
+
+        typed(&mut app, "a");
+        assert!(app.completion.is_none(), "a keystroke changes the answer");
+
+        tab(&mut app);
+        assert_eq!(app.command_buf, "select alpha ");
+        key(&mut app, KeyCode::Esc);
+        assert!(app.completion.is_none());
+        assert_eq!(app.panel_height(60), 0);
+    }
+
+    #[test]
+    fn a_completed_command_actually_runs() {
+        let mut app = app_sized("tabrun.csv", FOURCOL, 60);
+        press(&mut app, ':');
+        typed(&mut app, "sel");
+        tab(&mut app);
+        typed(&mut app, "d");
+        tab(&mut app);
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(shown_columns(&app), ["d"], "msg: {:?}", app.message);
     }
 
     #[test]
