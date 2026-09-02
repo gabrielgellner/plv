@@ -19,10 +19,18 @@ use crate::view::View;
 const SOURCE_ROW: &str = "__src__";
 
 /// A sorted frame is kept in memory, so there has to be a point past which it
-/// is not. One sort of a frame that fits costs about what a single lazily
-/// sorted *page* costs, and every page after it is then free — so this wants
-/// to be generous. Past it, sorting stays lazy: slower, and without row
-/// identity, but it still works.
+/// is not — and past which plv declines to sort at all.
+///
+/// Falling back to a lazy sort was the obvious kindness and is the wrong one.
+/// Polars has to read and rank every row either way, so a lazy sort of a table
+/// that does not fit does not degrade, it just fails slowly: measured against
+/// an 842M-row census parquet, the lazy path reached **12.5GB resident in 45
+/// seconds** without producing a page. Refusing is the honest answer.
+///
+/// Cells rather than bytes, because it is the only size knowable before
+/// reading anything. It is a rough proxy — a table of long strings weighs far
+/// more per cell than one of integers — so this is set where a miss is
+/// survivable rather than where it is exact.
 const SORT_CELL_CAP: usize = 50_000_000;
 
 /// Where a store's rows come from.
@@ -445,18 +453,13 @@ impl Store {
         let keys = self.sort_keys();
 
         match &self.source {
-            Source::Lazy(base) if self.sort_fits() => {
+            // Held or not at all: see `SORT_CELL_CAP`. Callers ask
+            // `sort_blocked` first, so reaching here past the cap would be a
+            // bug rather than a slow path.
+            Source::Lazy(base) => {
                 let base = base.clone();
                 thread::spawn(move || {
                     if let Ok(df) = Self::materialise(base, &keys) {
-                        let _ = tx.send(df);
-                    }
-                });
-            }
-            Source::Lazy(_) => {
-                let lf = self.effective_lf().expect("lazy source");
-                thread::spawn(move || {
-                    if let Ok(df) = Self::fetch_lazy(&lf, 0, vp) {
                         let _ = tx.send(df);
                     }
                 });
@@ -480,7 +483,22 @@ impl Store {
 
     /// Whether the sorted frame is small enough to keep.
     fn sort_fits(&self) -> bool {
-        self.total_rows.saturating_mul(self.schema.len()) <= SORT_CELL_CAP
+        sort_fits(self.total_rows, self.schema.len())
+    }
+
+    /// Why this store will not sort, or `None` when it will.
+    ///
+    /// Asked *before* a sort key is recorded, so a refusal leaves the view as
+    /// it was rather than in an order nothing can produce.
+    pub fn sort_blocked(&self) -> Option<String> {
+        if matches!(self.source, Source::Lazy(_)) && !self.sort_fits() {
+            return Some(format!(
+                "{} rows across {} columns is too much to sort — it has to be held in memory",
+                self.total_rows,
+                self.schema.len()
+            ));
+        }
+        None
     }
 
     /// Sort the whole frame, carrying the file's row numbers through it.
@@ -564,11 +582,9 @@ impl Store {
             // Without the sorted frame there is no record of where each row
             // came from, so an edit could not be told which line it belongs
             // to. Which of the two reasons it is matters: one passes.
-            return Some(if self.sort_fits() {
-                "still sorting"
-            } else {
-                "too many rows to sort and edit at once — clear the sort"
-            });
+            // Sorting past the cap is refused outright, so a sort that is
+            // set but not held can only be one still being built.
+            return Some("still sorting");
         }
         None
     }
@@ -1037,6 +1053,11 @@ impl Store {
     }
 }
 
+/// Whether a table of this shape can be sorted at all — see [`SORT_CELL_CAP`].
+fn sort_fits(rows: usize, columns: usize) -> bool {
+    rows.saturating_mul(columns) <= SORT_CELL_CAP
+}
+
 /// A column rendered as text and matched against a pattern — how `/` search
 /// reads every column, and how `~` reads one.
 fn matches_pattern(column: &str, pattern: &str) -> Expr {
@@ -1207,6 +1228,26 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(10))
             .expect("the sort never finished");
         store.adopt_sorted(df).unwrap();
+    }
+
+    #[test]
+    fn a_table_too_big_to_hold_is_not_sorted_at_all() {
+        // Measured against an 842M-row census parquet: sorting it lazily
+        // reached 12.5GB resident in 45s without producing a page, so the
+        // answer past the cap is no rather than "slowly".
+        assert!(sort_fits(1_000_000, 20), "a million rows of twenty is fine");
+        assert!(sort_fits(SORT_CELL_CAP, 1));
+        assert!(!sort_fits(SORT_CELL_CAP + 1, 1));
+        assert!(!sort_fits(842_209_475, 20), "the census parquet");
+        // Multiplying the shape must not wrap into a false yes.
+        assert!(!sort_fits(usize::MAX, 20));
+    }
+
+    #[test]
+    fn an_ordinary_file_is_sortable() {
+        let path = write_temp("sortable.csv", SAMPLE);
+        let store = Store::open_file(&path, 10).unwrap();
+        assert_eq!(store.sort_blocked(), None);
     }
 
     #[test]

@@ -1172,6 +1172,10 @@ impl App {
                         Some("cannot sort a filtered view — :filter clears it".to_string());
                     return Ok(());
                 }
+                if let Some(reason) = self.store.as_ref().and_then(Store::sort_blocked) {
+                    self.message = Some(reason);
+                    return Ok(());
+                }
                 if let Some(store) = &mut self.store {
                     self.sort_rx = Some(store.begin_sort(self.cursor_col));
                     self.cursor_row = 0;
@@ -1865,6 +1869,16 @@ impl App {
                 | view::Command::Reset(None)
                 | view::Command::Reset(Some(view::Slot::Filter))
         );
+
+        // Asked before the key is recorded, so a refusal leaves the view as
+        // it was rather than in an order nothing can produce.
+        if let view::Command::Sort(keys) = &command
+            && !keys.is_empty()
+            && let Some(reason) = store.sort_blocked()
+        {
+            self.message = Some(reason);
+            return Ok(());
+        }
 
         let mut next = store.view.clone();
         let sort_before = next.sort.clone();
