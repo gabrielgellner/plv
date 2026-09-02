@@ -35,10 +35,12 @@ src/
     lake_db.rs    DuckLake access via DuckDB's ducklake extension
     rows.rs       row sets: which rows a :filter matched, and paging by index
   view.rs         the view language: parse and check :select/:filter/:sort
+  complete.rs     completion for the `:` line, per position
   ui/
     table.rs      DataTable widget: renders DataFrame as a table
     browser.rs    Browser widget + cursor/scroll state for catalog lists
     help.rs       Help widget: the `?` key-binding overlay
+    panel.rs      Panel widget: the candidate list above the status bar
     statusbar.rs  StatusBar widget: file/row/col position + help
 ```
 
@@ -176,6 +178,31 @@ type; an empty literal `""` means the cells with nothing in them, matching how
 plv renders and writes empty fields elsewhere. Conditions join with `and` only —
 no `or` and no parentheses, because precedence cannot be introduced later
 without changing what already-written commands mean.
+
+## Completion (`src/complete.rs`, `src/ui/panel.rs`)
+
+Tab on the `:` line completes, deliberately **not** fuzzily: this is a small
+closed vocabulary — a few verbs and the file's own column names — that the user
+is trying to type exactly, where a prefix match is predictable and a fuzzy one
+is a guess. Fuzzy matching belongs on `/`, over the data.
+
+What is offered depends on where in the line the cursor is: verbs at the front,
+column names after `:select`/`:hide`/`:sort`, slot names after `:reset`, and
+inside a `:filter` the positions cycle through column, operator, value, `and` —
+a value being the file's own data, which is not a vocabulary to complete
+against. A test asserts every verb completion offers is one `view::parse`
+accepts, so the two cannot drift.
+
+Candidates are matched against the bare column name and offered in the form that
+has to be typed, so `rel` finds `release date` and writes `"release date"`.
+Tab extends the line as far as the candidates agree and never shortens it, then
+steps through them; Shift+Tab steps back.
+
+`Panel` draws the candidates above the status bar. Unlike the `?` overlay it
+sits *in* the layout — `viewport_rows` subtracts its height, so the table gives
+up exactly the rows the panel takes rather than being covered. It is capped at
+four rows and says `… n more` rather than truncating in silence, because a list
+that quietly stops reads as the whole list.
 
 ## Polars 0.53 API notes
 

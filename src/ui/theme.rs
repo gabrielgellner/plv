@@ -23,6 +23,9 @@ pub struct Theme {
     /// Empty cells, which are shown as a marker rather than as the word
     /// `null`: it has to read as "nothing here" and not as data.
     pub null_fg: Color,
+    /// The candidate the completion panel has applied to the line.
+    pub completion_bg: Color,
+    pub completion_fg: Color,
     /// Cells inside a visual selection.
     pub selection_bg: Color,
     pub selection_fg: Color,
@@ -47,6 +50,8 @@ impl Theme {
             match_fg: Color::Rgb(30, 30, 46),          // Base
             edited_fg: Color::Rgb(243, 139, 168),      // Red
             null_fg: Color::Rgb(108, 112, 134),        // Overlay0
+            completion_bg: Color::Rgb(137, 180, 250),  // Blue
+            completion_fg: Color::Rgb(30, 30, 46),     // Base
             selection_bg: Color::Rgb(88, 91, 112),     // Surface2
             selection_fg: Color::Rgb(205, 214, 244),   // Text
         }

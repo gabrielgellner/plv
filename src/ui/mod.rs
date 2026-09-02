@@ -1,5 +1,6 @@
 mod browser;
 mod help;
+mod panel;
 mod prompt;
 mod statusbar;
 mod table;
@@ -7,6 +8,7 @@ pub mod theme;
 
 pub use browser::{Browser, BrowserState};
 pub use help::{Help, Section};
+pub use panel::{Panel, height as panel_height};
 pub use prompt::Prompt;
 pub use statusbar::StatusBar;
 pub use table::{DataTable, col_offset_showing};
