@@ -170,7 +170,7 @@ on 2M rows, 102ms to sort and then 5µs for four pages. The frame carries a
 `__src__` column added *before* the sort, so every displayed row knows its line
 in the file — which is what lets a sorted view be edited at all.
 
-Past `SORT_CELL_CAP` plv **refuses to sort at all** rather than falling back to
+Past what `budget::sort_cells()` allows, plv **refuses to sort at all** rather than falling back to
 a lazy sort. Falling back looks like the kindness and is not: Polars has to read
 and rank every row either way, so a lazy sort of a table that does not fit does
 not degrade, it fails slowly. Measured against an 842M-row census parquet, the
@@ -178,6 +178,15 @@ lazy path reached 12.5GB resident in 45 seconds without producing a page; the
 refusal peaks at 125MB. `Store::sort_blocked()` is asked *before* a key is
 recorded, so a refusal leaves the view as it was. Lake tables sort through
 DuckDB, which spills, and are not capped.
+
+**The bounds come from `data/budget.rs`**, which asks the machine for its memory
+rather than assuming one: a quarter of it for a held sort, a twentieth for a
+filter's row set. Counted in cells at 128 bytes each — measured over three
+shapes of real data a held sort costs 35 bytes per cell for integers, 82 for
+strings and 46 for the mixed census table, while the same three against *file
+size* vary more widely, so cells calibrated to the worst case is the steadier
+estimate. A filter that fills its set keeps what it has, stops the scan, and
+reads `(first n)` in the status bar rather than looking like the whole answer.
 
 **A filter and a sort compose, and only one mechanism runs at a time.** With a
 sort held the whole table is already in memory, so the filter is applied as part

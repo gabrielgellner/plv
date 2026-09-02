@@ -408,7 +408,13 @@ impl App {
                             file_name,
                             cursor_row,
                             total_rows: store.row_count(),
-                            view: store.view.describe(&store.schema),
+                            view: store.view.describe(&store.schema).map(|text| {
+                                if store.filter_truncated() {
+                                    format!("{text}  (first {})", store.row_count())
+                                } else {
+                                    text
+                                }
+                            }),
                             col_position: self.col_position(),
                             total_cols: store.column_count(),
                             message: self.message.clone(),
@@ -960,13 +966,19 @@ impl App {
         }
         if let Some(store) = &mut self.store {
             for batch in batches {
-                let _ = store.extend_filter(batch);
+                // The set fills up before the file runs out on a filter that
+                // matches nearly everything; stop asking for more.
+                if !store.extend_filter(batch).unwrap_or(false) {
+                    finished = true;
+                    break;
+                }
             }
             if finished {
                 let _ = store.finish_filter();
             }
         }
         if finished {
+            // Dropping the receiver ends the scan.
             self.filter_rx = None;
         }
         // Rows arriving can leave the cursor past the end of what matched.

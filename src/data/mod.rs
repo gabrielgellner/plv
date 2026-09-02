@@ -1,3 +1,4 @@
+pub mod budget;
 pub mod edit;
 pub mod index;
 pub mod lake_db;

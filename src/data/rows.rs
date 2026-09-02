@@ -23,16 +23,46 @@ use crate::view::{Filter, Op, Value};
 pub struct RowSet {
     rows: Vec<usize>,
     complete: bool,
+    /// How many rows this set may hold before it stops taking them.
+    limit: usize,
+    /// The limit was reached, so these are the first matches rather than all
+    /// of them. Said out loud rather than left to look like the whole answer.
+    truncated: bool,
 }
 
 impl RowSet {
-    pub fn new() -> Self {
-        Self::default()
+    /// A set that will hold at most `limit` rows.
+    ///
+    /// One index per matching row is small until the matches are not: a filter
+    /// keeping most of an 842M-row table is a 6.7GB `Vec`, arriving in batches
+    /// so it grows quietly rather than failing at once. Past the limit the set
+    /// keeps what it has and says it is partial, which leaves something usable
+    /// on screen where refusing outright would not.
+    pub fn new(limit: usize) -> Self {
+        Self {
+            limit: limit.max(1),
+            ..Self::default()
+        }
     }
 
     /// Take a batch from the background scan. Batches arrive in file order.
-    pub fn extend(&mut self, batch: Vec<usize>) {
+    ///
+    /// Returns whether the scan is still wanted; false once the set is full.
+    pub fn extend(&mut self, batch: Vec<usize>) -> bool {
+        let room = self.limit.saturating_sub(self.rows.len());
+        if batch.len() > room {
+            self.rows.extend(batch.into_iter().take(room));
+            self.truncated = true;
+            self.complete = true;
+            return false;
+        }
         self.rows.extend(batch);
+        self.rows.len() < self.limit
+    }
+
+    /// Whether the set stopped short of every match.
+    pub fn is_truncated(&self) -> bool {
+        self.truncated
     }
 
     pub fn finish(&mut self) {
@@ -132,7 +162,7 @@ mod tests {
     use super::*;
 
     fn set(rows: &[usize]) -> RowSet {
-        let mut set = RowSet::new();
+        let mut set = RowSet::new(usize::MAX);
         set.extend(rows.to_vec());
         set.finish();
         set
@@ -158,8 +188,34 @@ mod tests {
     }
 
     #[test]
+    fn a_full_set_stops_the_scan_and_owns_up() {
+        let mut set = RowSet::new(4);
+        assert!(set.extend(vec![1, 2]), "room for more");
+        assert!(
+            !set.extend(vec![3, 4, 5, 6]),
+            "the scan is no longer wanted"
+        );
+
+        assert_eq!(set.len(), 4, "kept what fits");
+        assert!(
+            set.is_truncated(),
+            "and does not pretend that is all of them"
+        );
+        assert!(set.is_complete(), "nothing further is coming");
+        assert_eq!(set.source(3), Some(4));
+        assert_eq!(set.source(4), None);
+    }
+
+    #[test]
+    fn a_set_that_exactly_fills_its_limit_is_not_called_truncated() {
+        let mut set = RowSet::new(3);
+        assert!(!set.extend(vec![1, 2, 3]), "full, so stop asking");
+        assert!(!set.is_truncated(), "every match fitted");
+    }
+
+    #[test]
     fn batches_accumulate_until_the_scan_finishes() {
-        let mut set = RowSet::new();
+        let mut set = RowSet::new(usize::MAX);
         assert!(!set.is_complete());
         set.extend(vec![1, 4]);
         assert_eq!(set.len(), 2);

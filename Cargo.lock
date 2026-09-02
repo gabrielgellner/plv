@@ -2580,6 +2580,7 @@ dependencies = [
  "polars",
  "ratatui",
  "regex",
+ "sysinfo",
 ]
 
 [[package]]
