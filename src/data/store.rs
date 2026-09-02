@@ -8,6 +8,7 @@ use duckdb::Connection;
 use polars::prelude::*;
 
 use crate::data::edit::{Cell, Overlay};
+use crate::data::index::{self, RowIndex};
 use crate::data::lake_db::{self, LakeSource};
 use crate::data::loader;
 use crate::data::rows::{self, RowSet};
@@ -80,6 +81,10 @@ pub struct Store {
     /// The rows a `:filter` matched, when one is active. Present means the
     /// viewer is paging through this set rather than through the file.
     filter_rows: Option<RowSet>,
+    /// Where each row of a delimited file starts, so a page can be read
+    /// without parsing everything before it. Absent for Parquet, which can
+    /// already seek, and for lake tables.
+    row_index: Option<RowIndex>,
     /// The whole sorted table, held in memory, carrying [`SOURCE_ROW`].
     ///
     /// Sorting cannot be lazy — nothing can know which row comes first
@@ -121,6 +126,7 @@ impl Store {
             edit: None,
             overlay: Overlay::new(),
             filter_rows: None,
+            row_index: None,
             sorted: None,
         })
     }
@@ -128,16 +134,29 @@ impl Store {
     /// Open a store over a file, remembering the path so edits can be written
     /// back to it.
     pub fn open_file(path: &Path, viewport_rows: usize) -> Result<Self> {
-        let mut store = Self::build(loader::load(path)?, viewport_rows, None)?;
         // Only delimited text is editable. Parquet is genuinely typed, so a
         // one-cell change would mean rewriting the whole file against a schema.
-        if let Some(separator) = loader::separator(path)? {
+        let separator = loader::separator(path)?;
+
+        // A delimited file has to be read through once to know how many rows
+        // it has. That same pass records where the rows are, so paging into it
+        // later does not have to count its way there.
+        let row_index = match separator {
+            Some(separator) => Some(RowIndex::build(path, separator)?),
+            None => None,
+        };
+        let rows = row_index.as_ref().map(RowIndex::rows);
+
+        let mut store = Self::build(loader::load(path)?, viewport_rows, rows)?;
+        store.row_index = row_index;
+        if let Some(separator) = separator {
             store.edit = Some(EditTarget {
                 path: path.to_path_buf(),
                 separator,
                 stamp: Stamp::of(path)?,
             });
         }
+        store.current_view = store.fetch(0, viewport_rows)?;
         Ok(store)
     }
 
@@ -173,6 +192,7 @@ impl Store {
             edit: None,
             overlay: Overlay::new(),
             filter_rows: None,
+            row_index: None,
             sorted: None,
         })
     }
@@ -362,6 +382,16 @@ impl Store {
                 let lf = self.effective_lf().expect("lazy source");
                 match &self.filter_rows {
                     Some(set) => Self::gather(&lf, set, offset, height),
+                    // With an index the page is a known byte range, so it is
+                    // read directly rather than sliced out of the whole file.
+                    // Only when nothing else is composed on top: a sort or a
+                    // projection changes what a row number means.
+                    None if self.view.sort.is_empty() && self.view.select.is_none() => {
+                        match self.indexed_page(offset, height) {
+                            Some(page) => page,
+                            None => Self::fetch_lazy(&lf, offset, height),
+                        }
+                    }
                     None => Self::fetch_lazy(&lf, offset, height),
                 }
             }
@@ -398,6 +428,34 @@ impl Store {
             .map(|(name, _)| name.clone())
             .collect();
         Ok(page.select(shown)?)
+    }
+
+    /// One page, read straight out of the byte range the index points at.
+    ///
+    /// `None` when there is no index to ask, leaving the caller to slice the
+    /// frame the slow way. The parse is given the schema plv already inferred
+    /// — a chunk left to infer its own would type a column by whatever
+    /// happens to be in those rows, and the types would change as you scroll.
+    fn indexed_page(&self, offset: usize, height: usize) -> Option<Result<DataFrame>> {
+        let index = self.row_index.as_ref()?;
+        let target = self.edit.as_ref()?;
+        if offset >= index.rows() {
+            return None;
+        }
+        let (first_row, from) = index.seek(offset);
+        let to = index.end_of(offset + height);
+
+        Some((|| {
+            let bytes = index::read_span(&target.path, index, from, to)?;
+            let page = CsvReadOptions::default()
+                .with_has_header(true)
+                .with_schema(Some(self.schema.clone()))
+                .with_parse_options(CsvParseOptions::default().with_separator(target.separator))
+                .into_reader_with_file_handle(std::io::Cursor::new(bytes))
+                .finish()?;
+            // The span starts at a checkpoint, which is at or before the page.
+            Ok(page.slice((offset - first_row) as i64, height))
+        })())
     }
 
     fn gather(lf: &LazyFrame, set: &RowSet, offset: usize, height: usize) -> Result<DataFrame> {
@@ -1115,6 +1173,52 @@ mod tests {
     }
 
     const SAMPLE: &str = "name,count\na,1\nb,2\nc,3\nd,4\n";
+
+    /// Small fixtures never reach a second checkpoint, so the interesting
+    /// case — a page found by seeking rather than by counting — needs a file
+    /// bigger than one stride.
+    #[test]
+    fn an_indexed_page_reads_the_same_rows_the_slow_path_would() {
+        use crate::data::index::STRIDE;
+
+        let rows = STRIDE * 2 + 1_000;
+        let mut csv = String::from("id,note\n");
+        for i in 0..rows {
+            // A quoted comma every so often, so the byte offsets cannot be
+            // arrived at by assuming fixed-width records.
+            if i % 7 == 0 {
+                csv.push_str(&format!("{i},\"a,b\"\n"));
+            } else {
+                csv.push_str(&format!("{i},plain\n"));
+            }
+        }
+        let path = write_temp("indexed.csv", &csv);
+        let mut store = Store::open_file(&path, 10).unwrap();
+        assert_eq!(store.total_rows, rows);
+
+        // Either side of both checkpoints, and the last page.
+        for offset in [
+            0,
+            5,
+            STRIDE - 3,
+            STRIDE,
+            STRIDE + 4,
+            2 * STRIDE + 900,
+            rows - 10,
+        ] {
+            store.scroll_to_offset(offset).unwrap();
+            let landed = store.row_offset;
+            let first = cell(&store.current_view, 0, 0).unwrap();
+            assert_eq!(
+                first,
+                landed.to_string(),
+                "page at {offset} began on the wrong row"
+            );
+            let note = cell(&store.current_view, 1, 0).unwrap();
+            let expected = if landed % 7 == 0 { "a,b" } else { "plain" };
+            assert_eq!(note, expected, "row {landed} came back with the wrong note");
+        }
+    }
 
     #[test]
     fn an_edit_shows_in_the_page() {

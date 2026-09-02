@@ -1,4 +1,5 @@
 pub mod edit;
+pub mod index;
 pub mod lake_db;
 pub mod loader;
 pub mod rows;
