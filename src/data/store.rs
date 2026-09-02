@@ -602,7 +602,7 @@ impl Store {
         let text = column.cast(&DataType::String)?;
         let mut values: Vec<Option<String>> = text
             .str()?
-            .into_iter()
+            .iter()
             .map(|v| v.map(str::to_string))
             .collect();
         for &(row, value) in edits {
@@ -825,7 +825,7 @@ impl Store {
                     .column("__idx__")
                     .ok()
                     .and_then(|c| c.u32().ok())
-                    .map(|ca| ca.into_iter().flatten().map(|i| i as usize).collect())
+                    .map(|ca| ca.iter().flatten().map(|i| i as usize).collect())
                     .unwrap_or_default();
 
                 if !rows.is_empty() && tx.send(rows).is_err() {
