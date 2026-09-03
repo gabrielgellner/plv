@@ -521,7 +521,7 @@ impl App {
                             sort_tick: self.sort_rx.as_ref().map(|_| self.spinner_tick),
                             filtering: store.filtering(),
                             help: if self.picker.is_some() {
-                                " -:show  p:pin  ⏎:apply  esc:cancel "
+                                " -:show  a/A:all/one  p:pin  ⏎:apply  esc "
                             } else if self.lake.is_some() {
                                 " f:partitions  T:snapshots  b:back  ?:help "
                             } else {
@@ -701,6 +701,7 @@ impl App {
             ("g / G", "First / last column"),
             ("Ctrl+d / Ctrl+u", "Half page down / up"),
             ("-", "Show or hide this column"),
+            ("a / A", "Show every column / hide all but this one"),
             ("p", "Pin or unpin this column"),
             ("Enter", "Apply"),
             ("Esc", "Cancel, changing nothing"),
@@ -2587,6 +2588,11 @@ impl App {
                 }
             }
             KeyCode::Char('p') => picker.toggle_pinned(),
+            // Bulk over the whole list. Picking four columns out of two
+            // hundred means starting from none, and unticking 196 by hand is
+            // not a thing anyone will do.
+            KeyCode::Char('a') => picker.show_all(),
+            KeyCode::Char('A') => picker.show_only_cursor(),
             _ => {}
         }
         Ok(())
@@ -4398,6 +4404,25 @@ mod tests {
         press(&mut app, '-');
         key(&mut app, KeyCode::Enter);
         assert_eq!(shown_columns(&app), ["a", "c", "d"]);
+    }
+
+    /// The workflow the keys exist for: start from none, tick the few wanted.
+    #[test]
+    fn a_and_shift_a_pick_a_handful_out_of_the_whole_list() {
+        let mut app = app_sized("pickall.csv", FOURCOL, 60);
+        press(&mut app, 'C');
+        press(&mut app, 'j'); // onto b
+        press(&mut app, 'A'); // and nothing else
+        press(&mut app, 'j');
+        press(&mut app, 'j'); // onto d
+        press(&mut app, '-'); // tick it too
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(shown_columns(&app), ["b", "d"]);
+
+        press(&mut app, 'C');
+        press(&mut app, 'a');
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(shown_columns(&app), ["b", "d", "a", "c"], "all back, listed order");
     }
 
     /// `q` closes a window everywhere else in vim, and a window is a view —

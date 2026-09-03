@@ -182,7 +182,14 @@ which, so the message says `:reset select` at the moment the user might want it.
 
 `C` opens the **column picker** (`src/picker.rs`), the other direction: a list of
 every column with a tick for shown and one for pinned, `-` and `p` to toggle,
-`Enter` to apply and `Esc` to leave. `-` and not Space, so the key that takes a
+`Enter` to apply and `Esc` to leave. `a` shows every column and `A` hides all but
+the one under the cursor — picking four columns out of two hundred means starting
+from none, and unticking 196 by hand is not a thing anyone will do. Two keys and
+not one toggle, because the state a toggle would read is a hundred rows long and
+mostly off screen, and a key whose direction depends on what you cannot see is a
+guess; `A` keeps the cursor's column because that is where the handful gets built
+up from, and lands on exactly one, which is the fewest a view may have. `-` and
+not Space, so the key that takes a
 column off the view is the same one in the list as in the table — out there it
 can only hide, since there is nothing on screen to un-hide, while in here the
 state is in front of you and it toggles. `q` is deliberately **unbound**:
