@@ -95,6 +95,31 @@ impl Picker {
         Ok(())
     }
 
+    /// `a`: put every column back on show.
+    pub fn show_all(&mut self) {
+        self.shown = self.order.iter().copied().collect();
+    }
+
+    /// `A`: hide everything but the column under the cursor.
+    ///
+    /// Not a toggle paired with `a`, because the state it would toggle on is
+    /// a hundred rows long and mostly off screen — a key whose direction
+    /// depends on what you cannot see is a guess. Two keys, each doing one
+    /// thing, is the honest shape for an operation over the whole list.
+    ///
+    /// Something has to stay, since a view with no columns is not one, and
+    /// the cursor's is what to keep: this key exists for picking a handful
+    /// out of a hundred, and the handful is built up from where you are
+    /// already looking. On a hidden column it shows that one, which is the
+    /// same rule read the other way.
+    pub fn show_only_cursor(&mut self) {
+        let Some(column) = self.cursor_column() else {
+            return;
+        };
+        self.shown.clear();
+        self.shown.insert(column);
+    }
+
     /// Toggle whether the cursor column is pinned.
     ///
     /// Allowed on a hidden column: a pin is kept against the source column and
@@ -207,6 +232,44 @@ mod tests {
         picker.state.go_to(2, 4); // onto b, the first hidden one
         picker.toggle_shown().unwrap();
         assert_eq!(picker.selection(), [0, 2, 1], "in its listed position");
+    }
+
+    /// Picking four columns out of two hundred means starting from none.
+    #[test]
+    fn a_and_shift_a_work_over_the_whole_list() {
+        let mut picker = Picker::new(names(), vec![0, 1, 2, 3], BTreeSet::new());
+        picker.state.go_to(2, 4); // onto c
+
+        picker.show_only_cursor();
+        assert_eq!(picker.selection(), [2], "everything but the cursor column");
+
+        // And then the handful is built up from there.
+        picker.state.go_to(0, 4);
+        picker.toggle_shown().unwrap();
+        assert_eq!(picker.selection(), [0, 2], "in listed order");
+
+        picker.show_all();
+        assert_eq!(picker.selection(), [0, 1, 2, 3]);
+    }
+
+    /// Keeping the cursor column means showing it when it was hidden, which
+    /// is the same rule read the other way.
+    #[test]
+    fn shift_a_on_a_hidden_column_leaves_that_one_showing() {
+        let mut picker = Picker::new(names(), vec![0, 1], BTreeSet::new());
+        picker.state.go_to(3, 4); // onto d, which the view hides
+        picker.show_only_cursor();
+        assert_eq!(picker.selection(), [3]);
+    }
+
+    /// `A` lands on exactly one column, which is the fewest a view may have —
+    /// so it never produces a state `toggle_shown` would have refused.
+    #[test]
+    fn shift_a_leaves_a_view_that_is_still_legal() {
+        let mut picker = Picker::new(names(), vec![0, 1, 2, 3], BTreeSet::new());
+        picker.show_only_cursor();
+        assert_eq!(picker.selection().len(), 1);
+        assert!(picker.toggle_shown().is_err(), "and the last one still holds");
     }
 
     #[test]
