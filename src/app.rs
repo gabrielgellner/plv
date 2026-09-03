@@ -572,6 +572,7 @@ impl App {
             ("0 / $", "Scroll to the first / last column"),
             ("Tab", "Cycle row \u{2192} column \u{2192} cell"),
             ("s", "Sort by cursor column"),
+            ("-", "Hide the cursor column (:reset select brings it back)"),
             ("zp", "Pin / unpin the cursor column at the left edge"),
             ("z|", "Unpin every column"),
         ];
@@ -1259,6 +1260,19 @@ impl App {
 
             // Sort by cursor column (Column/Cell mode only). Toggles asc ↔ desc;
             // pressing s on a new column adds it as the next priority sort key.
+            // Hide the cursor column. Gated to the cursor modes as `s` is:
+            // row mode has no column cursor, and hiding whichever column
+            // happens to be leftmost is not what the key means.
+            KeyCode::Char('-')
+                if matches!(
+                    self.selection_mode,
+                    SelectionMode::Column | SelectionMode::Cell
+                ) =>
+            {
+                self.pending_num.clear();
+                self.hide_column()?;
+            }
+
             KeyCode::Char('s')
                 if matches!(
                     self.selection_mode,
@@ -2041,6 +2055,20 @@ impl App {
                 return Ok(());
             }
         };
+        self.apply_view_command(command)
+    }
+
+    /// Adopt a view command, whether it was typed on the `:` line or came
+    /// from a key.
+    ///
+    /// Split out so `-` is genuinely the command it looks like rather than a
+    /// second way to narrow the view: one path decides what a new view costs,
+    /// refuses the ones that will not collect, and puts the cursor back.
+    fn apply_view_command(&mut self, command: view::Command) -> anyhow::Result<()> {
+        let Some(store) = &self.store else {
+            self.message = Some("no file open".to_string());
+            return Ok(());
+        };
 
         // Whether the row set has to be rebuilt is a property of the command,
         // not of the state it produces: `:select` leaves a filter's matches
@@ -2108,7 +2136,7 @@ impl App {
     }
 
     /// Put the cursor back inside a view that may have fewer columns, and drop
-    /// what was pinned to the old numbering.
+    /// whatever was keyed to the old numbering.
     fn after_view_change(&mut self, reordered: bool) -> anyhow::Result<()> {
         let last = self
             .store
@@ -2430,6 +2458,44 @@ impl App {
                 self.cursor_col = (self.cursor_col + n).min(last);
             }
         }
+    }
+
+    /// `-`: take the cursor column off the view.
+    ///
+    /// Sugar for typing `:hide <name>`, and deliberately nothing more: it
+    /// writes the slot `:select` writes, through the same `apply` that a
+    /// typed line goes through, so there is one answer to which columns show
+    /// rather than two that can disagree. `:hide` already reads the current
+    /// list and filters it, so pressing this twice narrows twice — where a
+    /// second `:select` would replace the first.
+    ///
+    /// The cursor is left where the column was, on whatever has moved into
+    /// that position, as `dd` leaves it on the next row. That falls out of
+    /// the clamp in `after_view_change` and needs nothing here.
+    fn hide_column(&mut self) -> anyhow::Result<()> {
+        let Some(store) = &self.store else {
+            return Ok(());
+        };
+        let Some(source) = store.source_column(self.cursor_col) else {
+            return Ok(());
+        };
+        let name = store
+            .current_view
+            .columns()
+            .get(self.cursor_col)
+            .map(|column| column.name().to_string());
+
+        self.apply_view_command(view::Command::Hide(vec![source]))?;
+
+        // Say how to get it back. There is no key that un-hides one column —
+        // naming it is the only way to say which — so the way back has to be
+        // in front of the user at the moment they might want it.
+        if let Some(name) = name
+            && self.message.is_none()
+        {
+            self.message = Some(format!("hid {name} — :reset select brings it back"));
+        }
+        Ok(())
     }
 
     /// Widen or narrow the cursor column by `steps`, each of a few characters.
@@ -4006,6 +4072,108 @@ mod tests {
         assert_eq!(app.store.as_ref().unwrap().dirty(), 0);
         let message = app.message.clone().unwrap();
         assert!(message.contains("too many"), "{message}");
+    }
+
+    /// `-` is `:hide <name>` without the typing, so it goes through the same
+    /// slot and shows up in the same place.
+    #[test]
+    fn minus_hides_the_cursor_column() {
+        let mut app = app_sized("hide.csv", FOURCOL, 60);
+        key(&mut app, KeyCode::Tab); // column mode
+        press(&mut app, 'l'); // onto b
+
+        press(&mut app, '-');
+        assert_eq!(shown_columns(&app), ["a", "c", "d"]);
+    }
+
+    /// `:hide` reads the current list and filters it, so hiding twice narrows
+    /// twice — where a second `:select` would replace the first.
+    #[test]
+    fn hiding_accumulates_rather_than_replacing() {
+        let mut app = app_sized("hidetwice.csv", FOURCOL, 60);
+        key(&mut app, KeyCode::Tab);
+        press(&mut app, '-');
+        press(&mut app, '-');
+        assert_eq!(shown_columns(&app), ["c", "d"]);
+    }
+
+    /// The cursor stays where the column was, on whatever moved into that
+    /// position — as `dd` leaves it on the next row.
+    #[test]
+    fn the_cursor_stays_where_the_hidden_column_was() {
+        let mut app = app_sized("hidecursor.csv", FOURCOL, 60);
+        key(&mut app, KeyCode::Tab);
+        press(&mut app, 'l'); // onto b, position 1
+        press(&mut app, '-');
+        assert_eq!(app.cursor_col, 1, "still position 1");
+        assert_eq!(shown_columns(&app)[app.cursor_col], "c", "now showing c");
+
+        // At the right edge there is nothing to move up, so it steps back.
+        press(&mut app, '$');
+        let last = shown_columns(&app).len() - 1;
+        assert_eq!(app.cursor_col, last);
+        press(&mut app, '-');
+        assert_eq!(app.cursor_col, shown_columns(&app).len() - 1);
+    }
+
+    /// Hiding everything would leave nothing to look at, and `view::apply`
+    /// already refuses it — the key must not find its own way round that.
+    #[test]
+    fn hiding_the_last_column_is_refused() {
+        let mut app = app_sized("hideall.csv", FOURCOL, 60);
+        key(&mut app, KeyCode::Tab);
+        for _ in 0..3 {
+            press(&mut app, '-');
+        }
+        assert_eq!(shown_columns(&app).len(), 1);
+
+        press(&mut app, '-');
+        assert_eq!(shown_columns(&app).len(), 1, "the last one stays");
+        let refusal = app.message.clone().unwrap();
+        assert!(refusal.contains("hide every column"), "{refusal}");
+    }
+
+    /// There is no key that un-hides one column, so the way back has to be in
+    /// front of the user at the moment they might want it.
+    #[test]
+    fn hiding_says_how_to_get_the_column_back() {
+        let mut app = app_sized("hideback.csv", FOURCOL, 60);
+        key(&mut app, KeyCode::Tab);
+        press(&mut app, '-');
+        let said = app.message.clone().unwrap();
+        assert!(said.contains("hid a"), "{said}");
+        assert!(said.contains("reset select"), "{said}");
+
+        command(&mut app, "reset select");
+        assert_eq!(shown_columns(&app), ["a", "b", "c", "d"]);
+    }
+
+    /// Row mode has no column cursor, so there is no column the key could
+    /// mean — the same gate `s` has.
+    #[test]
+    fn hiding_needs_a_column_cursor() {
+        let mut app = app_sized("hiderow.csv", FOURCOL, 60);
+        assert_eq!(app.selection_mode, SelectionMode::Row);
+        press(&mut app, '-');
+        assert_eq!(shown_columns(&app), ["a", "b", "c", "d"]);
+    }
+
+    /// The two column features compose: a pin on a hidden column waits, and
+    /// hiding around a pin leaves it drawn.
+    #[test]
+    fn a_hidden_column_keeps_its_pin_for_when_it_comes_back() {
+        let mut app = app_sized("hidepin.csv", FOURCOL, 60);
+        key(&mut app, KeyCode::Tab);
+        press(&mut app, 'z');
+        press(&mut app, 'p'); // pin a
+        press(&mut app, '-'); // and hide it
+
+        assert_eq!(shown_columns(&app), ["b", "c", "d"]);
+        assert!(app.display_pins().is_empty(), "nowhere to draw it");
+        assert_eq!(app.pinned.iter().copied().collect::<Vec<_>>(), [0]);
+
+        command(&mut app, "reset select");
+        assert_eq!(app.display_pins().iter().copied().collect::<Vec<_>>(), [0]);
     }
 
     #[test]
