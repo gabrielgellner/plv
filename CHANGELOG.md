@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.0] - 2026-09-03
+
+### Bug Fixes
+
+- hold a sort instead of redoing it for every page ([`868f70e`](https://gitlab.com/gabrielgellner/plv/-/commit/868f70ebb1a8b9ace9091c57945e17337745e46a))
+- refuse an oversized sort rather than attempting one ([`e4614b3`](https://gitlab.com/gabrielgellner/plv/-/commit/e4614b3fc81fed94b78c0e4f54696c8c94b0df5c))
+- bound memory by what the machine has, and bound the filter at all ([`2593fa5`](https://gitlab.com/gabrielgellner/plv/-/commit/2593fa590382273e0bc324fe9137b8042d0949ff))
+- read scan chunks where they live, not from the top each time ([`dd43afb`](https://gitlab.com/gabrielgellner/plv/-/commit/dd43afb4874e1f95ee5922aca77c1b748d21e710))
+- bound a scan chunk by bytes, not by a row count ([`7d7d4bc`](https://gitlab.com/gabrielgellner/plv/-/commit/7d7d4bce6bd18bd3c682ff972cdcf1f8e893230a))
+
+### Features
+
+- a filter and a sort at the same time ([`ed1601a`](https://gitlab.com/gabrielgellner/plv/-/commit/ed1601aa596a76d233410b74965542953667d327))
+- index where the rows are, so a page can be found ([`f36b051`](https://gitlab.com/gabrielgellner/plv/-/commit/f36b051ff8e044f4b0ce51e8a70604a88523b7e1))
+
+### Miscellaneous
+
+- polars 0.53 → 0.55.2 ([`eef38e7`](https://gitlab.com/gabrielgellner/plv/-/commit/eef38e7a97d040b974e05ff837af50d2d11674be))
+
 ## [0.6.0] - 2026-09-02
 
 ### Features
@@ -107,6 +126,8 @@ All notable changes to this project will be documented in this file.
 ### Styling
 
 - fix clippy warnings ([`5cb0dba`](https://gitlab.com/gabrielgellner/plv/-/commit/5cb0dba5f5d4bc0be4d3d3b09fd1e7cd00ff7722))
+
+[0.7.0]: https://gitlab.com/gabrielgellner/plv/-/compare/v0.6.0...v0.7.0
 
 [0.6.0]: https://gitlab.com/gabrielgellner/plv/-/compare/v0.5.0...v0.6.0
 
