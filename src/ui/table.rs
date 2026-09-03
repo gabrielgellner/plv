@@ -127,12 +127,21 @@ fn natural_col_width(col: &Column) -> usize {
 
 /// The sort indicator in full and in brief.
 ///
-/// The number is the key's priority and says nothing at all when there is only
-/// one key; the arrow is the part that cannot be dropped, since it is what
-/// tells you which way the column is sorted.
-fn sort_marks(order: usize, ascending: bool) -> (String, String) {
+/// With a single key the full form *is* the arrow: the number is the key's
+/// priority, and a priority among one thing says nothing — ` [▲1]` spent five
+/// characters of a header to tell the user what ` ▲` tells them. The brackets
+/// exist to bind the number to the arrow, so they go with it.
+///
+/// The arrow is the part that can never be dropped, since it is what says
+/// which way the column is sorted.
+fn sort_marks(order: usize, ascending: bool, keys: usize) -> (String, String) {
     let arrow = if ascending { "▲" } else { "▼" };
-    (format!(" [{arrow}{}]", order + 1), arrow.to_string())
+    let full = if keys > 1 {
+        format!(" [{arrow}{}]", order + 1)
+    } else {
+        format!(" {arrow}")
+    };
+    (full, arrow.to_string())
 }
 
 /// How much room beyond its name a column's header would like: the sort
@@ -146,7 +155,7 @@ fn sort_marks(order: usize, ascending: bool) -> (String, String) {
 fn indicator_width(sort: &[(usize, bool)], ci: usize) -> usize {
     sort.iter()
         .position(|key| key.0 == ci)
-        .map(|order| sort_marks(order, true).0.chars().count())
+        .map(|order| sort_marks(order, true, sort.len()).0.chars().count())
         .unwrap_or(0)
 }
 
@@ -554,11 +563,11 @@ impl Widget for DataTable<'_> {
 
             let sort_entry = self.sort.iter().enumerate().find(|(_, key)| key.0 == ci);
 
-            let marks = sort_entry.map(|(order, key)| sort_marks(order, key.1));
+            let marks = sort_entry.map(|(order, key)| sort_marks(order, key.1, self.sort.len()));
             let (name, indicator) =
                 header_parts(cols[ci].name().as_str(), final_widths[idx], marks.clone());
 
-            let cell = if let (Some(tick), Some((full, _))) = (self.sort_tick, marks.as_ref()) {
+            let cell = if let (Some(tick), Some(_)) = (self.sort_tick, marks.as_ref()) {
                 // Sort in progress: animate the indicator with cycling bold.
                 let active = Style::new()
                     .fg(fg)
@@ -570,10 +579,10 @@ impl Widget for DataTable<'_> {
                     .remove_modifier(Modifier::BOLD);
                 let lead = Span::styled(format!("{:>width$}{}", "", name, width = sp), cell_style);
 
-                let spans = if &indicator == full {
+                let spans = if indicator.contains('[') {
                     // " [▲N]" in full: cycle the bold over "[", the arrow, "]".
                     let bold_pos = (tick / 3) % 3;
-                    let mut chars = full.chars();
+                    let mut chars = indicator.chars();
                     chars.next(); // the leading space, carried by the " " span below
                     let bracket = chars.next().map(String::from).unwrap_or_default();
                     let arrow = chars.next().map(String::from).unwrap_or_default();
@@ -588,8 +597,9 @@ impl Widget for DataTable<'_> {
                         Span::styled(close, if bold_pos == 2 { active } else { quiet }),
                     ]
                 } else {
-                    // Too narrow for the brackets, so the arrow alone carries
-                    // the animation — blinking rather than cycling.
+                    // No brackets to cycle — a single key, or a column too
+                    // narrow for them — so the arrow alone carries the
+                    // animation, blinking rather than cycling.
                     let on = (tick / 3) % 2 == 0;
                     vec![
                         lead,
@@ -1156,7 +1166,32 @@ mod tests {
         let plain = lines(&draw_sorted(&df, 60, &[]))[1].clone();
         let sorted = lines(&draw_sorted(&df, 60, &[(0, true)]))[1].clone();
         assert!(!plain.contains('['), "unsorted has no indicator: {plain}");
-        assert!(sorted.contains("region [▲1]"), "{sorted}");
+        assert!(sorted.contains("region ▲"), "one key, so no priority: {sorted}");
+    }
+
+    /// A priority among one thing says nothing, so a lone key is just its
+    /// arrow — ` [▲1]` spent five characters of a header saying what ` ▲`
+    /// says in two.
+    #[test]
+    fn a_lone_sort_key_is_just_its_arrow() {
+        assert_eq!(sort_marks(0, true, 1).0, " ▲");
+        assert_eq!(sort_marks(0, false, 1).0, " ▼");
+        assert_eq!(
+            header_parts("region", 8, Some(sort_marks(0, true, 1))),
+            ("region".to_string(), " ▲".to_string())
+        );
+    }
+
+    /// The number only earns its brackets once there is another key to be
+    /// told apart from.
+    #[test]
+    fn the_priority_number_comes_back_for_a_second_key() {
+        assert_eq!(sort_marks(0, true, 2).0, " [▲1]");
+        assert_eq!(sort_marks(2, false, 3).0, " [▼3]");
+        assert_eq!(
+            header_parts("q1", 8, Some(sort_marks(2, false, 3))),
+            ("q1".to_string(), " [▼3]".to_string())
+        );
     }
 
     /// Squeezed with nowhere to grow, the indicator gives way before the name
@@ -1166,7 +1201,8 @@ mod tests {
     /// not the ladder.
     #[test]
     fn a_squeezed_indicator_gives_up_its_brackets_before_the_name() {
-        let marks = || Some(sort_marks(0, true));
+        // Three keys, so the full form carries brackets and a number.
+        let marks = || Some(sort_marks(0, true, 3));
 
         // Room for both: nothing gives way.
         assert_eq!(
@@ -1174,8 +1210,8 @@ mod tests {
             ("region".to_string(), " [▲1]".to_string())
         );
 
-        // One short of the full indicator: the brackets and the priority go,
-        // the arrow and the whole name stay.
+        // One short: the brackets and the priority go, the arrow and the
+        // whole name stay.
         assert_eq!(
             header_parts("region", 10, marks()),
             ("region".to_string(), "▲".to_string())
@@ -1192,15 +1228,15 @@ mod tests {
         assert_eq!(name, "regi…", "and the name keeps the rest");
     }
 
-    /// The priority number is what tells a multi-key sort apart, so it is only
-    /// dropped under real pressure.
+    /// A lone key walks the same ladder, from ` ▲` to a bare `▲`.
     #[test]
-    fn the_indicator_keeps_its_priority_number_when_there_is_room() {
-        assert_eq!(sort_marks(2, false).0, " [▼3]");
+    fn a_lone_arrow_gives_up_its_space_before_the_name() {
+        let marks = || Some(sort_marks(0, true, 1));
         assert_eq!(
-            header_parts("q1", 8, Some(sort_marks(2, false))),
-            ("q1".to_string(), " [▼3]".to_string())
+            header_parts("region", 7, marks()),
+            ("region".to_string(), "▲".to_string())
         );
+        assert_eq!(header_parts("region", 6, marks()).0, "regi…");
     }
 
     /// An unsorted column is untouched by any of this.
