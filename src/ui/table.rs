@@ -125,6 +125,53 @@ fn natural_col_width(col: &Column) -> usize {
     header_w.max(data_w).max(MIN_COL_WIDTH)
 }
 
+/// The sort indicator in full and in brief.
+///
+/// The number is the key's priority and says nothing at all when there is only
+/// one key; the arrow is the part that cannot be dropped, since it is what
+/// tells you which way the column is sorted.
+fn sort_marks(order: usize, ascending: bool) -> (String, String) {
+    let arrow = if ascending { "▲" } else { "▼" };
+    (format!(" [{arrow}{}]", order + 1), arrow.to_string())
+}
+
+/// How much room beyond its name a column's header would like: the sort
+/// indicator, when it has one.
+///
+/// Counted into what a column *asks* for and not into what it is granted, so
+/// that slack reaches a sorted column ahead of an unsorted one without
+/// changing which columns are visible. Growing the visible set when a sort
+/// starts would shift the table sideways under the user, and would disagree
+/// with `col_offset_showing`, which cannot see the sort.
+fn indicator_width(sort: &[(usize, bool)], ci: usize) -> usize {
+    sort.iter()
+        .position(|key| key.0 == ci)
+        .map(|order| sort_marks(order, true).0.chars().count())
+        .unwrap_or(0)
+}
+
+/// A header as it will be drawn: the name, and whatever of the indicator fits
+/// beside it.
+///
+/// The name is what identifies the column, so it is the last thing to be given
+/// up — a six-wide `region` used to render as a bare `…`, all six characters
+/// spent on ` [▲1]`, which named the sort and lost the column. The indicator
+/// gives way first, to its arrow and then to nothing.
+fn header_parts(name: &str, width: usize, marks: Option<(String, String)>) -> (String, String) {
+    let Some((full, brief)) = marks else {
+        return (truncate(name, width), String::new());
+    };
+    let name_w = name.chars().count();
+    if name_w + full.chars().count() <= width {
+        (name.to_string(), full)
+    } else if name_w + brief.chars().count() <= width {
+        (name.to_string(), brief)
+    } else {
+        let brief_w = brief.chars().count();
+        (truncate(name, width.saturating_sub(brief_w)), brief)
+    }
+}
+
 /// csvlens-style width redistribution.
 ///
 /// After capping every column at `max_w`, any slack (unused terminal space) is
@@ -425,7 +472,20 @@ impl Widget for DataTable<'_> {
         // ── Phase 2: redistribute leftover space to capped columns ────────
         let capped = vis_widths;
         let slack = inner_w.saturating_sub(consumed);
-        let vis_naturals: Vec<usize> = vis_cols.iter().map(|&i| naturals[i]).collect();
+        // A sorted column asks for its indicator on top of its name, so the
+        // slack goes there first. A width set by hand asks for exactly what
+        // was set and no more — `z>` is the user saying how wide, and a sort
+        // must not talk them out of it.
+        let vis_naturals: Vec<usize> = vis_cols
+            .iter()
+            .map(|&i| {
+                if self.widths.contains_key(&i) {
+                    naturals[i]
+                } else {
+                    naturals[i] + indicator_width(self.sort, i)
+                }
+            })
+            .collect();
         let final_widths = redistribute(capped, &vis_naturals, slack);
 
         // Actual pixels used by full columns (excluding the filler slot).
@@ -494,16 +554,12 @@ impl Widget for DataTable<'_> {
 
             let sort_entry = self.sort.iter().enumerate().find(|(_, key)| key.0 == ci);
 
-            let cell = if let (Some(tick), Some((order, key))) = (self.sort_tick, sort_entry) {
-                // Sort in progress: animate [ arrow num ] with cycling bold.
-                let arrow = if key.1 { "▲" } else { "▼" };
-                let num = (order + 1).to_string();
-                // indicator is " [▲N]" — 4 chars for "[▲N]" plus 1 space = 5 + num digits
-                let indicator_len = 1 + 1 + 1 + num.len() + 1;
-                let avail = final_widths[idx].saturating_sub(indicator_len);
-                let name = truncate(cols[ci].name().as_str(), avail);
+            let marks = sort_entry.map(|(order, key)| sort_marks(order, key.1));
+            let (name, indicator) =
+                header_parts(cols[ci].name().as_str(), final_widths[idx], marks.clone());
 
-                let bold_pos = (tick / 3) % 3; // 0="[", 1=arrow, 2="]"
+            let cell = if let (Some(tick), Some((full, _))) = (self.sort_tick, marks.as_ref()) {
+                // Sort in progress: animate the indicator with cycling bold.
                 let active = Style::new()
                     .fg(fg)
                     .bold()
@@ -512,27 +568,37 @@ impl Widget for DataTable<'_> {
                     .fg(fg)
                     .add_modifier(Modifier::UNDERLINED)
                     .remove_modifier(Modifier::BOLD);
+                let lead = Span::styled(format!("{:>width$}{}", "", name, width = sp), cell_style);
 
-                let spans = vec![
-                    Span::styled(format!("{:>width$}{}", "", name, width = sp), cell_style),
-                    Span::styled(" ", quiet),
-                    Span::styled("[", if bold_pos == 0 { active } else { quiet }),
-                    Span::styled(arrow, if bold_pos == 1 { active } else { quiet }),
-                    Span::styled(num, quiet),
-                    Span::styled("]", if bold_pos == 2 { active } else { quiet }),
-                ];
+                let spans = if &indicator == full {
+                    // " [▲N]" in full: cycle the bold over "[", the arrow, "]".
+                    let bold_pos = (tick / 3) % 3;
+                    let mut chars = full.chars();
+                    chars.next(); // the leading space, carried by the " " span below
+                    let bracket = chars.next().map(String::from).unwrap_or_default();
+                    let arrow = chars.next().map(String::from).unwrap_or_default();
+                    let close = chars.next_back().map(String::from).unwrap_or_default();
+                    let num: String = chars.collect();
+                    vec![
+                        lead,
+                        Span::styled(" ", quiet),
+                        Span::styled(bracket, if bold_pos == 0 { active } else { quiet }),
+                        Span::styled(arrow, if bold_pos == 1 { active } else { quiet }),
+                        Span::styled(num, quiet),
+                        Span::styled(close, if bold_pos == 2 { active } else { quiet }),
+                    ]
+                } else {
+                    // Too narrow for the brackets, so the arrow alone carries
+                    // the animation — blinking rather than cycling.
+                    let on = (tick / 3) % 2 == 0;
+                    vec![
+                        lead,
+                        Span::styled(indicator.clone(), if on { active } else { quiet }),
+                    ]
+                };
                 Cell::new(Line::from(spans)).style(cell_style)
             } else {
-                // Static: show completed sort indicator.
-                let sort_indicator = sort_entry
-                    .map(|(order, key)| {
-                        let arrow = if key.1 { "▲" } else { "▼" };
-                        format!(" [{arrow}{}]", order + 1)
-                    })
-                    .unwrap_or_default();
-                let avail = final_widths[idx].saturating_sub(sort_indicator.chars().count());
-                let name = truncate(cols[ci].name().as_str(), avail);
-                let padded = format!("{:>width$}{}{}", "", name, sort_indicator, width = sp);
+                let padded = format!("{:>width$}{}{}", "", name, indicator, width = sp);
                 Cell::new(padded).style(cell_style)
             };
             header_cells.push(cell);
@@ -1041,6 +1107,110 @@ mod tests {
             &[0].into_iter().collect()
         ));
         assert!(!pin_fits(&df, 0, 40, &Widths::new(), &(0..6).collect()));
+    }
+
+    fn draw_sorted(df: &DataFrame, width: u16, sort: &[(usize, bool)]) -> Buffer {
+        let theme = Theme::catppuccin_mocha();
+        let last_vis = std::cell::Cell::new(0);
+        let area = Rect::new(0, 0, width, 4);
+        let mut buf = Buffer::empty(area);
+        DataTable {
+            df,
+            col_offset: 0,
+            cursor_col: 0,
+            row_offset: 0,
+            cursor_row: 0,
+            selection_mode: SelectionMode::Cell,
+            theme: &theme,
+            search: None,
+            search_col: None,
+            last_vis_col_out: &last_vis,
+            sort,
+            sort_tick: None,
+            edited: &[],
+            selection: None,
+            relative_rows: true,
+            widths: &Widths::new(),
+            pinned: &Pinned::new(),
+        }
+        .render(area, &mut buf);
+        buf
+    }
+
+    /// The name is what identifies the column. A six-wide `region` used to
+    /// render as a bare `…`, every character of it spent on ` [▲1]` — the
+    /// sort named, the column lost.
+    #[test]
+    fn a_sorted_column_does_not_lose_its_name_to_the_indicator() {
+        let df = df! { "region" => ["east"], "q1" => ["1"] }.unwrap();
+        let header = lines(&draw_sorted(&df, 60, &[(0, true)]))[1].clone();
+        assert!(header.contains("region"), "{header}");
+        assert!(header.contains('▲'), "and still says it is sorted: {header}");
+    }
+
+    /// With the slack to grow into, the column takes the room for the whole
+    /// indicator rather than eating into its own name.
+    #[test]
+    fn a_sorted_column_asks_for_room_for_its_indicator() {
+        let df = df! { "region" => ["east"], "q1" => ["1"] }.unwrap();
+        let plain = lines(&draw_sorted(&df, 60, &[]))[1].clone();
+        let sorted = lines(&draw_sorted(&df, 60, &[(0, true)]))[1].clone();
+        assert!(!plain.contains('['), "unsorted has no indicator: {plain}");
+        assert!(sorted.contains("region [▲1]"), "{sorted}");
+    }
+
+    /// Squeezed with nowhere to grow, the indicator gives way before the name
+    /// does. Tested on `header_parts` rather than through a render, because
+    /// the interesting case is the one where the layout has no slack left and
+    /// arranging for that through the width arithmetic tests the arithmetic,
+    /// not the ladder.
+    #[test]
+    fn a_squeezed_indicator_gives_up_its_brackets_before_the_name() {
+        let marks = || Some(sort_marks(0, true));
+
+        // Room for both: nothing gives way.
+        assert_eq!(
+            header_parts("region", 11, marks()),
+            ("region".to_string(), " [▲1]".to_string())
+        );
+
+        // One short of the full indicator: the brackets and the priority go,
+        // the arrow and the whole name stay.
+        assert_eq!(
+            header_parts("region", 10, marks()),
+            ("region".to_string(), "▲".to_string())
+        );
+        assert_eq!(
+            header_parts("region", 7, marks()),
+            ("region".to_string(), "▲".to_string())
+        );
+
+        // Past that the name is truncated, but never below what is left after
+        // the arrow — and never to the bare `…` this used to render.
+        let (name, indicator) = header_parts("region", 6, marks());
+        assert_eq!(indicator, "▲", "the arrow is the part that cannot go");
+        assert_eq!(name, "regi…", "and the name keeps the rest");
+    }
+
+    /// The priority number is what tells a multi-key sort apart, so it is only
+    /// dropped under real pressure.
+    #[test]
+    fn the_indicator_keeps_its_priority_number_when_there_is_room() {
+        assert_eq!(sort_marks(2, false).0, " [▼3]");
+        assert_eq!(
+            header_parts("q1", 8, Some(sort_marks(2, false))),
+            ("q1".to_string(), " [▼3]".to_string())
+        );
+    }
+
+    /// An unsorted column is untouched by any of this.
+    #[test]
+    fn an_unsorted_header_is_just_its_name() {
+        assert_eq!(
+            header_parts("region", 20, None),
+            ("region".to_string(), String::new())
+        );
+        assert_eq!(header_parts("region", 4, None).0, "reg…");
     }
 
     /// A column that only partly fits still has to start clear of the one
