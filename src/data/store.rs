@@ -81,6 +81,12 @@ pub struct Store {
     /// without parsing everything before it. Absent for Parquet, which can
     /// already seek, and for lake tables.
     row_index: Option<std::sync::Arc<RowIndex>>,
+    /// Overrides how many bytes a scan chunk may read.
+    ///
+    /// Only tests set it. Crossing a chunk seam otherwise needs a fixture of
+    /// tens of megabytes, and the row numbering across that seam is precisely
+    /// where an off-by-one would hide.
+    scan_bytes: Option<u64>,
     /// The whole sorted table, held in memory, carrying [`SOURCE_ROW`].
     ///
     /// Sorting cannot be lazy — nothing can know which row comes first
@@ -123,6 +129,7 @@ impl Store {
             overlay: Overlay::new(),
             filter_rows: None,
             row_index: None,
+            scan_bytes: None,
             sorted: None,
         })
     }
@@ -189,6 +196,7 @@ impl Store {
             overlay: Overlay::new(),
             filter_rows: None,
             row_index: None,
+            scan_bytes: None,
             sorted: None,
         })
     }
@@ -1059,15 +1067,18 @@ impl Store {
         let path = target.path.clone();
         let separator = target.separator;
         let schema = self.schema.clone();
+        let budget = self.scan_bytes.unwrap_or_else(budget::scan_bytes);
 
         thread::spawn(move || {
             let Some(predicate) = build() else { return };
             let total = index.rows();
-            let step = chunk_rows(total);
             let mut start = 0usize;
 
             while start < total {
-                let end = (start + step).min(total);
+                // Sized by what it will read, not by a row count: a chunk of
+                // n rows is a few megabytes in one file and gigabytes in
+                // another, and only the bytes bound the memory.
+                let end = index.chunk_end(start, budget);
                 let (_, from) = index.seek(start);
                 let to = index.end_of(end);
 
@@ -1249,21 +1260,6 @@ fn parse_span(bytes: Vec<u8>, schema: &SchemaRef, separator: u8) -> Result<DataF
         .finish()?)
 }
 
-/// Rows per chunk of a background scan.
-///
-/// Chunking is for progress and cancellation, not because the reader wants
-/// small reads — so the count follows the size of the file, giving a roughly
-/// constant number of steps whatever it is, rather than a fixed row count that
-/// becomes tens of thousands of steps on a large one. Rounded up to the index's
-/// stride so every boundary is a checkpoint and no chunk overshoots its end.
-fn chunk_rows(total: usize) -> usize {
-    const STEPS: usize = 200;
-    (total / STEPS)
-        .max(index::STRIDE)
-        .div_ceil(index::STRIDE)
-        .saturating_mul(index::STRIDE)
-}
-
 /// Whether a table of this shape can be sorted at all: whether holding it
 /// would fit the memory budget.
 fn sort_fits(rows: usize, columns: usize) -> bool {
@@ -1302,42 +1298,32 @@ mod tests {
     /// Small fixtures never reach a second checkpoint, so the interesting
     /// case — a page found by seeking rather than by counting — needs a file
     /// bigger than one stride.
-    #[test]
-    fn a_scan_takes_about_the_same_number_of_steps_whatever_the_file() {
-        use crate::data::index::STRIDE;
-
-        // Small files get one stride; large ones get roughly 200 chunks
-        // rather than a count that grows with the file.
-        assert_eq!(chunk_rows(1_000), STRIDE);
-        assert_eq!(chunk_rows(STRIDE), STRIDE);
-
-        for total in [10_000_000usize, 272_000_000, 842_209_475] {
-            let step = chunk_rows(total);
-            assert_eq!(step % STRIDE, 0, "chunks must land on checkpoints");
-            let chunks = total.div_ceil(step);
-            assert!(
-                (100..=400).contains(&chunks),
-                "{total} rows gave {chunks} chunks of {step}"
-            );
-        }
-    }
-
     /// The indexed scan reads spans of the file itself, so it has to find
     /// exactly what a filter over the whole frame would.
     #[test]
     fn an_indexed_scan_finds_the_same_rows_across_several_chunks() {
         use crate::data::index::STRIDE;
 
+        // Wide enough that the fixture runs past one chunk's byte budget, or
+        // the seams between chunks never get crossed.
         let rows = STRIDE * 3 + 500;
-        let mut csv = String::from("id,cat\n");
+        let padding = "x".repeat(48);
+        let mut csv = String::from("id,cat,filler\n");
         for i in 0..rows {
-            csv.push_str(&format!("{i},{}\n", if i % 3 == 0 { "a" } else { "b" }));
+            csv.push_str(&format!(
+                "{i},{},{padding}\n",
+                if i % 3 == 0 { "a" } else { "b" }
+            ));
         }
         let path = write_temp("scan.csv", &csv);
         let mut store = Store::open_file(&path, 10).unwrap();
+        // Force several chunks out of a small fixture, so the row numbering
+        // across the seams is what is being checked.
+        store.scan_bytes = Some(64 << 10);
+        let index = store.row_index.clone().expect("a csv has an index");
         assert!(
-            chunk_rows(rows) < rows,
-            "the fixture has to span more than one chunk"
+            index.chunk_end(0, 64 << 10) < rows,
+            "the budget was meant to force more than one chunk"
         );
 
         store.view.filter = Some(

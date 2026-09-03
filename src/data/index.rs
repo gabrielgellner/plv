@@ -66,6 +66,28 @@ impl RowIndex {
         self.checkpoints.get(k).copied().unwrap_or(self.len)
     }
 
+    /// How far a chunk starting at `from` can run without reading more than
+    /// `bytes`, as a row number to stop at.
+    ///
+    /// Sizing a chunk in rows is the wrong unit: rows differ in width between
+    /// files by more than an order of magnitude, so the same row count is a
+    /// few megabytes in one file and gigabytes in another. The index knows
+    /// where the bytes are, so it can answer in the unit that actually bounds
+    /// the memory. Never returns `from` — a chunk is at least one stride, or
+    /// the scan would not advance.
+    pub fn chunk_end(&self, from: usize, bytes: u64) -> usize {
+        let start = self.seek(from).1;
+        let mut end = (from / STRIDE + 1) * STRIDE;
+        while end < self.rows {
+            let next = (end / STRIDE + 1) * STRIDE;
+            if self.end_of(next).saturating_sub(start) > bytes {
+                break;
+            }
+            end = next;
+        }
+        end.min(self.rows)
+    }
+
     /// Scan `path`, counting records and noting where every [`STRIDE`]-th one
     /// begins.
     ///
@@ -352,6 +374,41 @@ mod tests {
 
         let bytes = read_span(&path, &index, at, index.end_of(3)).unwrap();
         assert_eq!(String::from_utf8(bytes).unwrap(), "a,b\n1,2\n3,4\n5,6\n");
+    }
+
+    #[test]
+    fn a_chunk_is_bounded_by_bytes_rather_than_by_rows() {
+        // Rows about 10 bytes wide, so a byte budget maps to a row count.
+        let mut csv = String::from("id\n");
+        for i in 0..STRIDE * 8 {
+            csv.push_str(&format!("{i:08}\n"));
+        }
+        let path = write("chunked.csv", &csv);
+        let index = RowIndex::build(&path, b',').unwrap();
+        assert_eq!(index.rows(), STRIDE * 8);
+
+        // A generous budget takes several strides at once.
+        let wide = index.chunk_end(0, 10 << 20);
+        assert_eq!(wide, STRIDE * 8, "the whole file fits in 10MB");
+
+        // A tight one still advances, by at least a stride.
+        let tight = index.chunk_end(0, 1);
+        assert_eq!(tight, STRIDE, "never stalls, never overshoots");
+
+        // And it advances from wherever it is asked.
+        assert!(index.chunk_end(STRIDE, 1) > STRIDE);
+
+        // Walking the file in chunks reaches the end and skips nothing.
+        let mut at = 0usize;
+        let mut steps = 0usize;
+        while at < index.rows() {
+            let next = index.chunk_end(at, 200_000);
+            assert!(next > at, "a chunk must move forward");
+            at = next;
+            steps += 1;
+        }
+        assert_eq!(at, index.rows());
+        assert!(steps > 1, "the budget was meant to force several chunks");
     }
 
     #[test]

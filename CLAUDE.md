@@ -162,9 +162,11 @@ want the answer progressively. It reads each chunk from the byte offset the row
 index gives it: the lazy alternative re-reads from the top for every chunk, so
 its cost grows with the offset and the whole scan is quadratic. Measured on a
 2M-row CSV, the same filter took 4.16s in fixed 10,000-row chunks and 45.6ms
-read by span. Chunk size follows the file's size rather than being a fixed row
-count, so a scan takes roughly two hundred steps whatever it is reading, and
-every chunk boundary is an index checkpoint. A chunk that matched nothing still
+read by span. Chunk size is bounded by **bytes**, not by a row count: rows differ in
+width between files by more than an order of magnitude, so the same row count is
+a few megabytes in one file and gigabytes in another, and only the bytes bound
+the memory. `budget::scan_bytes()` sets the ceiling and the index answers which
+row that reaches, so every chunk boundary is still a checkpoint. A chunk that matched nothing still
 reports, so a scan that is merely finding nothing cannot look like one that has
 stalled. It buys a real row count, cancellation, and row
 identity, which is what lets the edit buffer survive a filter: a row picked out
