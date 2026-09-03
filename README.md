@@ -1,11 +1,13 @@
 # plv
 
-A terminal viewer for CSV, TSV, Parquet and [DuckLake](https://ducklake.select/) data, inspired by [csvlens](https://github.com/YS-L/csvlens). Built with [Polars](https://pola.rs/) and [ratatui](https://ratatui.rs/).
+A terminal viewer and editor for CSV, TSV, Parquet and [DuckLake](https://ducklake.select/) data, inspired by [csvlens](https://github.com/YS-L/csvlens). Built with [Polars](https://pola.rs/) and [ratatui](https://ratatui.rs/).
 
 - Supports CSV, tab-separated text, Parquet, and DuckLake lakes
-- Larger-than-memory files via Polars lazy evaluation
-- Browse a lake's tables, partition files and snapshots — including time travel
-- Vim-style navigation
+- **Edits delimited text** — cells, blocks, whole rows — in a buffer, written with `:w`
+- **A view language** — `:select`, `:hide`, `:filter`, `:sort` — with Tab completion over the file's own column names
+- Works on files larger than memory: a 30GB CSV opens, pages anywhere, edits and writes back within about 60MB
+- Browse a lake's tables, partitions and snapshots — including time travel
+- Vim-style navigation throughout
 
 ## Usage
 
@@ -26,19 +28,27 @@ Press `?` at any time for the key bindings of whatever screen you are on.
 | `j` / `↓` | Move cursor down |
 | `k` / `↑` | Move cursor up |
 | `Ctrl+d` / `Ctrl+u` | Half page down / up |
-| `g` / `Home` | Jump to first row |
+| `gg` / `Home` | Jump to first row |
 | `G` / `End` | Jump to last row |
-| `{n}G` | Jump to row n |
-| `h` / `←` | Scroll columns left |
-| `l` / `→` | Scroll columns right |
-| `H` | Jump to first column (all modes) |
-| `0` | Jump to first column (column/cell mode) |
-| `$` | Jump to last column (column/cell mode) |
+| `{n}gg` / `{n}G` | Jump to row n |
+| `h` / `l` | Move a column left / right |
+| `{n}h` / `{n}l` | Jump n columns |
+| `H` | Jump to first column |
+| `0` / `$` | Scroll so the first / last column sits at its edge |
 | `Tab` | Cycle selection mode: row → column → cell |
-| `s` | Sort by cursor column (column/cell mode); toggles asc ↔ desc; add more columns for multi-sort |
-| `zz` / `zt` / `zb` | Center / top / bottom cursor in view |
+| `s` | Sort by cursor column; toggles asc ↔ desc; add more columns for multi-sort |
+| `zz` / `zt` / `zb` | Centre / top / bottom cursor in view |
+| `#` | Relative or absolute row numbers |
 | `?` | Show key bindings for the current screen |
 | `q` | Quit |
+
+Row numbers count from the cursor by default, the way nvim's hybrid
+`number` + `relativenumber` gutter does, so `3j` and `12G` can be read off
+rather than worked out. `#` switches to plain absolute numbering.
+
+`Ctrl+d` and `Ctrl+u` move the view and the cursor together, keeping the cursor
+at the same height in the window — as vim does, rather than walking the cursor
+to the edge first.
 
 ## Selection modes
 
@@ -47,6 +57,9 @@ Press `Tab` to cycle through three selection modes:
 - **Row** (default) — entire cursor row is highlighted; search covers all columns
 - **Column** — the current column is highlighted; search covers only that column; press `s` to sort, `Esc` to clear all sorts
 - **Cell** — only the cursor cell is highlighted; search covers only the current column; press `s` to sort, `Esc` to clear all sorts
+
+The mode also decides the shape of a `v` selection, and an edit key pressed in
+row mode adopts a column cursor rather than doing nothing.
 
 ## Search
 
@@ -58,6 +71,76 @@ Press `Tab` to cycle through three selection modes:
 | `Esc` | Clear active search |
 
 Type a regex pattern after `/` and press `Enter`. In Row mode, search covers all columns. In Column or Cell mode, search is scoped to the selected column. Matches are highlighted in the table and the status bar shows progress (`/pattern [2/15]`).
+
+## Editing
+
+CSV, TSV and `.txt` files can be edited. Parquet stays read-only — it is
+genuinely typed, so a one-cell change would mean rewriting the whole file
+against a schema — as do lake tables.
+
+| Key | Action |
+|-----|--------|
+| `i` / `a` | Edit the cell, caret at the start / end |
+| `c` | Replace the cell |
+| `x` | Clear the cell |
+| `dd` / `{n}dd` | Delete the row, or n rows |
+| `o` / `O` | Open a new row below / above |
+| `y` / `p` | Yank the cursor / paste at the cursor |
+| `u` / `Ctrl+r` | Undo / redo |
+| `:w` `:w!` `:w path` | Write (force past a changed file / write elsewhere) |
+| `:q` `:q!` `:wq` | Quit (discarding / writing) |
+
+**Nothing reaches the file until `:w`.** Edits live in a buffer keyed by
+position in the file, so memory follows the number of changes rather than the
+size of the file, `u` reaches all of it, and `q` refuses while anything is
+pending. The status bar carries a `[+n]` count and edited cells are drawn in
+red.
+
+**Writing splices bytes rather than re-serialising.** Only the fields you
+changed are replaced: quoting style, line endings, a BOM, a missing final
+newline and every untouched line survive exactly. Changing one cell of a 30GB
+file changes as many bytes as the value grew by, and nothing else — which is
+what keeps CSV-in-git diffs readable.
+
+### Visual mode
+
+`v` starts a selection whose shape follows the `Tab` mode: whole rows, whole
+columns, or a rectangle.
+
+| Key | Over a selection |
+|-----|------------------|
+| `c` | Replace every cell with one value |
+| `i` / `a` | Prepend / append text to every cell |
+| `x` | Clear the selected cells |
+| `d` | Delete the selected rows |
+| `y` | Yank the selection |
+
+`v jjj a` then `kg` turns a column of `1 2 3` into `1kg 2kg 3kg`. A fill is one
+undo step however many cells it touched.
+
+## Shaping the view
+
+`:` opens a command line for narrowing what is on screen.
+
+| Command | Action |
+|---------|--------|
+| `:select a b` | Show only these columns, in this order |
+| `:hide a b` | Drop these columns |
+| `:filter count > 10` | Keep matching rows |
+| `:filter a = x and b ~ y` | Conditions join with `and`; `~` is a regex |
+| `:sort a b-` | Sort by columns; `-` reverses one |
+| `:reset [slot]` | Clear select, filter, sort, or all of them |
+
+A verb on its own puts its slot back, so `:select` shows every column again and
+`:sort` returns the file's own order.
+
+**Tab completes** against the verbs and the file's own column names — including
+the quoting, so `rel⇥` writes `"release date"`. Candidates appear in a panel
+above the status bar; Tab steps through them, Shift+Tab back.
+
+Commands are checked as you type them, against the schema: `:filter count > abc`
+says so at the prompt, naming the column and its type, rather than failing later
+inside a query.
 
 ## DuckLake
 
@@ -122,6 +205,26 @@ Notes:
   catalog file.
 - Columns are shown with their DuckDB types where they map cleanly to numbers or
   booleans; dates, timestamps and other types are displayed as text.
+
+## Large files
+
+plv is built for files that do not fit in memory. Measured on a census extract:
+
+| | 28GB CSV, 272M rows | 800MB parquet, 842M rows | DuckLake, 1.14B rows |
+|---|---|---|---|
+| open | 31s | 55ms | 150ms |
+| page anywhere | 3–7ms | <1ms | 0.14–2.9s |
+| peak memory | 63MB | 126MB | 329MB |
+
+Opening a delimited file reads it once, to count the rows — and that pass also
+records where the rows are, so a page afterwards seeks to the nearest checkpoint
+instead of counting from the top. Parquet needs no such thing: it can already
+seek by row group.
+
+Sorting is the one operation that has to hold the table, since nothing can know
+which row comes first without reading them all. plv sorts once and keeps the
+result, and declines outright when the table is larger than the memory it would
+take — the bounds come from the machine rather than being compiled in.
 
 ## Install
 
