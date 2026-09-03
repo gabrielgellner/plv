@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.0] - 2026-09-03
+
+### Bug Fixes
+
+- let shift be held through a z command ([`1e108d7`](https://gitlab.com/gabrielgellner/plv/-/commit/1e108d7043c6843ac0d820e30a2545fcd7ce171f))
+
+### Features
+
+- set column widths with z> z< z_ z= ([`200f134`](https://gitlab.com/gabrielgellner/plv/-/commit/200f134ca612263d6500cd5a34a8319712291401))
+- whole-screen scrolling with Ctrl+f and Ctrl+b ([`8351fba`](https://gitlab.com/gabrielgellner/plv/-/commit/8351fba9f9ddb1542b4df7b09948eafb52116760))
+- show the cursor cell in full with K ([`6d11d50`](https://gitlab.com/gabrielgellner/plv/-/commit/6d11d500b2c58d33dc39e2f45144540a3ae3e0ed))
+
 ## [0.8.0] - 2026-09-03
 
 ### Documentation
@@ -137,6 +149,8 @@ All notable changes to this project will be documented in this file.
 ### Styling
 
 - fix clippy warnings ([`5cb0dba`](https://gitlab.com/gabrielgellner/plv/-/commit/5cb0dba5f5d4bc0be4d3d3b09fd1e7cd00ff7722))
+
+[0.9.0]: https://gitlab.com/gabrielgellner/plv/-/compare/v0.8.0...v0.9.0
 
 [0.8.0]: https://gitlab.com/gabrielgellner/plv/-/compare/v0.7.0...v0.8.0
 
