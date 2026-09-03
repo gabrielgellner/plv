@@ -179,6 +179,13 @@ the key. The cursor is left where the column was, on whatever moved into that
 position — `dd`'s rule, and it falls out of the clamp in `after_view_change`.
 There is no key that un-hides one column, since naming it is the only way to say
 which, so the message says `:reset select` at the moment the user might want it.
+In row mode `-` **adopts** a column cursor through `App::adopt_column_cursor`,
+the leftmost visible column, exactly as the edit keys do: row mode is what plv
+opens in, and a key that silently does nothing there is indistinguishable from
+one that does not exist. Unlike an edit it makes no exception for a row-shaped
+selection — hiding a column renumbers the ones after it, so `after_view_change`
+drops the selection whatever mode it was made in, and there is nothing to
+protect.
 
 `C` opens the **column picker** (`src/picker.rs`), the other direction: a list of
 every column with a tick for shown and one for pinned, `-` and `p` to toggle,
