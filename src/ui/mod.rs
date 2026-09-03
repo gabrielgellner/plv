@@ -11,7 +11,9 @@ pub use help::{Help, Section};
 pub use panel::{CellView, Panel, cell_height, height as panel_height, wrap};
 pub use prompt::Prompt;
 pub use statusbar::StatusBar;
-pub use table::{DataTable, MIN_COLUMN, Widths, col_offset_showing, drawn_width, natural_width};
+pub use table::{
+    DataTable, MIN_COLUMN, Pinned, Widths, col_offset_showing, drawn_width, natural_width, pin_fits,
+};
 pub use theme::Theme;
 
 #[derive(Clone, Copy, PartialEq, Debug, Default)]

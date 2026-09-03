@@ -16,6 +16,8 @@ const MIN_COL_WIDTH: usize = 3;
 const COLUMN_SPACING: usize = 4;
 /// A column may consume at most this fraction of the available terminal width.
 const MAX_COL_FRAC: f32 = 0.3;
+/// The │ that closes the pinned block, one character wide.
+const PIN_DIVIDER: usize = 1;
 
 pub struct DataTable<'a> {
     pub df: &'a DataFrame,
@@ -45,6 +47,8 @@ pub struct DataTable<'a> {
     pub relative_rows: bool,
     /// Widths set by hand, by source column index.
     pub widths: &'a Widths,
+    /// Columns held at the left edge, as **display** indices.
+    pub pinned: &'a Pinned,
 }
 
 /// The row-number cell: each row's distance from the cursor, and on the cursor
@@ -201,6 +205,64 @@ fn truncate(s: &str, max_chars: usize) -> String {
 /// spreadsheet does, rather than everything shuffling to make room.
 pub type Widths = std::collections::HashMap<usize, usize>;
 
+/// Columns held at the left edge while the rest scroll past them, as display
+/// indices.
+///
+/// A set and not a count: what is pinned is the columns the user picked out,
+/// which need not be a prefix of the table — the point of pinning an id beside
+/// a value is to read two columns that are far apart together.
+pub type Pinned = std::collections::BTreeSet<usize>;
+
+/// The pinned columns this frame actually has, in order.
+///
+/// A pin outlives the view it was made in: a `:select` can narrow the table to
+/// fewer columns than there were when the pin was set, and the pin comes back
+/// when the column does.
+fn pin_cols(cols: &[Column], pinned: &Pinned) -> Vec<usize> {
+    pinned
+        .iter()
+        .copied()
+        .filter(|&ci| ci < cols.len())
+        .collect()
+}
+
+/// The width the pinned block takes at the left edge: each pinned column's
+/// slot, plus the divider that closes it.
+///
+/// Zero when nothing is pinned — there is no divider to draw and no space to
+/// take — so an unpinned table lays out exactly as it did before.
+fn pin_reserve(cols: &[Column], pins: &[usize], widths: &Widths, max_col: usize) -> usize {
+    if pins.is_empty() {
+        return 0;
+    }
+    pins.iter()
+        .map(|&ci| COLUMN_SPACING + width_of(&cols[ci], ci, widths, max_col))
+        .sum::<usize>()
+        + PIN_DIVIDER
+}
+
+/// Whether a pinned block would still leave room to scroll in.
+///
+/// Pin enough of a wide table and the scrolling region disappears: the view
+/// stops answering `h` and `l`, with nothing on screen to say why. plv refuses
+/// the pin instead — the same call `sort_blocked` makes, for the same reason.
+/// A refusal that names itself beats a view that quietly stops working.
+pub fn pin_fits(
+    df: &DataFrame,
+    row_offset: usize,
+    frame_width: u16,
+    widths: &Widths,
+    pinned: &Pinned,
+) -> bool {
+    let cols = df.columns();
+    let inner_w = (frame_width as usize).saturating_sub(2);
+    let max_col = ((inner_w as f32 * MAX_COL_FRAC) as usize).max(MIN_COL_WIDTH);
+    let row_num_w = row_num_width(row_offset, df.height());
+    let pins = pin_cols(cols, pinned);
+    let reserve = pin_reserve(cols, &pins, widths, max_col);
+    row_num_w + reserve + COLUMN_SPACING + MIN_COL_WIDTH <= inner_w
+}
+
 /// The width to draw a column at: what was set for it, or what it needs.
 fn width_of(column: &Column, source: usize, set: &Widths, cap: usize) -> usize {
     match set.get(&source) {
@@ -234,6 +296,7 @@ pub fn col_offset_showing(
     frame_width: u16,
     target: usize,
     widths: &Widths,
+    pinned: &Pinned,
 ) -> usize {
     let cols = df.columns();
     if cols.is_empty() {
@@ -244,15 +307,33 @@ pub fn col_offset_showing(
     let inner_w = (frame_width as usize).saturating_sub(2);
     let max_col = ((inner_w as f32 * MAX_COL_FRAC) as usize).max(MIN_COL_WIDTH);
     let row_num_w = row_num_width(row_offset, df.height());
+    let pins = pin_cols(cols, pinned);
+    let reserve = pin_reserve(cols, &pins, widths, max_col);
     let slot = |ci: usize| COLUMN_SPACING + width_of(&cols[ci], ci, widths, max_col);
 
-    let Some(mut budget) = inner_w.saturating_sub(row_num_w).checked_sub(slot(target)) else {
+    // A pinned column is on screen at every offset, so there is no offset that
+    // brings it into view and none to compute: answer for the nearest column
+    // that does scroll instead.
+    let Some(target) = (0..=target).rev().find(|ci| !pins.contains(ci)) else {
+        return 0;
+    };
+
+    let Some(mut budget) = inner_w
+        .saturating_sub(row_num_w)
+        .saturating_sub(reserve)
+        .checked_sub(slot(target))
+    else {
         return target; // the target alone does not fit — show it at the left edge
     };
 
-    // Walk left from the target, taking every column that still fits.
+    // Walk left from the target, taking every column that still fits. A pinned
+    // column on the way is stepped over: it is already drawn and already paid
+    // for out of `reserve`, so it neither costs the walk nor stops it.
     let mut offset = target;
     for ci in (0..target).rev() {
+        if pins.contains(&ci) {
+            continue;
+        }
         if budget < slot(ci) {
             break;
         }
@@ -283,22 +364,54 @@ impl Widget for DataTable<'_> {
             })
             .collect();
 
+        // ── Phase 0: the pinned block ─────────────────────────────────────
+        // Pinned columns are drawn at the left edge whatever the offset is, so
+        // they lead `vis_cols` and are then skipped by the scrolling walk — a
+        // column that is both pinned and scrolled to must not be drawn twice.
+        let pins = pin_cols(cols, self.pinned);
+        let n_pinned = pins.len();
+        let mut vis_cols: Vec<usize> = pins.clone();
+        let mut consumed = row_num_w;
+        let want = |i: usize| {
+            if self.widths.contains_key(&i) {
+                naturals[i]
+            } else {
+                naturals[i].min(max_col)
+            }
+        };
+        // Each visible column's width before slack is handed back, kept as the
+        // columns are picked: a forced last column can be squeezed below what
+        // it asks for, and recomputing the list afterwards would lose that.
+        let mut vis_widths: Vec<usize> = pins.iter().map(|&i| want(i)).collect();
+        consumed += vis_widths.iter().map(|w| sp + w).sum::<usize>();
+        if n_pinned > 0 {
+            consumed += PIN_DIVIDER;
+        }
+
         // ── Phase 1: greedily pick visible columns ────────────────────────
         // Row num slot = row_num_w (includes the │ char at end).
         // Each data column slot = sp + col_w.
-        let mut vis_cols: Vec<usize> = Vec::new();
-        let mut consumed = row_num_w;
-
-        for (i, &nat) in naturals.iter().enumerate().skip(self.col_offset) {
-            let w = if self.widths.contains_key(&i) {
-                nat
-            } else {
-                nat.min(max_col)
-            };
-            if consumed + sp + w > inner_w && !vis_cols.is_empty() {
-                break;
+        for i in self.col_offset..naturals.len() {
+            if pins.contains(&i) {
+                continue;
+            }
+            let mut w = want(i);
+            if consumed + sp + w > inner_w {
+                if vis_cols.len() > n_pinned {
+                    break;
+                }
+                // One scrolling column is drawn even where it does not fit, as
+                // one too-wide column always was — a view showing nothing but
+                // its pinned block could not be moved through. It is squeezed
+                // into what is left rather than overflowing, because the space
+                // an overflow takes comes out of the pinned columns, undoing
+                // the one thing they were set to do.
+                w = inner_w
+                    .saturating_sub(consumed + sp)
+                    .max(MIN_COL_WIDTH);
             }
             vis_cols.push(i);
+            vis_widths.push(w);
             consumed += sp + w;
         }
 
@@ -306,27 +419,30 @@ impl Widget for DataTable<'_> {
             return;
         }
 
+        // The last column of the scrolling run, if it has one. A pinned column
+        // is never it: pins are on screen at every offset, so what scrolls must
+        // not be decided from them.
+        let scroll_last = vis_cols[n_pinned..].last().copied();
+
         // ── Phase 2: redistribute leftover space to capped columns ────────
-        let capped: Vec<usize> = vis_cols
-            .iter()
-            .map(|&i| {
-                if self.widths.contains_key(&i) {
-                    naturals[i]
-                } else {
-                    naturals[i].min(max_col)
-                }
-            })
-            .collect();
+        let capped = vis_widths;
         let slack = inner_w.saturating_sub(consumed);
         let vis_naturals: Vec<usize> = vis_cols.iter().map(|&i| naturals[i]).collect();
         let final_widths = redistribute(capped, &vis_naturals, slack);
 
         // Actual pixels used by full columns (excluding the filler slot).
-        let used: usize = row_num_w + final_widths.iter().map(|w| sp + w).sum::<usize>();
+        let used: usize = row_num_w
+            + if n_pinned > 0 { PIN_DIVIDER } else { 0 }
+            + final_widths.iter().map(|w| sp + w).sum::<usize>();
 
-        // Remaining space for a partial right-edge column.
+        // Remaining space for a partial right-edge column. It is the next
+        // column the scrolling run would have reached, so a pinned one is
+        // stepped over — it is already on screen further left.
         let remaining = inner_w.saturating_sub(used);
-        let next_col_idx = vis_cols.last().map(|&i| i + 1).unwrap_or(self.col_offset);
+        let after = scroll_last.map_or(self.col_offset, |i| i + 1);
+        let next_col_idx = (after..cols.len())
+            .find(|ci| !pins.contains(ci))
+            .unwrap_or(cols.len());
         // The partial column carries the same lead-in as a full one. Without
         // it the last full column's header runs straight into this one's and
         // the two read as a single strange name.
@@ -336,10 +452,13 @@ impl Widget for DataTable<'_> {
         // ── Build ratatui constraints ─────────────────────────────────────
         // Spacing baked into constraints → cursor bg fills the full row.
         // Layout: [row_num_w] [sp+col0] [sp+col1] ... [Min(0) filler]
-        let mut widths: Vec<Constraint> = Vec::with_capacity(vis_cols.len() + 2);
+        let mut widths: Vec<Constraint> = Vec::with_capacity(vis_cols.len() + 3);
         widths.push(Constraint::Length(row_num_w as u16));
-        for &w in &final_widths {
+        for (idx, &w) in final_widths.iter().enumerate() {
             widths.push(Constraint::Length((sp + w) as u16));
+            if idx + 1 == n_pinned {
+                widths.push(Constraint::Length(PIN_DIVIDER as u16));
+            }
         }
         widths.push(Constraint::Min(0));
 
@@ -419,6 +538,12 @@ impl Widget for DataTable<'_> {
                 Cell::new(padded).style(cell_style)
             };
             header_cells.push(cell);
+            // Close the pinned block. The gutter already ends in a │, and
+            // without a second one a pinned column reads as sitting next to
+            // the column beside it, which it does not.
+            if idx + 1 == n_pinned {
+                header_cells.push(Cell::new("│").style(hdr_style));
+            }
         }
 
         // Partial column header — only add … if name doesn't fit.
@@ -564,6 +689,11 @@ impl Widget for DataTable<'_> {
                         Cell::new(format!("{:>width$}{}", "", val, width = sp)).style(cs)
                     };
                     cells.push(cell);
+                    // The divider takes the gutter's style, so the cursor row's
+                    // bar runs through it rather than being broken by it.
+                    if idx + 1 == n_pinned {
+                        cells.push(Cell::new("│").style(num_style));
+                    }
                 }
 
                 // Partial right-edge column — only truncate+ellipsis when needed.
@@ -607,7 +737,7 @@ impl Widget for DataTable<'_> {
 
         // Tell the app layer which column is the rightmost fully visible one.
         self.last_vis_col_out
-            .set(vis_cols.last().copied().unwrap_or(self.col_offset));
+            .set(scroll_last.unwrap_or(self.col_offset));
 
         // ── Render ───────────────────────────────────────────────────────
         let border_style = Style::new().fg(self.theme.border);
@@ -705,6 +835,7 @@ mod tests {
             selection: None,
             relative_rows: relative,
             widths: &Widths::new(),
+            pinned: &Pinned::new(),
         }
         .render(area, &mut buf);
         buf
@@ -783,6 +914,10 @@ mod tests {
     }
 
     fn draw_narrow(df: &DataFrame, width: u16, col_offset: usize) -> Buffer {
+        draw_pinned(df, width, col_offset, &Pinned::new())
+    }
+
+    fn draw_pinned(df: &DataFrame, width: u16, col_offset: usize, pinned: &Pinned) -> Buffer {
         let theme = Theme::catppuccin_mocha();
         let last_vis = std::cell::Cell::new(0);
         let area = Rect::new(0, 0, width, 4);
@@ -804,9 +939,104 @@ mod tests {
             selection: None,
             relative_rows: true,
             widths: &Widths::new(),
+            pinned,
         }
         .render(area, &mut buf);
         buf
+    }
+
+    /// A frame of narrow columns, wide enough that scrolling has somewhere to go.
+    fn pin_df() -> DataFrame {
+        df! {
+            "id"  => ["r1"],
+            "aa"  => ["1"],
+            "bb"  => ["2"],
+            "cc"  => ["3"],
+            "dd"  => ["4"],
+            "ee"  => ["5"],
+        }
+        .unwrap()
+    }
+
+    /// The whole point: the pinned column is still there after the view has
+    /// scrolled past where it lives.
+    #[test]
+    fn a_pinned_column_stays_on_screen_when_the_view_scrolls_past_it() {
+        let df = pin_df();
+        let pins: Pinned = [0].into_iter().collect();
+
+        let plain = lines(&draw_narrow(&df, 40, 3))[1].clone();
+        assert!(!plain.contains("id"), "unpinned it scrolls away: {plain}");
+
+        let held = lines(&draw_pinned(&df, 40, 3, &pins))[1].clone();
+        assert!(held.contains("id"), "pinned it stays: {held}");
+        assert!(held.contains("cc"), "and the scrolled columns still show");
+        assert!(
+            held.find("id") < held.find("cc"),
+            "at the left edge, ahead of them: {held}"
+        );
+    }
+
+    /// A pinned column is drawn once. It leads the row *and* falls inside the
+    /// scrolling range at a low offset, so the run has to skip it.
+    #[test]
+    fn a_pinned_column_that_is_scrolled_to_is_not_drawn_twice() {
+        let df = pin_df();
+        let pins: Pinned = [1].into_iter().collect();
+        let header = lines(&draw_pinned(&df, 40, 0, &pins))[1].clone();
+        assert_eq!(header.matches("aa").count(), 1, "{header}");
+    }
+
+    /// Without a divider a pinned column reads as sitting beside the column
+    /// next to it, which is the one thing it is not.
+    #[test]
+    fn the_pinned_block_is_closed_by_a_divider() {
+        let df = pin_df();
+        let pins: Pinned = [0].into_iter().collect();
+        let drawn = lines(&draw_pinned(&df, 40, 3, &pins))[1].clone();
+        // Inside the block's own borders: one │ closes the row-number gutter,
+        // a second closes the pins.
+        let chars: Vec<char> = drawn.chars().collect();
+        let header: String = chars[1..chars.len() - 1].iter().collect();
+        assert_eq!(header.matches('│').count(), 2, "{header}");
+        let bar = header.rfind('│').unwrap();
+        assert!(
+            header[..bar].contains("id") && !header[bar..].contains("id"),
+            "the pins sit ahead of the divider and nothing else does: {header}"
+        );
+    }
+
+    /// The pinned block costs width, so fewer columns fit beside a target and
+    /// the offset that shows it at the right edge moves right.
+    #[test]
+    fn the_offset_that_shows_a_column_pays_for_the_pinned_block() {
+        let df = pin_df();
+        let bare = col_offset_showing(&df, 0, 40, 5, &Widths::new(), &Pinned::new());
+        let held = col_offset_showing(&df, 0, 40, 5, &Widths::new(), &[0].into_iter().collect());
+        assert!(held > bare, "bare {bare}, pinned {held}");
+    }
+
+    /// A pinned column is on screen at every offset, so there is no offset to
+    /// compute for one — asking answers for the nearest column that scrolls.
+    #[test]
+    fn a_pinned_target_is_answered_by_the_nearest_scrolling_column() {
+        let df = pin_df();
+        let pins: Pinned = [5].into_iter().collect();
+        assert_eq!(
+            col_offset_showing(&df, 0, 40, 5, &Widths::new(), &pins),
+            col_offset_showing(&df, 0, 40, 4, &Widths::new(), &pins),
+        );
+        let all: Pinned = (0..6).collect();
+        assert_eq!(col_offset_showing(&df, 0, 40, 5, &Widths::new(), &all), 0);
+    }
+
+    /// Pin the whole width and there is nothing left to scroll in.
+    #[test]
+    fn a_pinned_block_that_fills_the_screen_does_not_fit() {
+        let df = pin_df();
+        assert!(pin_fits(&df, 0, 40, &Widths::new(), &Pinned::new()));
+        assert!(pin_fits(&df, 0, 40, &Widths::new(), &[0].into_iter().collect()));
+        assert!(!pin_fits(&df, 0, 40, &Widths::new(), &(0..6).collect()));
     }
 
     /// A column that only partly fits still has to start clear of the one
