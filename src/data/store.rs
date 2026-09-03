@@ -210,8 +210,10 @@ impl Store {
             (Some(sorted), _) => sorted.height(),
             (None, Some(set)) => set.len(),
             // Deleted rows are struck rather than removed: still in the
-            // file, simply not counted among what is on show.
-            (None, None) => self.total_rows.saturating_sub(self.overlay.struck_count()),
+            // file, simply not counted among what is on show. Added ones are
+            // the other way round — counted, but not in the file yet.
+            (None, None) => (self.total_rows + self.overlay.added_count())
+                .saturating_sub(self.overlay.struck_count()),
         }
     }
 
@@ -229,22 +231,53 @@ impl Store {
         }
         match &self.filter_rows {
             Some(set) => set.source(display),
-            None => {
-                let row = self.skip_struck(display);
-                (row < self.total_rows).then_some(row)
-            }
+            None => self.walk_to(display),
         }
     }
 
-    /// The source row at a display position, stepping over the struck ones.
+    /// Whether a row number is one of the file's, or an added row's id.
     ///
-    /// Walks the struck set, which is ascending, so it costs the number of
-    /// deletions before the row rather than a search of the file. Deleting a
-    /// handful of rows is what this is for; deleting a great many would make
-    /// a running count worth keeping instead.
-    fn skip_struck(&self, display: usize) -> usize {
-        let mut row = display;
+    /// Added rows are numbered past the end of the file, so the two can never
+    /// be confused and the same `(row, column)` key works for both.
+    pub fn is_added(&self, row: usize) -> bool {
+        row >= self.total_rows
+    }
+
+    /// What sits at a display position: a row of the file, stepping over the
+    /// struck ones, or the id of a row added before it.
+    ///
+    /// Walks the added anchors and the struck set, both ascending and both
+    /// expected to be small — this is for adding and removing a handful of
+    /// rows, not for rewriting the file.
+    fn walk_to(&self, display: usize) -> Option<usize> {
+        let mut remaining = display;
+        let mut from = 0usize;
+
+        for (anchor, ids) in self.overlay.added() {
+            let surviving = (anchor - from) - self.overlay.struck_in(from..anchor);
+            if remaining < surviving {
+                return Some(self.nth_surviving(from, remaining));
+            }
+            remaining -= surviving;
+            from = anchor;
+
+            if remaining < ids.len() {
+                return Some(ids[remaining]);
+            }
+            remaining -= ids.len();
+        }
+
+        let row = self.nth_surviving(from, remaining);
+        (row < self.total_rows).then_some(row)
+    }
+
+    /// The `n`th row at or after `from` that has not been struck out.
+    fn nth_surviving(&self, from: usize, n: usize) -> usize {
+        let mut row = from + n;
         for struck in self.overlay.struck() {
+            if struck < from {
+                continue;
+            }
             if struck <= row {
                 row += 1;
             } else {
@@ -434,10 +467,15 @@ impl Store {
     /// to be read, and there is nothing to pick out at all when nothing in
     /// between was left out.
     fn rows_at(&self, wanted: &[usize]) -> Result<DataFrame> {
+        // Added rows are not in the file, so they are not fetched — a blank
+        // row stands in for each, and the overlay fills it in afterwards the
+        // same way it fills in an edited cell.
+        if wanted.iter().any(|&row| self.is_added(row)) {
+            return self.rows_with_added(wanted);
+        }
         let (Some(&first), Some(&last)) = (wanted.first(), wanted.last()) else {
             // No rows, but the caller still needs the right columns.
-            let lf = self.effective_lf().expect("lazy source");
-            return Ok(lf.slice(0, 0).collect()?);
+            return self.empty_page();
         };
         let span = self.fetch_span(first, last - first + 1)?;
         if wanted.len() == last - first + 1 {
@@ -445,6 +483,70 @@ impl Store {
         }
         let picked: Vec<IdxSize> = wanted.iter().map(|&row| (row - first) as IdxSize).collect();
         Ok(span.take(&IdxCa::from_vec(PlSmallStr::from_static("i"), picked))?)
+    }
+
+    /// A page of the file's rows with blanks left where rows were added.
+    ///
+    /// Built by stacking runs of fetched rows and blanks in display order,
+    /// rather than a frame per row: a page has a handful of added rows at
+    /// most, so this is a handful of pieces.
+    fn rows_with_added(&self, wanted: &[usize]) -> Result<DataFrame> {
+        let from_file: Vec<usize> = wanted
+            .iter()
+            .copied()
+            .filter(|&row| !self.is_added(row))
+            .collect();
+        let fetched = self.rows_at(&from_file)?;
+
+        let mut page: Option<DataFrame> = None;
+        let mut taken = 0usize;
+        let mut run = 0usize;
+        let stack = |page: &mut Option<DataFrame>, piece: DataFrame| -> Result<()> {
+            match page {
+                Some(so_far) => so_far.vstack_mut(&piece).map(|_| ())?,
+                None => *page = Some(piece),
+            }
+            Ok(())
+        };
+
+        for &row in wanted {
+            if self.is_added(row) {
+                if run > 0 {
+                    stack(&mut page, fetched.slice(taken as i64, run))?;
+                    taken += run;
+                    run = 0;
+                }
+                stack(&mut page, self.blank_row()?)?;
+            } else {
+                run += 1;
+            }
+        }
+        if run > 0 {
+            stack(&mut page, fetched.slice(taken as i64, run))?;
+        }
+        match page {
+            Some(page) => Ok(page),
+            None => self.empty_page(),
+        }
+    }
+
+    /// One row of nulls, shaped like the page.
+    fn blank_row(&self) -> Result<DataFrame> {
+        let columns: Vec<Column> = self
+            .columns()
+            .into_iter()
+            .filter_map(|source| self.schema.get_at_index(source))
+            .map(|(name, dtype)| Column::full_null(name.clone(), 1, dtype))
+            .collect();
+        Ok(DataFrame::new(1, columns)?)
+    }
+
+    /// No rows, but the columns the caller is going to draw.
+    fn empty_page(&self) -> Result<DataFrame> {
+        match self.effective_lf() {
+            Some(lf) => Ok(lf.slice(0, 0).collect()?),
+            None => self.blank_row().map(|df| df.slice(0, 0)),
+        }
     }
 
     /// Rows `first..first + span` of the source.
@@ -748,6 +850,39 @@ impl Store {
         None
     }
 
+    /// Why a row cannot be added here, or `None` when it can.
+    pub fn insert_blocked(&self) -> Option<&'static str> {
+        self.delete_blocked()
+    }
+
+    /// Add an empty row next to the one at `display`, and say where it landed.
+    ///
+    /// A new row belongs *before* some row of the file, and among any others
+    /// already added there — which is what keeps `o` and `O` meaning below and
+    /// above even when the neighbour is itself a new row.
+    pub fn add_row(&mut self, display: usize, below: bool) -> Result<usize> {
+        let (before, at) = match self.source_row(display) {
+            Some(row) if self.is_added(row) => {
+                let (anchor, place) = self.overlay.locate(row).unwrap_or((self.total_rows, 0));
+                (anchor, if below { place + 1 } else { place })
+            }
+            Some(row) if below => (row + 1, 0),
+            Some(row) => (row, self.overlay.added_at(row).len()),
+            // An empty file, or the cursor past the end: it goes on the end.
+            None => (
+                self.total_rows,
+                self.overlay.added_at(self.total_rows).len(),
+            ),
+        };
+        self.overlay.add_row(before, at, self.total_rows);
+        self.refresh()?;
+        Ok(if below && self.row_count() > 1 {
+            display + 1
+        } else {
+            display
+        })
+    }
+
     /// Strike out the rows at these display positions, as one undoable step.
     pub fn delete_rows<I: IntoIterator<Item = usize>>(&mut self, rows: I) -> Result<usize> {
         let struck: Vec<usize> = rows
@@ -755,7 +890,7 @@ impl Store {
             .filter_map(|d| self.source_row(d))
             .collect();
         let count = struck.len();
-        self.overlay.strike(struck);
+        self.overlay.delete(struck, self.total_rows);
         self.refresh()?;
         Ok(count)
     }

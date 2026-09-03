@@ -512,6 +512,7 @@ impl App {
             ("c", "Replace cell"),
             ("x", "Clear cell"),
             ("dd / {n}dd", "Delete the row, or n rows"),
+            ("o / O", "Open a new row below / above"),
             ("u / Ctrl+r", "Undo / redo"),
             ("y / p", "Yank the cursor / paste at the cursor"),
             (
@@ -1292,6 +1293,8 @@ impl App {
                 self.pending_num.clear();
                 self.relative_rows = !self.relative_rows;
             }
+            KeyCode::Char('o') => self.open_row(true)?,
+            KeyCode::Char('O') => self.open_row(false)?,
             KeyCode::Char('y') => self.yank()?,
             KeyCode::Char('p') => self.paste()?,
             KeyCode::Char('i') => self.begin_edit(EditStart::Front)?,
@@ -1595,6 +1598,39 @@ impl App {
             if deleted == 1 { "" } else { "s" }
         ));
         Ok(())
+    }
+
+    /// `o` and `O`: a new row below or above, ready to be typed into.
+    ///
+    /// Opens the editor on it straight away, as vim does — an empty row is
+    /// only useful once something is in it.
+    fn open_row(&mut self, below: bool) -> anyhow::Result<()> {
+        self.pending_num.clear();
+        let blocked = match &self.store {
+            None => Some("no file open"),
+            Some(store) => store.insert_blocked(),
+        };
+        if let Some(reason) = blocked {
+            self.message = Some(reason.to_string());
+            return Ok(());
+        }
+
+        let at = self.cursor_row;
+        let landed = match &mut self.store {
+            Some(store) => store.add_row(at, below)?,
+            None => at,
+        };
+        self.visual_anchor = None;
+        self.cursor_to(landed)?;
+
+        // A row needs a column cursor to be typed into, the way a cell edit
+        // does, and starts at the first column.
+        if matches!(self.selection_mode, SelectionMode::Row) {
+            self.selection_mode = SelectionMode::Cell;
+        }
+        self.cursor_col = 0;
+        self.col_offset = 0;
+        self.begin_edit(EditStart::Empty)
     }
 
     fn undo(&mut self) -> anyhow::Result<()> {
@@ -3166,6 +3202,133 @@ mod tests {
         let message = app.message.clone().unwrap();
         assert!(message.contains("filtered or sorted"), "{message}");
         assert_eq!(app.store.as_ref().unwrap().row_count(), 3, "untouched");
+    }
+
+    #[test]
+    fn o_opens_a_row_below_ready_to_type_into() {
+        let (mut app, path) = app_with("open.csv", SAMPLE);
+        app.last_frame_width = 60;
+        press(&mut app, 'o');
+
+        assert!(matches!(app.mode, AppMode::Edit), "typing starts at once");
+        assert_eq!(app.cursor_row, 1, "below the row it was on");
+        assert_eq!(app.store.as_ref().unwrap().row_count(), 4);
+
+        typed(&mut app, "new");
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(shown(&app, 0, 1).as_deref(), Some("new"));
+        assert_eq!(shown(&app, 0, 2).as_deref(), Some("b"), "b moved down");
+
+        command(&mut app, "w");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "name,count\na,1\nnew,\nb,2\nc,3\n"
+        );
+    }
+
+    #[test]
+    fn shift_o_opens_a_row_above() {
+        let (mut app, path) = app_with("openabove.csv", SAMPLE);
+        app.last_frame_width = 60;
+        press(&mut app, 'j');
+        press(&mut app, 'O');
+        assert_eq!(app.cursor_row, 1, "where the old row 1 was");
+        typed(&mut app, "mid");
+        key(&mut app, KeyCode::Enter);
+
+        command(&mut app, "w");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "name,count\na,1\nmid,\nb,2\nc,3\n"
+        );
+    }
+
+    #[test]
+    fn a_row_opened_at_the_top_lands_above_everything() {
+        let (mut app, path) = app_with("opentop.csv", SAMPLE);
+        app.last_frame_width = 60;
+        press(&mut app, 'O');
+        typed(&mut app, "first");
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(shown(&app, 0, 0).as_deref(), Some("first"));
+
+        command(&mut app, "w");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "name,count\nfirst,\na,1\nb,2\nc,3\n",
+            "under the header, above the first row"
+        );
+    }
+
+    #[test]
+    fn a_row_opened_at_the_end_lands_after_everything() {
+        let (mut app, path) = app_with("openend.csv", SAMPLE);
+        app.last_frame_width = 60;
+        press(&mut app, 'G');
+        press(&mut app, 'o');
+        typed(&mut app, "last");
+        key(&mut app, KeyCode::Enter);
+
+        command(&mut app, "w");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "name,count\na,1\nb,2\nc,3\nlast,\n"
+        );
+    }
+
+    /// `o` twice running has to give two rows in the order they were opened,
+    /// which is the case that breaks if a new row is only ever appended to its
+    /// anchor rather than placed within it.
+    #[test]
+    fn opening_below_a_new_row_keeps_them_in_order() {
+        let (mut app, path) = app_with("openorder.csv", SAMPLE);
+        app.last_frame_width = 60;
+        press(&mut app, 'o');
+        typed(&mut app, "one");
+        key(&mut app, KeyCode::Enter);
+        press(&mut app, 'o');
+        typed(&mut app, "two");
+        key(&mut app, KeyCode::Enter);
+
+        assert_eq!(shown(&app, 0, 1).as_deref(), Some("one"));
+        assert_eq!(shown(&app, 0, 2).as_deref(), Some("two"));
+        command(&mut app, "w");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "name,count\na,1\none,\ntwo,\nb,2\nc,3\n"
+        );
+    }
+
+    #[test]
+    fn opening_a_row_is_one_undoable_step() {
+        let (mut app, _) = app_with("openundo.csv", SAMPLE);
+        app.last_frame_width = 60;
+        press(&mut app, 'o');
+        key(&mut app, KeyCode::Esc);
+        assert_eq!(app.store.as_ref().unwrap().row_count(), 4);
+
+        press(&mut app, 'u');
+        assert_eq!(app.store.as_ref().unwrap().row_count(), 3);
+        assert_eq!(app.store.as_ref().unwrap().dirty(), 0);
+    }
+
+    #[test]
+    fn a_new_row_can_be_deleted_again() {
+        let (mut app, path) = app_with("openthendelete.csv", SAMPLE);
+        app.last_frame_width = 60;
+        press(&mut app, 'o');
+        typed(&mut app, "gone");
+        key(&mut app, KeyCode::Enter);
+        press(&mut app, 'd');
+        press(&mut app, 'd');
+
+        assert_eq!(app.store.as_ref().unwrap().row_count(), 3);
+        command(&mut app, "w");
+        // Asserted positively: an unchanged file is also what a *refused*
+        // write leaves behind.
+        assert_eq!(app.message.as_deref(), Some("wrote openthendelete.csv"));
+        assert_eq!(app.store.as_ref().unwrap().dirty(), 0);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), SAMPLE, "as it was");
     }
 
     #[test]
