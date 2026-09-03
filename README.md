@@ -5,6 +5,7 @@ A terminal viewer and editor for CSV, TSV, Parquet and [DuckLake](https://duckla
 - Supports CSV, tab-separated text, Parquet, and DuckLake lakes
 - **Edits delimited text** — cells, blocks, whole rows — in a buffer, written with `:w`
 - **A view language** — `:select`, `:hide`, `:filter`, `:sort` — with Tab completion over the file's own column names
+- **Column control** — pin columns to the left edge, hide one with a keystroke, or pick from a list
 - Works on files larger than memory: a 30GB CSV opens, pages anywhere, edits and writes back within about 60MB
 - Browse a lake's tables, partitions and snapshots — including time travel
 - Vim-style navigation throughout
@@ -44,6 +45,9 @@ Press `?` at any time for the key bindings of whatever screen you are on.
 | `z>` / `z<` | Widen / narrow the cursor column |
 | `z_` | Fit the column to the widest value on screen |
 | `z=` | Put every column width back |
+| `zp` / `z\|` | Pin the cursor column to the left edge / unpin every column |
+| `-` | Hide the cursor column |
+| `C` | Open the column picker |
 | `K` | Show the cursor cell in full, above the status bar |
 | `?` | Show key bindings for the current screen |
 | `q` | Quit |
@@ -57,6 +61,15 @@ Widening a column pushes the ones after it along and off the right edge, as a
 spreadsheet does, rather than squeezing everything to make room — `h` and `l`
 reach what went past. Widths are remembered for the session and belong to the
 column, so they survive `:select` reordering it; `z=` puts them all back.
+
+A wide table is read by scrolling sideways, and the column saying *which row
+this is* is the first to leave the screen. `zp` pins the cursor column to the
+left edge, where it stays while the rest scroll past it; `z|` unpins the lot.
+Pins need not be neighbours — pinning an id and a status brings two columns from
+opposite ends of the file into one view, which is the case the feature exists
+for. Like widths they belong to the column and survive a `:select`, and a pin
+the screen has no room for is refused rather than drawn, since a table with no
+room left to scroll in stops answering `h` and `l` with nothing to say why.
 
 Row numbers count from the cursor by default, the way nvim's hybrid
 `number` + `relativenumber` gutter does, so `3j` and `12G` can be read off
@@ -157,6 +170,40 @@ above the status bar; Tab steps through them, Shift+Tab back.
 Commands are checked as you type them, against the schema: `:filter count > abc`
 says so at the prompt, naming the column and its type, rather than failing later
 inside a query.
+
+### Choosing columns without typing
+
+`-` hides the cursor column: `:hide <name>` without the name. It accumulates, so
+pressing it again narrows further, and `:reset select` brings everything back.
+Like `s`, it wants a column cursor — press `Tab` first if you are in row mode.
+
+`C` opens the **column picker** — every column in a list, with a tick for shown
+and a tick for pinned. Unlike `-` it needs no column cursor, since it is a list
+of every column rather than an operation on the one you are on.
+
+| Key | Action |
+|-----|--------|
+| `j` / `k` (`↓` / `↑`) | Move down the list |
+| `Ctrl+d` / `Ctrl+u` | Half a page down / up |
+| `g` / `G` (`Home` / `End`) | First / last column |
+| `-` | Show or hide this column |
+| `a` / `A` | Show every column / hide all but this one |
+| `p` | Pin or unpin this column |
+| `Enter` | Apply |
+| `Esc` | Cancel, changing nothing |
+
+It holds a working copy, so `Esc` costs nothing and `Enter` is the only thing
+that changes the view — and what it applies is a `:select`, so the picker is a
+way of *writing* one rather than a second thing deciding what shows.
+
+Picking four columns out of two hundred is `A` and then three ticks. The list is
+in the view's own order with the hidden columns appended, and applies in that
+order, so a `:select c a` survives a round trip through it rather than being
+quietly put back into file order.
+
+`q` is deliberately not a picker key. Everywhere else in vim it closes a window,
+and a window is a view — closing one never destroys work — so it is not borrowed
+here for something that would discard everything ticked.
 
 ## DuckLake
 
