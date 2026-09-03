@@ -1330,16 +1330,17 @@ impl App {
                 self.open_picker();
             }
 
-            // Hide the cursor column. Gated to the cursor modes as `s` is:
-            // row mode has no column cursor, and hiding whichever column
-            // happens to be leftmost is not what the key means.
-            KeyCode::Char('-')
-                if matches!(
-                    self.selection_mode,
-                    SelectionMode::Column | SelectionMode::Cell
-                ) =>
-            {
+            // Hide the cursor column. Row mode has no column cursor, so it
+            // adopts one exactly as the edit keys do, rather than leaving the
+            // key silently dead in the mode plv opens in.
+            //
+            // No exception for a row-shaped selection, unlike an edit: hiding
+            // a column renumbers the ones after it, so `after_view_change`
+            // drops the selection whatever mode it was made in. There is
+            // nothing here to protect.
+            KeyCode::Char('-') => {
                 self.pending_num.clear();
+                self.adopt_column_cursor();
                 self.hide_column()?;
             }
 
@@ -1511,6 +1512,24 @@ impl App {
 
     // ── editing ───────────────────────────────────────────────────────────
 
+    /// Give row mode a column cursor, at the leftmost visible column — which
+    /// is where `Tab` would put it.
+    ///
+    /// A key that acts on *a column* has to have one to act on, and of the
+    /// three answers to being pressed without one, silence is the worst: it
+    /// is indistinguishable from a key that does not exist. Refusing at least
+    /// says why. Adopting does the obvious thing and leaves the user where
+    /// they meant to be.
+    ///
+    /// Callers decide when, because a row-shaped *selection* can be
+    /// meaningful in its own right and this reshapes it.
+    fn adopt_column_cursor(&mut self) {
+        if matches!(self.selection_mode, SelectionMode::Row) {
+            self.selection_mode = SelectionMode::Cell;
+            self.cursor_col = self.col_offset;
+        }
+    }
+
     /// Whether an edit can start here, reporting why not when it cannot.
     ///
     /// An edit needs a column cursor, so row mode adopts one rather than doing
@@ -1527,9 +1546,8 @@ impl App {
         // Row mode has no column cursor, so a single-cell edit adopts one —
         // but a row-shaped *selection* is meaningful in its own right and must
         // not be reshaped out from under the operator about to run on it.
-        if matches!(self.selection_mode, SelectionMode::Row) && self.visual_anchor.is_none() {
-            self.selection_mode = SelectionMode::Cell;
-            self.cursor_col = self.col_offset;
+        if self.visual_anchor.is_none() {
+            self.adopt_column_cursor();
         }
         true
     }
@@ -4532,14 +4550,33 @@ mod tests {
         assert_eq!(shown_columns(&app), ["a", "b", "c", "d"]);
     }
 
-    /// Row mode has no column cursor, so there is no column the key could
-    /// mean — the same gate `s` has.
+    /// Row mode is what plv opens in, and a key that does nothing there is
+    /// indistinguishable from one that does not exist — so it takes a column
+    /// cursor the way the edit keys do.
     #[test]
-    fn hiding_needs_a_column_cursor() {
+    fn hiding_in_row_mode_adopts_a_column_cursor() {
         let mut app = app_sized("hiderow.csv", FOURCOL, 60);
         assert_eq!(app.selection_mode, SelectionMode::Row);
+
         press(&mut app, '-');
-        assert_eq!(shown_columns(&app), ["a", "b", "c", "d"]);
+        assert_eq!(app.selection_mode, SelectionMode::Cell, "as Tab would");
+        assert_eq!(shown_columns(&app), ["b", "c", "d"], "and it hid one");
+    }
+
+    /// It adopts the leftmost visible column, so scrolling sideways in row
+    /// mode and pressing `-` takes off the column that is under the cursor
+    /// once there is one, not the file's first.
+    #[test]
+    fn row_mode_hides_the_column_it_would_have_landed_on() {
+        // Narrow enough that not every column fits, or row mode has nothing
+        // to scroll and `col_offset` never leaves 0.
+        let mut app = app_sized("hidescroll.csv", FOURCOL, 24);
+        press(&mut app, 'l'); // row mode: scrolls rather than moving a cursor
+        press(&mut app, 'l');
+        assert_eq!(app.col_offset, 2);
+
+        press(&mut app, '-');
+        assert_eq!(shown_columns(&app), ["a", "b", "d"], "c, where Tab would land");
     }
 
     /// The two column features compose: a pin on a hidden column waits, and

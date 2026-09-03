@@ -175,11 +175,12 @@ inside a query.
 
 `-` hides the cursor column: `:hide <name>` without the name. It accumulates, so
 pressing it again narrows further, and `:reset select` brings everything back.
-Like `s`, it wants a column cursor — press `Tab` first if you are in row mode.
+Pressed in row mode it takes a column cursor first, the leftmost visible one —
+where `Tab` would have put it — so it works straight from the mode plv opens in.
 
 `C` opens the **column picker** — every column in a list, with a tick for shown
-and a tick for pinned. Unlike `-` it needs no column cursor, since it is a list
-of every column rather than an operation on the one you are on.
+and a tick for pinned. It touches no column cursor at all, being a list of every
+column rather than an operation on the one you are on.
 
 | Key | Action |
 |-----|--------|
