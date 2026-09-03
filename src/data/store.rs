@@ -209,7 +209,9 @@ impl Store {
         match (&self.sorted, &self.filter_rows) {
             (Some(sorted), _) => sorted.height(),
             (None, Some(set)) => set.len(),
-            (None, None) => self.total_rows,
+            // Deleted rows are struck rather than removed: still in the
+            // file, simply not counted among what is on show.
+            (None, None) => self.total_rows.saturating_sub(self.overlay.struck_count()),
         }
     }
 
@@ -227,8 +229,29 @@ impl Store {
         }
         match &self.filter_rows {
             Some(set) => set.source(display),
-            None => (display < self.total_rows).then_some(display),
+            None => {
+                let row = self.skip_struck(display);
+                (row < self.total_rows).then_some(row)
+            }
         }
+    }
+
+    /// The source row at a display position, stepping over the struck ones.
+    ///
+    /// Walks the struck set, which is ascending, so it costs the number of
+    /// deletions before the row rather than a search of the file. Deleting a
+    /// handful of rows is what this is for; deleting a great many would make
+    /// a running count worth keeping instead.
+    fn skip_struck(&self, display: usize) -> usize {
+        let mut row = display;
+        for struck in self.overlay.struck() {
+            if struck <= row {
+                row += 1;
+            } else {
+                break;
+            }
+        }
+        row
     }
 
     /// Turn a row index reported by a background search into a display
@@ -383,21 +406,13 @@ impl Store {
         }
         let df = match &self.source {
             Source::Lazy(_) => {
-                let lf = self.effective_lf().expect("lazy source");
-                match &self.filter_rows {
-                    Some(set) => Self::gather(&lf, set, offset, height),
-                    // With an index the page is a known byte range, so it is
-                    // read directly rather than sliced out of the whole file.
-                    // Only when nothing else is composed on top: a sort or a
-                    // projection changes what a row number means.
-                    None if self.view.sort.is_empty() && self.view.select.is_none() => {
-                        match self.indexed_page(offset, height) {
-                            Some(page) => page,
-                            None => Self::fetch_lazy(&lf, offset, height),
-                        }
-                    }
-                    None => Self::fetch_lazy(&lf, offset, height),
-                }
+                // Which rows of the file this page shows: picked out by a
+                // filter, missing the ones deleted, or simply the next few in
+                // order when neither applies.
+                let wanted: Vec<usize> = (0..height)
+                    .filter_map(|i| self.source_row(offset + i))
+                    .collect();
+                self.rows_at(&wanted)
             }
             Source::Lake(query) => lake_db::page_with(
                 &query.conn,
@@ -410,12 +425,44 @@ impl Store {
         self.apply_overlay(df, offset)
     }
 
-    /// A page picked out of the frame by row index.
+    /// The named source rows, read by whatever means is cheapest.
     ///
-    /// Reads the span the page covers and takes the wanted rows from it. The
-    /// span is the unavoidable part — those rows have to be read — and Polars
-    /// still pushes that slice into the scan, so it costs what scrolling to
-    /// the same point unfiltered would.
+    /// Every page of a delimited file comes through here — rows a filter
+    /// picked out, rows left after deletions, or simply the next few in order.
+    /// The span between the first and last is read once and the wanted rows
+    /// taken from it. The span is the unavoidable part, since those rows have
+    /// to be read, and there is nothing to pick out at all when nothing in
+    /// between was left out.
+    fn rows_at(&self, wanted: &[usize]) -> Result<DataFrame> {
+        let (Some(&first), Some(&last)) = (wanted.first(), wanted.last()) else {
+            // No rows, but the caller still needs the right columns.
+            let lf = self.effective_lf().expect("lazy source");
+            return Ok(lf.slice(0, 0).collect()?);
+        };
+        let span = self.fetch_span(first, last - first + 1)?;
+        if wanted.len() == last - first + 1 {
+            return Ok(span);
+        }
+        let picked: Vec<IdxSize> = wanted.iter().map(|&row| (row - first) as IdxSize).collect();
+        Ok(span.take(&IdxCa::from_vec(PlSmallStr::from_static("i"), picked))?)
+    }
+
+    /// Rows `first..first + span` of the source.
+    ///
+    /// Read from the byte offset the index points at when there is one and
+    /// nothing is composed on top — a sort or a projection changes what a row
+    /// number means, so those go the lazy way.
+    fn fetch_span(&self, first: usize, span: usize) -> Result<DataFrame> {
+        if self.view.sort.is_empty()
+            && self.view.select.is_none()
+            && let Some(page) = self.indexed_span(first, span)
+        {
+            return page;
+        }
+        let lf = self.effective_lf().expect("lazy source");
+        Self::fetch_lazy(&lf, first, span)
+    }
+
     /// A page of the materialised sorted frame: sliced, with the bookkeeping
     /// column dropped and the view's projection applied.
     fn page_of_sorted(
@@ -434,13 +481,13 @@ impl Store {
         Ok(page.select(shown)?)
     }
 
-    /// One page, read straight out of the byte range the index points at.
+    /// A span of rows, read straight out of the byte range the index points at.
     ///
     /// `None` when there is no index to ask, leaving the caller to slice the
     /// frame the slow way. The parse is given the schema plv already inferred
     /// — a chunk left to infer its own would type a column by whatever
     /// happens to be in those rows, and the types would change as you scroll.
-    fn indexed_page(&self, offset: usize, height: usize) -> Option<Result<DataFrame>> {
+    fn indexed_span(&self, offset: usize, height: usize) -> Option<Result<DataFrame>> {
         let index = self.row_index.as_ref()?;
         let target = self.edit.as_ref()?;
         if offset >= index.rows() {
@@ -455,20 +502,6 @@ impl Store {
             // The span starts at a checkpoint, which is at or before the page.
             Ok(page.slice((offset - first_row) as i64, height))
         })())
-    }
-
-    fn gather(lf: &LazyFrame, set: &RowSet, offset: usize, height: usize) -> Result<DataFrame> {
-        let page = set.page(offset, height);
-        let (Some(&first), Some(&last)) = (page.first(), page.last()) else {
-            // No rows, but the caller still needs the right columns.
-            return Ok(lf.clone().slice(0, 0).collect()?);
-        };
-        let df = lf
-            .clone()
-            .slice(first as i64, (last - first + 1) as u32)
-            .collect()?;
-        let wanted: Vec<IdxSize> = page.iter().map(|&row| (row - first) as IdxSize).collect();
-        Ok(df.take(&IdxCa::from_vec(PlSmallStr::from_static("i"), wanted))?)
     }
 
     /// Toggle sort direction on `col_idx`, or add it as a new ascending sort key.
@@ -694,9 +727,37 @@ impl Store {
         Some(text.str().ok()?.get(local).unwrap_or("").to_string())
     }
 
-    /// Cells holding an edit that has not been written yet.
+    /// Everything pending: cells edited and rows deleted.
     pub fn dirty(&self) -> usize {
-        self.overlay.len()
+        self.overlay.pending()
+    }
+
+    /// Why rows cannot be deleted here, or `None` when they can.
+    ///
+    /// A sort or a filter puts an explicit list of rows on screen, and taking
+    /// one out of the middle would mean rebuilding that list — a different
+    /// piece of work from striking a row out of the file, and one worth doing
+    /// deliberately.
+    pub fn delete_blocked(&self) -> Option<&'static str> {
+        if let Some(reason) = self.edit_blocked() {
+            return Some(reason);
+        }
+        if self.filter_rows.is_some() || self.sorted.is_some() {
+            return Some("cannot delete rows from a filtered or sorted view");
+        }
+        None
+    }
+
+    /// Strike out the rows at these display positions, as one undoable step.
+    pub fn delete_rows<I: IntoIterator<Item = usize>>(&mut self, rows: I) -> Result<usize> {
+        let struck: Vec<usize> = rows
+            .into_iter()
+            .filter_map(|d| self.source_row(d))
+            .collect();
+        let count = struck.len();
+        self.overlay.strike(struck);
+        self.refresh()?;
+        Ok(count)
     }
 
     /// Apply `edits` as a single undoable change. Both coordinates are

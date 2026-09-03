@@ -130,7 +130,7 @@ pub fn splice<R: BufRead, W: Write>(
         }
         src.consume(read);
     }
-    let (rows, applied) = splicer.finish()?;
+    let (rows, applied, dropped) = splicer.finish()?;
 
     if rows != expected_rows {
         bail!(
@@ -144,6 +144,13 @@ pub fn splice<R: BufRead, W: Write>(
              (a row with fewer fields than the header)",
             overlay.len() - applied,
             overlay.len()
+        );
+    }
+    if dropped != overlay.struck_count() {
+        bail!(
+            "refusing to write: {} of {} deleted rows were not found",
+            overlay.struck_count() - dropped,
+            overlay.struck_count()
         );
     }
     Ok(())
@@ -181,6 +188,12 @@ struct Splicer<'a, W: Write> {
     pending_cr: bool,
     /// Edits actually placed, checked against the overlay at the end.
     applied: usize,
+    /// The record being read is struck out, so none of it is written — its
+    /// terminator included, or the file would grow blank lines where rows
+    /// used to be.
+    dropping: bool,
+    /// Records dropped, checked against the overlay at the end.
+    dropped: usize,
 }
 
 impl<'a, W: Write> Splicer<'a, W> {
@@ -199,6 +212,8 @@ impl<'a, W: Write> Splicer<'a, W> {
             pending_quote: false,
             pending_cr: false,
             applied: 0,
+            dropping: false,
+            dropped: 0,
         }
     }
 
@@ -268,6 +283,12 @@ impl<'a, W: Write> Splicer<'a, W> {
             self.record_started = true;
             self.field = 0;
             self.field_started = false;
+            // Decided once per record: a struck row is written nowhere.
+            self.dropping = self.record >= self.header_rows
+                && self.overlay.is_struck(self.record - self.header_rows);
+            if self.dropping {
+                self.dropped += 1;
+            }
         }
         if self.field_started {
             return Ok(());
@@ -282,8 +303,10 @@ impl<'a, W: Write> Splicer<'a, W> {
         {
             self.replacing = true;
             self.applied += 1;
-            let encoded = encode(value, self.separator);
-            self.out.write_all(encoded.as_bytes())?;
+            if !self.dropping {
+                let encoded = encode(value, self.separator);
+                self.out.write_all(encoded.as_bytes())?;
+            }
         }
         Ok(())
     }
@@ -302,11 +325,16 @@ impl<'a, W: Write> Splicer<'a, W> {
         self.end_field();
         self.record += 1;
         self.record_started = false;
+        if self.dropping {
+            // The terminator goes with the row it ended.
+            self.dropping = false;
+            return Ok(());
+        }
         self.raw(eol)
     }
 
-    /// Returns the number of data records seen and the number of edits placed.
-    fn finish(mut self) -> Result<(usize, usize)> {
+    /// Records seen, edits placed, and rows dropped.
+    fn finish(mut self) -> Result<(usize, usize, usize)> {
         if self.pending_quote {
             self.emit(b"\"")?;
             self.in_quotes = false;
@@ -322,7 +350,11 @@ impl<'a, W: Write> Splicer<'a, W> {
             self.record += 1;
         }
         self.out.flush()?;
-        Ok((self.record.saturating_sub(self.header_rows), self.applied))
+        Ok((
+            self.record.saturating_sub(self.header_rows),
+            self.applied,
+            self.dropped,
+        ))
     }
 
     /// Field content: dropped while a replacement stands in for it.
@@ -333,8 +365,16 @@ impl<'a, W: Write> Splicer<'a, W> {
         self.raw(bytes)
     }
 
-    /// Structure — separators and line endings — which is never replaced.
+    /// Structure — separators and line endings — which is never replaced, but
+    /// which still goes nowhere while a struck row is being read past.
     fn raw(&mut self, bytes: &[u8]) -> Result<()> {
+        if self.dropping {
+            return Ok(());
+        }
+        self.write_out(bytes)
+    }
+
+    fn write_out(&mut self, bytes: &[u8]) -> Result<()> {
         self.out.write_all(bytes)?;
         Ok(())
     }
@@ -495,6 +535,104 @@ mod tests {
             spliced(input, &[((0, 0), "x"), ((0, 2), "z")], 1),
             "a,b,c\nx,2,z\n"
         );
+    }
+
+    /// Deleting rows, spliced the same way an edit is: the surviving bytes are
+    /// untouched and the struck rows leave nothing behind, terminator
+    /// included.
+    fn without(input: &str, struck: &[usize], rows: usize) -> String {
+        let mut overlay = Overlay::new();
+        overlay.strike(struck.iter().copied());
+        let mut out = Vec::new();
+        splice(input.as_bytes(), &mut out, b',', true, &overlay, rows).expect("splice failed");
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn a_struck_row_leaves_nothing_behind() {
+        let input = "name,count\na,1\nb,2\nc,3\n";
+        assert_eq!(without(input, &[1], 3), "name,count\na,1\nc,3\n");
+        assert_eq!(without(input, &[0, 2], 3), "name,count\nb,2\n");
+        assert_eq!(without(input, &[0, 1, 2], 3), "name,count\n");
+    }
+
+    #[test]
+    fn the_header_is_never_struck() {
+        // Row 0 is the first *data* row, so deleting it must not take the
+        // header with it.
+        let input = "name,count\na,1\nb,2\n";
+        assert_eq!(without(input, &[0], 2), "name,count\nb,2\n");
+    }
+
+    #[test]
+    fn deleting_a_row_with_a_quoted_newline_removes_all_of_it() {
+        let input = "a,b\n\"one\ntwo\",x\ny,z\n";
+        assert_eq!(without(input, &[0], 2), "a,b\ny,z\n");
+    }
+
+    #[test]
+    fn crlf_survives_a_deletion() {
+        let input = "a,b\r\n1,2\r\n3,4\r\n";
+        assert_eq!(without(input, &[0], 2), "a,b\r\n3,4\r\n");
+    }
+
+    #[test]
+    fn deleting_the_last_row_of_a_file_with_no_final_newline() {
+        let input = "a,b\n1,2\n3,4";
+        assert_eq!(without(input, &[1], 2), "a,b\n1,2\n");
+        assert_eq!(without(input, &[0], 2), "a,b\n3,4");
+    }
+
+    #[test]
+    fn a_row_can_be_edited_and_struck_in_the_same_write() {
+        let mut overlay = Overlay::new();
+        overlay.set([((0, 1), "99".to_string())]);
+        overlay.strike([1]);
+        let mut out = Vec::new();
+        splice(
+            "name,count\na,1\nb,2\nc,3\n".as_bytes(),
+            &mut out,
+            b',',
+            true,
+            &overlay,
+            3,
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "name,count\na,99\nc,3\n",
+            "the edit lands and the other row goes"
+        );
+    }
+
+    #[test]
+    fn an_edit_on_a_struck_row_is_written_nowhere() {
+        // Contradictory, and the row wins: it is not in the file to edit.
+        let mut overlay = Overlay::new();
+        overlay.set([((1, 0), "zz".to_string())]);
+        overlay.strike([1]);
+        let mut out = Vec::new();
+        splice(
+            "name,count\na,1\nb,2\n".as_bytes(),
+            &mut out,
+            b',',
+            true,
+            &overlay,
+            2,
+        )
+        .unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "name,count\na,1\n");
+    }
+
+    #[test]
+    fn a_deletion_that_finds_no_row_is_refused() {
+        let mut overlay = Overlay::new();
+        overlay.strike([9]);
+        let mut out = Vec::new();
+        let e = splice("a,b\n1,2\n".as_bytes(), &mut out, b',', true, &overlay, 1)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("deleted rows were not found"), "{e}");
     }
 
     #[test]

@@ -511,6 +511,7 @@ impl App {
             ("i / a", "Edit cell, caret at start / end"),
             ("c", "Replace cell"),
             ("x", "Clear cell"),
+            ("dd / {n}dd", "Delete the row, or n rows"),
             ("u / Ctrl+r", "Undo / redo"),
             ("y / p", "Yank the cursor / paste at the cursor"),
             (
@@ -538,7 +539,8 @@ impl App {
             ("", "Its shape follows the Tab mode"),
             ("c", "Replace every cell with one value"),
             ("i / a", "Prepend / append text to every cell"),
-            ("x / d", "Clear the selection"),
+            ("x", "Clear the selected cells"),
+            ("d", "Delete the selected rows"),
             ("y", "Yank the selection"),
         ];
         const GENERAL: &[(&str, &str)] = &[("?", "This help"), ("q", "Quit")];
@@ -1119,9 +1121,14 @@ impl App {
             KeyCode::Char('d') if ctrl => self.half_page(true)?,
             KeyCode::Char('u') if ctrl => self.half_page(false)?,
 
-            // `g` waits for its second key. The count survives it, so `12gg`
-            // reads as one motion.
+            // `g` and `d` wait for their second key. The count survives, so
+            // `12gg` and `3dd` each read as one action.
             KeyCode::Char('g') => self.pending_prefix = Some('g'),
+            // Over a selection `d` acts at once, on the rows already chosen,
+            // so it does not wait for a second key.
+            KeyCode::Char('d') if !ctrl && self.visual_anchor.is_none() => {
+                self.pending_prefix = Some('d')
+            }
             KeyCode::Home => {
                 self.pending_num.clear();
                 self.cursor_to(0)?;
@@ -1274,8 +1281,12 @@ impl App {
             KeyCode::Char('a') if self.visual_anchor.is_some() => {
                 self.begin_fill(FillMode::Append)?
             }
-            KeyCode::Char('x') | KeyCode::Char('d') if self.visual_anchor.is_some() => {
-                self.clear_selection()?
+            KeyCode::Char('x') if self.visual_anchor.is_some() => self.clear_selection()?,
+            KeyCode::Char('d') if self.visual_anchor.is_some() => {
+                let rows = self.visual_range().map(|((first, last), _)| (first, last));
+                if let Some((first, last)) = rows {
+                    self.delete_rows(first, last - first + 1)?;
+                }
             }
             KeyCode::Char('#') => {
                 self.pending_num.clear();
@@ -1547,6 +1558,42 @@ impl App {
         }
         self.visual_anchor = None;
         self.message = Some(format!("cleared {cleared} cells"));
+        Ok(())
+    }
+
+    /// Strike out `count` rows from display position `first`.
+    ///
+    /// Nothing is removed from the file until `:w`; until then the rows are
+    /// simply not shown, and `u` puts them back.
+    fn delete_rows(&mut self, first: usize, count: usize) -> anyhow::Result<()> {
+        self.pending_num.clear();
+        let blocked = match &self.store {
+            None => Some("no file open"),
+            Some(store) => store.delete_blocked(),
+        };
+        if let Some(reason) = blocked {
+            self.message = Some(reason.to_string());
+            return Ok(());
+        }
+
+        let deleted = match &mut self.store {
+            Some(store) => store.delete_rows(first..first + count)?,
+            None => 0,
+        };
+        self.visual_anchor = None;
+
+        // Everything below has moved up; the cursor may now be past the end.
+        let last = self
+            .store
+            .as_ref()
+            .map_or(0, |s| s.row_count().saturating_sub(1));
+        if self.cursor_row > last {
+            self.cursor_to(last)?;
+        }
+        self.message = Some(format!(
+            "deleted {deleted} row{}",
+            if deleted == 1 { "" } else { "s" }
+        ));
         Ok(())
     }
 
@@ -1998,6 +2045,11 @@ impl App {
             ('z', KeyCode::Char('t')) => self.scroll_cursor_top(),
             ('z', KeyCode::Char('b')) => self.scroll_cursor_bottom(),
             // `gg` is the first row, or the nth when a count precedes it.
+            // `dd` takes out the cursor row, `{n}dd` that many.
+            ('d', KeyCode::Char('d')) => {
+                let count = self.take_count(1);
+                self.delete_rows(self.cursor_row, count)
+            }
             ('g', KeyCode::Char('g')) => {
                 if self.pending_num.is_empty() {
                     self.cursor_to(0)
@@ -2994,6 +3046,126 @@ mod tests {
         tab(&mut app);
         key(&mut app, KeyCode::Enter);
         assert_eq!(shown_columns(&app), ["d"], "msg: {:?}", app.message);
+    }
+
+    #[test]
+    fn dd_takes_out_the_cursor_row_and_writes_it_out() {
+        let (mut app, path) = app_with("dd.csv", SAMPLE);
+        app.last_frame_width = 60;
+        press(&mut app, 'j'); // on row 1, `b`
+
+        press(&mut app, 'd');
+        assert_eq!(app.pending_prefix, Some('d'), "one d is half a command");
+        assert_eq!(shown(&app, 0, 1).as_deref(), Some("b"), "nothing yet");
+
+        press(&mut app, 'd');
+        assert_eq!(app.store.as_ref().unwrap().row_count(), 2);
+        assert_eq!(shown(&app, 0, 0).as_deref(), Some("a"));
+        assert_eq!(shown(&app, 0, 1).as_deref(), Some("c"), "c moved up");
+
+        // Nothing has reached the file until :w.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), SAMPLE);
+        command(&mut app, "w");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "name,count\na,1\nc,3\n"
+        );
+    }
+
+    #[test]
+    fn a_count_deletes_that_many_rows() {
+        let (mut app, path) = app_with("countdd.csv", SAMPLE);
+        app.last_frame_width = 60;
+        press(&mut app, '2');
+        press(&mut app, 'd');
+        assert_eq!(app.pending_num, "2", "the count outlives the prefix");
+        press(&mut app, 'd');
+
+        assert_eq!(app.store.as_ref().unwrap().row_count(), 1);
+        assert_eq!(shown(&app, 0, 0).as_deref(), Some("c"));
+        command(&mut app, "w");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "name,count\nc,3\n");
+    }
+
+    #[test]
+    fn deleting_is_one_undoable_step() {
+        let (mut app, _) = app_with("undodd.csv", SAMPLE);
+        app.last_frame_width = 60;
+        press(&mut app, '2');
+        press(&mut app, 'd');
+        press(&mut app, 'd');
+        assert_eq!(app.store.as_ref().unwrap().row_count(), 1);
+
+        press(&mut app, 'u');
+        assert_eq!(
+            app.store.as_ref().unwrap().row_count(),
+            3,
+            "two rows, one undo"
+        );
+        assert_eq!(shown(&app, 0, 0).as_deref(), Some("a"));
+        assert_eq!(app.store.as_ref().unwrap().dirty(), 0);
+    }
+
+    #[test]
+    fn a_visual_selection_deletes_its_rows() {
+        let (mut app, path) = app_with("visualdd.csv", SAMPLE);
+        app.last_frame_width = 60;
+        press(&mut app, 'v');
+        press(&mut app, 'j');
+        press(&mut app, 'd');
+
+        assert_eq!(app.store.as_ref().unwrap().row_count(), 1);
+        assert!(app.visual_anchor.is_none(), "the selection is spent");
+        command(&mut app, "w");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "name,count\nc,3\n");
+    }
+
+    #[test]
+    fn deleting_past_the_end_takes_what_is_there_and_moves_the_cursor_back() {
+        let (mut app, _) = app_with("ddend.csv", SAMPLE);
+        app.last_frame_width = 60;
+        press(&mut app, 'j');
+        press(&mut app, '9');
+        press(&mut app, 'd');
+        press(&mut app, 'd');
+
+        assert_eq!(app.store.as_ref().unwrap().row_count(), 1);
+        assert_eq!(app.cursor_row, 0, "the cursor cannot sit past the end");
+        assert!(app.message.clone().unwrap().contains("deleted 2 rows"));
+    }
+
+    #[test]
+    fn an_edited_cell_below_a_deleted_row_still_belongs_to_its_own_line() {
+        // The edit is keyed to the file, the deletion shifts what is on
+        // screen, and only the file can say whether they agree.
+        let (mut app, path) = app_with("ddshift.csv", SAMPLE);
+        app.last_frame_width = 60;
+        cell_mode(&mut app);
+        press(&mut app, 'd');
+        press(&mut app, 'd'); // delete `a`, so `b` is now display row 0
+
+        press(&mut app, 'c');
+        typed(&mut app, "B");
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(shown(&app, 0, 0).as_deref(), Some("B"));
+
+        command(&mut app, "w");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "name,count\nB,2\nc,3\n",
+            "the edit belongs to b's line, not a's"
+        );
+    }
+
+    #[test]
+    fn a_sorted_or_filtered_view_says_why_it_will_not_delete() {
+        let mut app = app_sized("ddblocked.csv", CATS, 60);
+        filter(&mut app, "filter cat = a");
+        press(&mut app, 'd');
+        press(&mut app, 'd');
+        let message = app.message.clone().unwrap();
+        assert!(message.contains("filtered or sorted"), "{message}");
+        assert_eq!(app.store.as_ref().unwrap().row_count(), 3, "untouched");
     }
 
     #[test]
