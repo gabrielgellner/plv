@@ -156,9 +156,19 @@ Scrolling would pay it on every keypress.
 
 So a filter is resolved once into the sorted set of source rows it matches
 (`data/rows.rs`), and paging becomes a gather: read the span the page covers,
-take the wanted rows out of it. `Store::scan_rows` is the chunked background
+take the wanted rows out of it. `Store::scan_indexed` is the chunked background
 scan, shared with `/` search — both ask the same question of the file and both
-want the answer progressively. It buys a real row count, cancellation, and row
+want the answer progressively. It reads each chunk from the byte offset the row
+index gives it: the lazy alternative re-reads from the top for every chunk, so
+its cost grows with the offset and the whole scan is quadratic. Measured on a
+2M-row CSV, the same filter took 4.16s in fixed 10,000-row chunks and 45.6ms
+read by span. Chunk size is bounded by **bytes**, not by a row count: rows differ in
+width between files by more than an order of magnitude, so the same row count is
+a few megabytes in one file and gigabytes in another, and only the bytes bound
+the memory. `budget::scan_bytes()` sets the ceiling and the index answers which
+row that reaches, so every chunk boundary is still a checkpoint. A chunk that matched nothing still
+reports, so a scan that is merely finding nothing cannot look like one that has
+stalled. It buys a real row count, cancellation, and row
 identity, which is what lets the edit buffer survive a filter: a row picked out
 of a filtered view still knows which line of the file it came from.
 

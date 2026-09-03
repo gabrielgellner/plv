@@ -80,7 +80,13 @@ pub struct Store {
     /// Where each row of a delimited file starts, so a page can be read
     /// without parsing everything before it. Absent for Parquet, which can
     /// already seek, and for lake tables.
-    row_index: Option<RowIndex>,
+    row_index: Option<std::sync::Arc<RowIndex>>,
+    /// Overrides how many bytes a scan chunk may read.
+    ///
+    /// Only tests set it. Crossing a chunk seam otherwise needs a fixture of
+    /// tens of megabytes, and the row numbering across that seam is precisely
+    /// where an off-by-one would hide.
+    scan_bytes: Option<u64>,
     /// The whole sorted table, held in memory, carrying [`SOURCE_ROW`].
     ///
     /// Sorting cannot be lazy — nothing can know which row comes first
@@ -123,6 +129,7 @@ impl Store {
             overlay: Overlay::new(),
             filter_rows: None,
             row_index: None,
+            scan_bytes: None,
             sorted: None,
         })
     }
@@ -138,10 +145,10 @@ impl Store {
         // it has. That same pass records where the rows are, so paging into it
         // later does not have to count its way there.
         let row_index = match separator {
-            Some(separator) => Some(RowIndex::build(path, separator)?),
+            Some(separator) => Some(std::sync::Arc::new(RowIndex::build(path, separator)?)),
             None => None,
         };
-        let rows = row_index.as_ref().map(RowIndex::rows);
+        let rows = row_index.as_ref().map(|index| index.rows());
 
         let mut store = Self::build(loader::load(path)?, viewport_rows, rows)?;
         store.row_index = row_index;
@@ -189,6 +196,7 @@ impl Store {
             overlay: Overlay::new(),
             filter_rows: None,
             row_index: None,
+            scan_bytes: None,
             sorted: None,
         })
     }
@@ -443,12 +451,7 @@ impl Store {
 
         Some((|| {
             let bytes = index::read_span(&target.path, index, from, to)?;
-            let page = CsvReadOptions::default()
-                .with_has_header(true)
-                .with_schema(Some(self.schema.clone()))
-                .with_parse_options(CsvParseOptions::default().with_separator(target.separator))
-                .into_reader_with_file_handle(std::io::Cursor::new(bytes))
-                .finish()?;
+            let page = parse_span(bytes, &self.schema, target.separator)?;
             // The span starts at a checkpoint, which is at or before the page.
             Ok(page.slice((offset - first_row) as i64, height))
         })())
@@ -1013,16 +1016,97 @@ impl Store {
             },
         };
         let schema = self.schema.clone();
-        Self::scan_rows(lf, total, tx, move || {
-            // Built inside the thread: an `Expr` is not `Send`.
-            match col_name {
+        // Built inside the thread: an `Expr` is not `Send`.
+        let build = {
+            let schema = schema.clone();
+            let pattern = pattern.clone();
+            let col_name = col_name.clone();
+            move || match col_name {
                 Some(name) => Some(matches_pattern(&name, &pattern)),
                 None => schema
                     .iter_names()
                     .map(|name| matches_pattern(name.as_str(), &pattern))
                     .reduce(Expr::or),
             }
+        };
+
+        // The indexed scan reads the file itself, so it can only stand in for
+        // the lazy one when the view has not changed what a row is.
+        let plain =
+            self.sorted.is_none() && self.view.sort.is_empty() && self.view.select.is_none();
+        if plain && self.scan_indexed(tx.clone(), build).is_some() {
+            return;
+        }
+        Self::scan_rows(lf, total, tx, move || match col_name {
+            Some(name) => Some(matches_pattern(&name, &pattern)),
+            None => schema
+                .iter_names()
+                .map(|name| matches_pattern(name.as_str(), &pattern))
+                .reduce(Expr::or),
         });
+    }
+
+    /// Scan a delimited file chunk by chunk, reading each chunk from the byte
+    /// offset the index points at.
+    ///
+    /// The lazy alternative re-reads from the top of the file for every chunk,
+    /// so its cost grows with the offset and the whole scan is quadratic:
+    /// measured on a 437MB CSV, a 10,000-row chunk costs 10ms at the start and
+    /// 494ms twenty million rows in. Reading each chunk where it actually
+    /// lives makes the scan linear.
+    ///
+    /// `None` when there is no index to read from, leaving the caller on the
+    /// lazy path.
+    #[allow(clippy::too_many_arguments)]
+    fn scan_indexed<F>(&self, tx: mpsc::Sender<Vec<usize>>, build: F) -> Option<()>
+    where
+        F: FnOnce() -> Option<Expr> + Send + 'static,
+    {
+        let index = self.row_index.clone()?;
+        let target = self.edit.as_ref()?;
+        let path = target.path.clone();
+        let separator = target.separator;
+        let schema = self.schema.clone();
+        let budget = self.scan_bytes.unwrap_or_else(budget::scan_bytes);
+
+        thread::spawn(move || {
+            let Some(predicate) = build() else { return };
+            let total = index.rows();
+            let mut start = 0usize;
+
+            while start < total {
+                // Sized by what it will read, not by a row count: a chunk of
+                // n rows is a few megabytes in one file and gigabytes in
+                // another, and only the bytes bound the memory.
+                let end = index.chunk_end(start, budget);
+                let (_, from) = index.seek(start);
+                let to = index.end_of(end);
+
+                let Ok(bytes) = index::read_span(&path, &index, from, to) else {
+                    break;
+                };
+                let Ok(chunk) = parse_span(bytes, &schema, separator) else {
+                    break;
+                };
+                let Ok(hits) = chunk
+                    .lazy()
+                    .with_row_index(MATCH_ROW, Some(start as u32))
+                    .filter(predicate.clone())
+                    .select([col(MATCH_ROW)])
+                    .collect()
+                else {
+                    break;
+                };
+
+                // Sent even when empty, so a scan that is merely finding
+                // nothing cannot be mistaken for one that has stalled.
+                if tx.send(match_rows(&hits)).is_err() {
+                    return; // receiver dropped — cancelled
+                }
+                start = end;
+            }
+        });
+        Some(())
     }
 
     /// Scan `lf` in chunks, streaming the absolute indices of the rows an
@@ -1051,22 +1135,15 @@ impl Store {
                 let Ok(df) = lf
                     .clone()
                     .slice(offset as i64, size as u32)
-                    .with_row_index("__idx__", Some(offset as u32))
+                    .with_row_index(MATCH_ROW, Some(offset as u32))
                     .filter(predicate.clone())
-                    .select([col("__idx__")])
+                    .select([col(MATCH_ROW)])
                     .collect()
                 else {
                     break;
                 };
 
-                let rows: Vec<usize> = df
-                    .column("__idx__")
-                    .ok()
-                    .and_then(|c| c.u32().ok())
-                    .map(|ca| ca.iter().flatten().map(|i| i as usize).collect())
-                    .unwrap_or_default();
-
-                if !rows.is_empty() && tx.send(rows).is_err() {
+                if tx.send(match_rows(&df)).is_err() {
                     return; // receiver dropped — cancelled
                 }
 
@@ -1108,9 +1185,18 @@ impl Store {
         self.row_offset = 0;
         self.refresh()?;
 
-        Self::scan_rows(lf, self.total_rows, tx, move || {
-            rows::predicate(&filter, &schema)
-        });
+        let predicate = {
+            let filter = filter.clone();
+            let schema = schema.clone();
+            move || rows::predicate(&filter, &schema)
+        };
+        // The index makes the scan linear; without one it re-reads from the
+        // top of the file for every chunk.
+        if self.scan_indexed(tx.clone(), predicate).is_none() {
+            Self::scan_rows(lf, self.total_rows, tx, move || {
+                rows::predicate(&filter, &schema)
+            });
+        }
         Ok(Some(rx))
     }
 
@@ -1146,6 +1232,32 @@ impl Store {
         let df = lf.clone().select([len().alias("n")]).collect()?;
         Ok(df.column("n")?.u32()?.get(0).unwrap_or(0) as usize)
     }
+}
+
+/// The column a scan puts its row numbers in.
+const MATCH_ROW: &str = "__idx__";
+
+/// The row numbers a scan's chunk turned up.
+fn match_rows(hits: &DataFrame) -> Vec<usize> {
+    hits.column(MATCH_ROW)
+        .ok()
+        .and_then(|c| c.u32().ok())
+        .map(|ca| ca.iter().flatten().map(|i| i as usize).collect())
+        .unwrap_or_default()
+}
+
+/// Parse a span of a delimited file that was read with its header in front.
+///
+/// Given the schema plv already inferred, never left to infer its own: a chunk
+/// would type each column by whatever happens to be in those rows, so the same
+/// column could come back differently from two different chunks.
+fn parse_span(bytes: Vec<u8>, schema: &SchemaRef, separator: u8) -> Result<DataFrame> {
+    Ok(CsvReadOptions::default()
+        .with_has_header(true)
+        .with_schema(Some(schema.clone()))
+        .with_parse_options(CsvParseOptions::default().with_separator(separator))
+        .into_reader_with_file_handle(std::io::Cursor::new(bytes))
+        .finish()?)
 }
 
 /// Whether a table of this shape can be sorted at all: whether holding it
@@ -1186,6 +1298,57 @@ mod tests {
     /// Small fixtures never reach a second checkpoint, so the interesting
     /// case — a page found by seeking rather than by counting — needs a file
     /// bigger than one stride.
+    /// The indexed scan reads spans of the file itself, so it has to find
+    /// exactly what a filter over the whole frame would.
+    #[test]
+    fn an_indexed_scan_finds_the_same_rows_across_several_chunks() {
+        use crate::data::index::STRIDE;
+
+        // Wide enough that the fixture runs past one chunk's byte budget, or
+        // the seams between chunks never get crossed.
+        let rows = STRIDE * 3 + 500;
+        let padding = "x".repeat(48);
+        let mut csv = String::from("id,cat,filler\n");
+        for i in 0..rows {
+            csv.push_str(&format!(
+                "{i},{},{padding}\n",
+                if i % 3 == 0 { "a" } else { "b" }
+            ));
+        }
+        let path = write_temp("scan.csv", &csv);
+        let mut store = Store::open_file(&path, 10).unwrap();
+        // Force several chunks out of a small fixture, so the row numbering
+        // across the seams is what is being checked.
+        store.scan_bytes = Some(64 << 10);
+        let index = store.row_index.clone().expect("a csv has an index");
+        assert!(
+            index.chunk_end(0, 64 << 10) < rows,
+            "the budget was meant to force more than one chunk"
+        );
+
+        store.view.filter = Some(
+            match crate::view::parse("filter cat = a", &store.schema).unwrap() {
+                crate::view::Command::Filter(filter) => filter,
+                other => panic!("{other:?}"),
+            },
+        );
+        let rx = store.begin_filter().unwrap().unwrap();
+        while let Ok(batch) = rx.recv_timeout(std::time::Duration::from_secs(30)) {
+            if !store.extend_filter(batch).unwrap() {
+                break;
+            }
+        }
+        store.finish_filter().unwrap();
+
+        let expected = rows.div_ceil(3);
+        assert_eq!(store.row_count(), expected, "every third row matches");
+        // And they are the right rows, in file order, across chunk seams.
+        assert_eq!(store.source_row(0), Some(0));
+        assert_eq!(store.source_row(1), Some(3));
+        let last = store.row_count() - 1;
+        assert_eq!(store.source_row(last), Some((expected - 1) * 3));
+    }
+
     #[test]
     fn an_indexed_page_reads_the_same_rows_the_slow_path_would() {
         use crate::data::index::STRIDE;

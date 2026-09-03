@@ -45,6 +45,18 @@ fn total_memory() -> u64 {
     })
 }
 
+/// Bytes of source a single scan chunk may read.
+///
+/// A chunk is transient — one at a time, parsed and dropped — so this is small
+/// and does not need a share of the machine so much as a ceiling. Sizing a
+/// chunk in *rows* would not bound it at all: rows differ in width between
+/// files by more than an order of magnitude.
+pub fn scan_bytes() -> u64 {
+    const FLOOR: u64 = 8 << 20;
+    const CEILING: u64 = 64 << 20;
+    (total_memory() / 512).clamp(FLOOR, CEILING)
+}
+
 /// Cells a held sort may cover.
 pub fn sort_cells() -> usize {
     cells(SORT_SHARE)
