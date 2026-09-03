@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.0] - 2026-09-03
+
+### Documentation
+
+- bring the README up to date ([`0a6d8e8`](https://gitlab.com/gabrielgellner/plv/-/commit/0a6d8e8a25bb1d91383d42674add70d12934eb23))
+
+### Features
+
+- delete rows with dd, and a visual d ([`adfa91c`](https://gitlab.com/gabrielgellner/plv/-/commit/adfa91ce4a18db7fe02fce994fbd8e3b23cd06c8))
+- open new rows with o and O ([`e23820e`](https://gitlab.com/gabrielgellner/plv/-/commit/e23820ed4fbd723dcb50cec7fa849fb45a06b554))
+
 ## [0.7.0] - 2026-09-03
 
 ### Bug Fixes
@@ -126,6 +137,8 @@ All notable changes to this project will be documented in this file.
 ### Styling
 
 - fix clippy warnings ([`5cb0dba`](https://gitlab.com/gabrielgellner/plv/-/commit/5cb0dba5f5d4bc0be4d3d3b09fd1e7cd00ff7722))
+
+[0.8.0]: https://gitlab.com/gabrielgellner/plv/-/compare/v0.7.0...v0.8.0
 
 [0.7.0]: https://gitlab.com/gabrielgellner/plv/-/compare/v0.6.0...v0.7.0
 
