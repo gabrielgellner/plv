@@ -11,19 +11,26 @@
 //! themselves. Whether a new value still parses as its column's type is a
 //! warning for the caller to raise, not a rule this layer enforces.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// A cell's position in the source file: the 0-based data row — the header is
 /// not counted — and the field index.
 pub type Cell = (usize, usize);
 
-/// One undoable step, recorded as the values that were there before it. `None`
-/// means the cell held no pending edit, so undoing it removes the entry.
+/// What one undoable step has to put back.
 ///
-/// A step is a `Vec` rather than a single cell because a fill over a visual
-/// range is one edit as far as the user is concerned, and `u` should take all
-/// of it back at once.
-type Change = Vec<(Cell, Option<String>)>;
+/// A step is a list rather than a single item because a fill or a `{n}dd` is
+/// one action as far as the user is concerned, and `u` should take all of it
+/// back at once.
+#[derive(Debug)]
+enum Undoable {
+    /// The value the cell held before, or `None` if it held no pending edit.
+    Cell(Cell, Option<String>),
+    /// Whether the row was already struck out before.
+    Struck(usize, bool),
+}
+
+type Change = Vec<Undoable>;
 
 /// Pending edits, grouped by row.
 ///
@@ -32,6 +39,13 @@ type Change = Vec<(Cell, Option<String>)>;
 #[derive(Default)]
 pub struct Overlay {
     rows: BTreeMap<usize, BTreeMap<usize, String>>,
+    /// Source rows struck out, to be left out when the file is written.
+    ///
+    /// Struck rather than removed: the file is not touched until `:w`, so a
+    /// deleted row is a note about what to leave out, and `u` puts it back.
+    /// Sorted, because every reader wants to ask how many come before a
+    /// given row.
+    struck: BTreeSet<usize>,
     len: usize,
     undo: Vec<Change>,
     redo: Vec<Change>,
@@ -48,7 +62,13 @@ impl Overlay {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        self.len == 0 && self.struck.is_empty()
+    }
+
+    /// Everything pending, cells and struck rows together — what `[+n]` counts
+    /// and what makes quitting ask first.
+    pub fn pending(&self) -> usize {
+        self.len + self.struck.len()
     }
 
     pub fn get(&self, (row, col): Cell) -> Option<&str> {
@@ -70,13 +90,49 @@ impl Overlay {
     pub fn set<I: IntoIterator<Item = (Cell, String)>>(&mut self, edits: I) {
         let change: Change = edits
             .into_iter()
-            .map(|(cell, value)| (cell, self.insert(cell, value)))
+            .map(|(cell, value)| Undoable::Cell(cell, self.insert(cell, value)))
             .collect();
         if change.is_empty() {
             return;
         }
         self.undo.push(change);
         self.redo.clear();
+    }
+
+    /// Strike out rows, so the write leaves them out. One undoable step.
+    pub fn strike<I: IntoIterator<Item = usize>>(&mut self, rows: I) {
+        let change: Change = rows
+            .into_iter()
+            .map(|row| {
+                let was = !self.struck.insert(row);
+                Undoable::Struck(row, was)
+            })
+            .collect();
+        if change.is_empty() {
+            return;
+        }
+        self.undo.push(change);
+        self.redo.clear();
+    }
+
+    /// Whether a source row is struck out.
+    pub fn is_struck(&self, row: usize) -> bool {
+        self.struck.contains(&row)
+    }
+
+    /// Struck rows, in file order.
+    pub fn struck(&self) -> impl Iterator<Item = usize> + '_ {
+        self.struck.iter().copied()
+    }
+
+    /// How many struck rows come before `row`, which is what turns a display
+    /// position back into a file row.
+    pub fn struck_before(&self, row: usize) -> usize {
+        self.struck.range(..row).count()
+    }
+
+    pub fn struck_count(&self) -> usize {
+        self.struck.len()
     }
 
     pub fn can_undo(&self) -> bool {
@@ -112,6 +168,7 @@ impl Overlay {
     /// silently reintroduce changes the user believes they saved.
     pub fn clear(&mut self) {
         self.rows.clear();
+        self.struck.clear();
         self.len = 0;
         self.undo.clear();
         self.redo.clear();
@@ -122,12 +179,23 @@ impl Overlay {
     fn revert(&mut self, change: Change) -> Change {
         change
             .into_iter()
-            .map(|(cell, previous)| {
-                let current = match previous {
-                    Some(value) => self.insert(cell, value),
-                    None => self.remove(cell),
-                };
-                (cell, current)
+            .map(|step| match step {
+                Undoable::Cell(cell, previous) => {
+                    let current = match previous {
+                        Some(value) => self.insert(cell, value),
+                        None => self.remove(cell),
+                    };
+                    Undoable::Cell(cell, current)
+                }
+                Undoable::Struck(row, was) => {
+                    let now = self.struck.contains(&row);
+                    if was {
+                        self.struck.insert(row);
+                    } else {
+                        self.struck.remove(&row);
+                    }
+                    Undoable::Struck(row, now)
+                }
             })
             .collect()
     }
@@ -241,6 +309,60 @@ mod tests {
         let seen: Vec<usize> = o.rows().map(|(row, _)| row).collect();
         assert_eq!(seen, [2, 7]);
         assert_eq!(o.row(2).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn striking_rows_is_one_undoable_step() {
+        let mut o = Overlay::new();
+        o.strike([2, 5, 9]);
+        assert_eq!(o.struck_count(), 3);
+        assert!(o.is_struck(5));
+        assert!(!o.is_struck(4));
+        assert_eq!(o.struck().collect::<Vec<_>>(), [2, 5, 9], "in file order");
+
+        assert!(o.undo());
+        assert_eq!(o.struck_count(), 0, "one dd, one undo");
+        assert!(o.redo());
+        assert!(o.is_struck(9));
+    }
+
+    #[test]
+    fn striking_a_row_twice_does_not_double_count_or_undo_wrongly() {
+        let mut o = Overlay::new();
+        o.strike([3]);
+        o.strike([3]);
+        assert_eq!(o.struck_count(), 1);
+
+        o.undo();
+        assert!(o.is_struck(3), "the second strike was a no-op to take back");
+        o.undo();
+        assert!(!o.is_struck(3));
+    }
+
+    #[test]
+    fn struck_before_is_what_turns_a_position_back_into_a_row() {
+        let mut o = Overlay::new();
+        o.strike([1, 4, 5]);
+        assert_eq!(o.struck_before(0), 0);
+        assert_eq!(o.struck_before(1), 0, "the row itself does not count");
+        assert_eq!(o.struck_before(2), 1);
+        assert_eq!(o.struck_before(5), 2);
+        assert_eq!(o.struck_before(99), 3);
+    }
+
+    #[test]
+    fn struck_rows_and_edited_cells_share_the_history() {
+        let mut o = Overlay::new();
+        set1(&mut o, (0, 0), "x");
+        o.strike([7]);
+        assert_eq!(o.pending(), 2, "one cell and one row");
+        assert!(!o.is_empty());
+
+        o.undo();
+        assert!(!o.is_struck(7));
+        assert_eq!(o.get((0, 0)), Some("x"), "the cell edit is untouched");
+        o.undo();
+        assert!(o.is_empty());
     }
 
     #[test]

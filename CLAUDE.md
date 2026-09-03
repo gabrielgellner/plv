@@ -81,6 +81,17 @@ Undo history is a stack of **transactions**, not single cells, so one fill over
 a visual selection is one `u`. `Overlay::clear()` drops the history with the
 edits: undoing past a write would resurrect changes the user believes they saved.
 
+**Rows are struck, not removed.** `dd` and a visual `d` note a source row in
+the overlay's struck set; nothing leaves the file until `:w`, so `u` puts it
+back and the buffer stays proportional to what was changed rather than to the
+file. The row space skips them — `row_count` subtracts them, `source_row` steps
+over them — so deleting a thousand rows from a ten-million-row file is about a
+millisecond and paging past them costs what it did before. In the writer a
+struck record goes nowhere, terminator included, or the file would grow blank
+lines where rows used to be. Deleting is refused under a filter or a sort, which
+put an explicit list of rows on screen that taking one out of the middle would
+mean rebuilding.
+
 **Values are text.** The file on disk is untyped; the types plv shows are
 Polars' inference over it. A column takes an edit by going through text and
 comes back typed if it can — typing `42` into a number is still a number — and
