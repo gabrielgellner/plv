@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.0] - 2026-09-03
+
+### Bug Fixes
+
+- the picker toggles with -, and does not bind q ([`7e1b8e8`](https://gitlab.com/gabrielgellner/plv/-/commit/7e1b8e86c86c02427739f570d4a09928fc3bf1a5))
+
+### Features
+
+- a column picker on C ([`9503ad1`](https://gitlab.com/gabrielgellner/plv/-/commit/9503ad1a0979963b8791e175264669fff873f1ff))
+- show all and hide all in the picker ([`52467d7`](https://gitlab.com/gabrielgellner/plv/-/commit/52467d76794363a3a6af5c1d771117c6b24f33b8))
+
 ## [0.10.0] - 2026-09-03
 
 ### Features
@@ -156,6 +167,8 @@ All notable changes to this project will be documented in this file.
 ### Styling
 
 - fix clippy warnings ([`5cb0dba`](https://gitlab.com/gabrielgellner/plv/-/commit/5cb0dba5f5d4bc0be4d3d3b09fd1e7cd00ff7722))
+
+[0.11.0]: https://gitlab.com/gabrielgellner/plv/-/compare/v0.10.0...v0.11.0
 
 [0.10.0]: https://gitlab.com/gabrielgellner/plv/-/compare/v0.9.0...v0.10.0
 
