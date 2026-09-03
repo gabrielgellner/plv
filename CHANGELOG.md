@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.12.0] - 2026-09-03
+
+### Bug Fixes
+
+- `-` takes a column cursor instead of doing nothing ([`29947d3`](https://gitlab.com/gabrielgellner/plv/-/commit/29947d374721f9723a35304e615ec0cabfed973f))
+- `s` takes a column cursor instead of doing nothing ([`1354513`](https://gitlab.com/gabrielgellner/plv/-/commit/135451337dae81f854eefb16bb99acc1ca2bbf2c))
+- the sort indicator no longer eats the column name ([`11d61bc`](https://gitlab.com/gabrielgellner/plv/-/commit/11d61bc4af3894f0a3d5bcb713e4283ff9ee3b89))
+- a single sort key is drawn as just its arrow ([`754e6ef`](https://gitlab.com/gabrielgellner/plv/-/commit/754e6ef90a4879d9a7db3f71237762a6af559a41))
+
+### Documentation
+
+- the column keys in the README ([`393c128`](https://gitlab.com/gabrielgellner/plv/-/commit/393c128f273f764c3104a1a87734237b596e1348))
+
 ## [0.11.0] - 2026-09-03
 
 ### Bug Fixes
@@ -167,6 +180,8 @@ All notable changes to this project will be documented in this file.
 ### Styling
 
 - fix clippy warnings ([`5cb0dba`](https://gitlab.com/gabrielgellner/plv/-/commit/5cb0dba5f5d4bc0be4d3d3b09fd1e7cd00ff7722))
+
+[0.12.0]: https://gitlab.com/gabrielgellner/plv/-/compare/v0.11.0...v0.12.0
 
 [0.11.0]: https://gitlab.com/gabrielgellner/plv/-/compare/v0.10.0...v0.11.0
 
