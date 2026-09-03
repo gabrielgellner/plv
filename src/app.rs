@@ -85,6 +85,13 @@ impl FillMode {
     }
 }
 
+/// How far `Ctrl+d`/`Ctrl+u` and `Ctrl+f`/`Ctrl+b` move.
+#[derive(Clone, Copy)]
+enum Page {
+    Half,
+    Whole,
+}
+
 /// Where the caret lands when a cell edit opens, following vim.
 #[derive(Clone, Copy)]
 enum EditStart {
@@ -495,6 +502,7 @@ impl App {
                 "Ctrl+d / Ctrl+u",
                 "Half a screen down / up, view and cursor",
             ),
+            ("Ctrl+f / Ctrl+b", "A whole screen down / up"),
             ("gg / G", "First / last row"),
             ("{n}gg / {n}G", "Jump to row n"),
             ("zz / zt / zb", "Centre / top / bottom"),
@@ -1128,8 +1136,12 @@ impl App {
                 let n = self.take_count(1);
                 self.cursor_up(n)?;
             }
-            KeyCode::Char('d') if ctrl => self.half_page(true)?,
-            KeyCode::Char('u') if ctrl => self.half_page(false)?,
+            KeyCode::Char('d') if ctrl => self.scroll_page(true, Page::Half)?,
+            KeyCode::Char('u') if ctrl => self.scroll_page(false, Page::Half)?,
+            KeyCode::Char('f') if ctrl => self.scroll_page(true, Page::Whole)?,
+            KeyCode::Char('b') if ctrl => self.scroll_page(false, Page::Whole)?,
+            KeyCode::PageDown => self.scroll_page(true, Page::Whole)?,
+            KeyCode::PageUp => self.scroll_page(false, Page::Whole)?,
 
             // `g` and `d` wait for their second key. The count survives, so
             // `12gg` and `3dd` each read as one action.
@@ -2130,7 +2142,8 @@ impl App {
         }
     }
 
-    /// `Ctrl+d` / `Ctrl+u`: half a screen, view and cursor together.
+    /// `Ctrl+d`/`Ctrl+u` and `Ctrl+f`/`Ctrl+b`: a screen or half of one, view
+    /// and cursor together.
     ///
     /// vim moves both, keeping the cursor at the same height in the window,
     /// rather than walking the cursor down until it falls off the edge — so
@@ -2140,12 +2153,15 @@ impl App {
     ///
     /// Against the ends of the file the view runs out of room first; the
     /// cursor then carries on alone, as it does in vim.
-    fn half_page(&mut self, down: bool) -> anyhow::Result<()> {
+    fn scroll_page(&mut self, down: bool, page: Page) -> anyhow::Result<()> {
         let Some(store) = &self.store else {
             return Ok(());
         };
         let viewport = store.viewport_rows.max(1);
-        let step = (viewport / 2).max(1);
+        let step = match page {
+            Page::Half => (viewport / 2).max(1),
+            Page::Whole => viewport.max(1),
+        };
         let last_row = store.row_count().saturating_sub(1);
         let offset = store.row_offset;
         let height_in_view = self.cursor_row.saturating_sub(offset);
@@ -2865,6 +2881,28 @@ mod tests {
         app.handle_key_event(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL))
             .unwrap();
         assert_eq!((app.cursor_row, offset(&app)), (0, 0));
+    }
+
+    #[test]
+    fn a_whole_page_moves_twice_as_far_as_half_of_one() {
+        let mut app = tall_app("wholepage.csv");
+        let viewport = app.store.as_ref().unwrap().viewport_rows;
+        assert_eq!(viewport, 10);
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL))
+            .unwrap();
+        assert_eq!(offset(&app), viewport, "a whole screen");
+        assert_eq!(app.cursor_row, viewport, "the cursor came with it");
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL))
+            .unwrap();
+        assert_eq!((offset(&app), app.cursor_row), (0, 0));
+
+        // Page Up and Page Down say the same thing, as they do in csvlens.
+        key(&mut app, KeyCode::PageDown);
+        assert_eq!(offset(&app), viewport);
+        key(&mut app, KeyCode::PageUp);
+        assert_eq!(offset(&app), 0);
     }
 
     #[test]

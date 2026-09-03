@@ -27,7 +27,9 @@ Press `?` at any time for the key bindings of whatever screen you are on.
 |-----|--------|
 | `j` / `↓` | Move cursor down |
 | `k` / `↑` | Move cursor up |
-| `Ctrl+d` / `Ctrl+u` | Half page down / up |
+| `Ctrl+d` / `Ctrl+u` | Half a screen down / up |
+| `Ctrl+f` / `Ctrl+b` | A whole screen down / up |
+| `PageDown` / `PageUp` | The same |
 | `gg` / `Home` | Jump to first row |
 | `G` / `End` | Jump to last row |
 | `{n}gg` / `{n}G` | Jump to row n |
