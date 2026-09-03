@@ -521,7 +521,7 @@ impl App {
                             sort_tick: self.sort_rx.as_ref().map(|_| self.spinner_tick),
                             filtering: store.filtering(),
                             help: if self.picker.is_some() {
-                                " space:show  p:pin  ⏎:apply  esc:cancel "
+                                " -:show  p:pin  ⏎:apply  esc:cancel "
                             } else if self.lake.is_some() {
                                 " f:partitions  T:snapshots  b:back  ?:help "
                             } else {
@@ -700,10 +700,10 @@ impl App {
             ("j / k", "Move down the list"),
             ("g / G", "First / last column"),
             ("Ctrl+d / Ctrl+u", "Half page down / up"),
-            ("Space", "Show or hide this column"),
+            ("-", "Show or hide this column"),
             ("p", "Pin or unpin this column"),
             ("Enter", "Apply"),
-            ("Esc / q", "Cancel, changing nothing"),
+            ("Esc", "Cancel, changing nothing"),
         ];
         const BROWSER: &[Section<'static>] = &[("Catalog", BROWSE), ("General", GENERAL)];
         // No `General` section: its `q` means quit, and in the picker `q`
@@ -2563,7 +2563,13 @@ impl App {
         let len = picker.len();
 
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => self.close_picker(),
+            // `q` is deliberately not bound. Everywhere else in vim it closes
+            // a window, and a window is a view — closing one never destroys
+            // work. The picker holds unapplied changes, so it cannot close
+            // harmlessly, and borrowing the letter for something that throws
+            // twenty toggles away is what makes `q` mean two things. `Esc`
+            // discards, as it discards a half-typed `:` line.
+            KeyCode::Esc => self.close_picker(),
             KeyCode::Enter => return self.apply_picker(),
             KeyCode::Char('j') | KeyCode::Down => picker.state.move_by(1, len),
             KeyCode::Char('k') | KeyCode::Up => picker.state.move_by(-1, len),
@@ -2571,7 +2577,11 @@ impl App {
             KeyCode::Char('u') if ctrl => picker.state.move_by(-half, len),
             KeyCode::Char('g') | KeyCode::Home => picker.state.go_to(0, len),
             KeyCode::Char('G') | KeyCode::End => picker.state.go_to(len.saturating_sub(1), len),
-            KeyCode::Char(' ') => {
+            // `-` and not Space, so the key that takes a column off the view
+            // is the same one in here as it is out there. In the table it can
+            // only hide, since there is nothing on screen to un-hide; in the
+            // list the state is in front of you, so it toggles.
+            KeyCode::Char('-') => {
                 if let Err(refusal) = picker.toggle_shown() {
                     self.message = Some(refusal);
                 }
@@ -4263,7 +4273,7 @@ mod tests {
         assert!(matches!(app.mode, AppMode::Picker));
 
         press(&mut app, 'j');
-        press(&mut app, ' '); // untick b
+        press(&mut app, '-'); // untick b
         press(&mut app, 'p'); // and pin it
         key(&mut app, KeyCode::Esc);
 
@@ -4280,7 +4290,7 @@ mod tests {
         let mut app = app_sized("pickapply.csv", FOURCOL, 60);
         press(&mut app, 'C');
         press(&mut app, 'j');
-        press(&mut app, ' '); // untick b
+        press(&mut app, '-'); // untick b
         key(&mut app, KeyCode::Enter);
 
         assert!(matches!(app.mode, AppMode::Normal));
@@ -4313,7 +4323,7 @@ mod tests {
         // Listed a c b d — the view's two, then the hidden ones.
         press(&mut app, 'j');
         press(&mut app, 'j'); // onto b
-        press(&mut app, ' ');
+        press(&mut app, '-');
         key(&mut app, KeyCode::Enter);
         assert_eq!(shown_columns(&app), ["a", "c", "b"]);
     }
@@ -4348,7 +4358,7 @@ mod tests {
         press(&mut app, 'j');
         press(&mut app, 'p'); // and b
         press(&mut app, 'j');
-        press(&mut app, ' '); // while also hiding c, so the view change is real
+        press(&mut app, '-'); // while also hiding c, so the view change is real
         key(&mut app, KeyCode::Enter);
 
         assert_eq!(shown_columns(&app), ["a", "b", "d"], "the view still applied");
@@ -4368,7 +4378,7 @@ mod tests {
         let mut app = app_sized("picklast.csv", FOURCOL, 60);
         command(&mut app, "select a");
         press(&mut app, 'C');
-        press(&mut app, ' ');
+        press(&mut app, '-');
         let refusal = app.message.clone().unwrap();
         assert!(refusal.contains("hide every column"), "{refusal}");
 
@@ -4385,9 +4395,28 @@ mod tests {
         press(&mut app, 'C');
         assert!(matches!(app.mode, AppMode::Picker));
         press(&mut app, 'j');
-        press(&mut app, ' ');
+        press(&mut app, '-');
         key(&mut app, KeyCode::Enter);
         assert_eq!(shown_columns(&app), ["a", "c", "d"]);
+    }
+
+    /// `q` closes a window everywhere else in vim, and a window is a view —
+    /// closing one never destroys work. The picker holds changes that are not
+    /// applied yet, so it cannot close harmlessly, and it does not borrow the
+    /// letter for something that would throw them away.
+    #[test]
+    fn q_is_not_a_picker_key() {
+        let mut app = app_sized("pickq.csv", FOURCOL, 60);
+        press(&mut app, 'C');
+        press(&mut app, 'j');
+        press(&mut app, '-'); // untick b
+
+        press(&mut app, 'q');
+        assert!(matches!(app.mode, AppMode::Picker), "still open");
+        assert!(!app.exit, "and it is not the app's q either");
+
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(shown_columns(&app), ["a", "c", "d"], "the tick survived it");
     }
 
     /// The picker's keys are the least guessable in plv, and the status bar
@@ -4401,7 +4430,7 @@ mod tests {
         let sections = app.help_sections();
         assert_eq!(sections.len(), 1, "just the picker's own keys");
         let keys: Vec<&str> = sections[0].1.iter().map(|(key, _)| *key).collect();
-        assert!(keys.contains(&"Space") && keys.contains(&"p"), "{keys:?}");
+        assert!(keys.contains(&"-") && keys.contains(&"p"), "{keys:?}");
     }
 
     /// `-` is `:hide <name>` without the typing, so it goes through the same
