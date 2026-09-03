@@ -18,6 +18,7 @@ use crate::complete::{self, Completion};
 use crate::data::Store;
 use crate::data::lake_db::{self, LakeDb};
 use crate::lake::{Lake, Level, Scope};
+use crate::picker::Picker;
 use crate::search::{SearchQuery, SearchState, SearchStatus};
 use crate::ui::{
     self, Browser, CellView, DataTable, Help, Panel, Prompt, Section, SelectionMode, StatusBar,
@@ -34,6 +35,9 @@ enum AppMode {
     Edit,
     /// Typing an ex command after `:`.
     Command,
+    /// The column picker is up. It holds a working copy of what it edits, so
+    /// the table underneath is untouched until `Enter`.
+    Picker,
 }
 
 /// A rectangle of cells, as inclusive `(row range, column range)` in absolute
@@ -193,6 +197,8 @@ pub struct App {
     /// a fact about this screen. `u` is the edit buffer's undo and does not
     /// take a pin back; `zp` again does, and `z|` takes them all back.
     pinned: std::collections::BTreeSet<usize>,
+    /// The column picker, while it is up.
+    picker: Option<Picker>,
 }
 
 impl App {
@@ -236,6 +242,7 @@ impl App {
             cell_view: false,
             widths: ui::Widths::new(),
             pinned: std::collections::BTreeSet::new(),
+            picker: None,
         }
     }
 
@@ -350,6 +357,16 @@ impl App {
         ])
         .areas(area);
 
+        // Done here, while `self` is still free to be borrowed mutably: the
+        // render below only reads.
+        if let Some(picker) = &mut self.picker {
+            let len = picker.len();
+            picker.state.go_to(picker.state.selected, len);
+            picker
+                .state
+                .clamp_scroll(Browser::viewport_rows(table_area.height));
+        }
+
         let file_name = self
             .lake
             .as_ref()
@@ -380,28 +397,47 @@ impl App {
             let edited = store.edited_cells();
             let sort_display = store.sort_display();
 
-            frame.render_widget(
-                DataTable {
-                    df: &store.current_view,
-                    col_offset,
-                    cursor_col,
-                    row_offset: store.row_offset,
-                    cursor_row,
-                    selection_mode: self.selection_mode,
-                    theme: &self.theme,
-                    search: self.search_state.as_ref(),
-                    search_col: self.search_state.as_ref().and_then(|s| s.col_idx),
-                    last_vis_col_out: &vis_col_cell,
-                    sort: &sort_display,
-                    sort_tick: self.sort_rx.as_ref().map(|_| self.spinner_tick),
-                    edited: &edited,
-                    selection: self.visual_range(),
-                    relative_rows: self.relative_rows,
-                    widths: &self.widths,
-                    pinned: &self.display_pins(),
-                },
-                table_area,
-            );
+            // The picker takes the table's place rather than covering it:
+            // the status bar below stays put, so a refusal it makes is
+            // reported where every other refusal is.
+            if let Some(picker) = &self.picker {
+                let rows = picker.rows();
+                frame.render_widget(
+                    Browser {
+                        title: picker.title(),
+                        headers: Picker::headers(),
+                        widths: Picker::widths(),
+                        rows: &rows,
+                        selected: picker.state.selected,
+                        offset: picker.state.offset,
+                        theme: &self.theme,
+                    },
+                    table_area,
+                );
+            } else {
+                frame.render_widget(
+                    DataTable {
+                        df: &store.current_view,
+                        col_offset,
+                        cursor_col,
+                        row_offset: store.row_offset,
+                        cursor_row,
+                        selection_mode: self.selection_mode,
+                        theme: &self.theme,
+                        search: self.search_state.as_ref(),
+                        search_col: self.search_state.as_ref().and_then(|s| s.col_idx),
+                        last_vis_col_out: &vis_col_cell,
+                        sort: &sort_display,
+                        sort_tick: self.sort_rx.as_ref().map(|_| self.spinner_tick),
+                        edited: &edited,
+                        selection: self.visual_range(),
+                        relative_rows: self.relative_rows,
+                        widths: &self.widths,
+                        pinned: &self.display_pins(),
+                    },
+                    table_area,
+                );
+            }
 
             match self.mode {
                 AppMode::Search => {
@@ -453,7 +489,7 @@ impl App {
                         status_area,
                     );
                 }
-                AppMode::Normal => {
+                AppMode::Normal | AppMode::Picker => {
                     let search_info = self.search_state.as_ref().map(|s| {
                         let (cur, total, complete) = s.match_info();
                         (s.query.raw.clone(), cur, total, complete)
@@ -484,7 +520,9 @@ impl App {
                             spinner_tick: self.spinner_tick,
                             sort_tick: self.sort_rx.as_ref().map(|_| self.spinner_tick),
                             filtering: store.filtering(),
-                            help: if self.lake.is_some() {
+                            help: if self.picker.is_some() {
+                                " space:show  p:pin  ⏎:apply  esc:cancel "
+                            } else if self.lake.is_some() {
                                 " f:partitions  T:snapshots  b:back  ?:help "
                             } else {
                                 " j/k:↕  h/l:←→  /:search  ?:help  q:quit "
@@ -573,6 +611,7 @@ impl App {
             ("Tab", "Cycle row \u{2192} column \u{2192} cell"),
             ("s", "Sort by cursor column"),
             ("-", "Hide the cursor column (:reset select brings it back)"),
+            ("C", "The column picker: show, hide and pin from a list"),
             ("zp", "Pin / unpin the cursor column at the left edge"),
             ("z|", "Unpin every column"),
         ];
@@ -657,9 +696,27 @@ impl App {
             ("Views", VIEWS),
             ("General", GENERAL),
         ];
+        const PICK: &[(&str, &str)] = &[
+            ("j / k", "Move down the list"),
+            ("g / G", "First / last column"),
+            ("Ctrl+d / Ctrl+u", "Half page down / up"),
+            ("Space", "Show or hide this column"),
+            ("p", "Pin or unpin this column"),
+            ("Enter", "Apply"),
+            ("Esc / q", "Cancel, changing nothing"),
+        ];
         const BROWSER: &[Section<'static>] = &[("Catalog", BROWSE), ("General", GENERAL)];
+        // No `General` section: its `q` means quit, and in the picker `q`
+        // cancels — one overlay must not say both. The picker's own list
+        // already covers every key it answers.
+        const PICKER: &[Section<'static>] = &[("Columns", PICK)];
 
-        if self.screen == Screen::Browser {
+        // The status bar has room for a few hints and then degrades, so for a
+        // modal screen whose keys are not guessable the overlay is the real
+        // reference — which is the reason it exists.
+        if self.picker.is_some() {
+            PICKER
+        } else if self.screen == Screen::Browser {
             BROWSER
         } else if self.lake.is_some() {
             VIEWER_LAKE
@@ -1097,9 +1154,12 @@ impl App {
             self.help_visible = false;
             return Ok(());
         }
-        // Only in Normal mode: '?' is an ordinary character to type into a
-        // search pattern, a cell or a command.
-        if key.code == KeyCode::Char('?') && matches!(self.mode, AppMode::Normal) {
+        // Only in the modes that are not taking text: '?' is an ordinary
+        // character to type into a search pattern, a cell or a command. The
+        // picker takes single keys, not text, so it can spare this one — and
+        // needs to, since its keys are the ones least likely to be guessed.
+        if key.code == KeyCode::Char('?') && matches!(self.mode, AppMode::Normal | AppMode::Picker)
+        {
             self.help_visible = true;
             return Ok(());
         }
@@ -1110,6 +1170,7 @@ impl App {
             AppMode::Search => self.handle_search_key(key),
             AppMode::Edit => self.handle_edit_key(key),
             AppMode::Command => self.handle_command_key(key),
+            AppMode::Picker => self.handle_picker_key(key),
             AppMode::Normal => self.handle_normal_key(key),
         }
     }
@@ -1260,6 +1321,14 @@ impl App {
 
             // Sort by cursor column (Column/Cell mode only). Toggles asc ↔ desc;
             // pressing s on a new column adds it as the next priority sort key.
+            // The picker needs no column cursor — it is a list of every
+            // column, not an operation on the one under the cursor — so
+            // unlike `-` it works in row mode too.
+            KeyCode::Char('C') => {
+                self.pending_num.clear();
+                self.open_picker();
+            }
+
             // Hide the cursor column. Gated to the cursor modes as `s` is:
             // row mode has no column cursor, and hiding whichever column
             // happens to be leftmost is not what the key means.
@@ -2460,6 +2529,130 @@ impl App {
         }
     }
 
+    // ── the column picker ─────────────────────────────────────────────────
+
+    /// `C`: open the list of every column, ticked for shown and pinned.
+    fn open_picker(&mut self) {
+        let Some(store) = &self.store else {
+            return;
+        };
+        let names: Vec<String> = store
+            .schema
+            .iter_names()
+            .map(|name| name.to_string())
+            .collect();
+        let order = store.view.columns(names.len());
+        self.picker = Some(Picker::new(names, order, self.pinned.clone()));
+        self.mode = AppMode::Picker;
+    }
+
+    fn close_picker(&mut self) {
+        self.picker = None;
+        self.mode = AppMode::Normal;
+    }
+
+    fn handle_picker_key(&mut self, key: KeyEvent) -> anyhow::Result<()> {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        // Read before the picker is borrowed: a half page is a fact about the
+        // screen, which the picker does not know.
+        let half = self.last_vp as isize / 2;
+        let Some(picker) = &mut self.picker else {
+            self.mode = AppMode::Normal;
+            return Ok(());
+        };
+        let len = picker.len();
+
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.close_picker(),
+            KeyCode::Enter => return self.apply_picker(),
+            KeyCode::Char('j') | KeyCode::Down => picker.state.move_by(1, len),
+            KeyCode::Char('k') | KeyCode::Up => picker.state.move_by(-1, len),
+            KeyCode::Char('d') if ctrl => picker.state.move_by(half, len),
+            KeyCode::Char('u') if ctrl => picker.state.move_by(-half, len),
+            KeyCode::Char('g') | KeyCode::Home => picker.state.go_to(0, len),
+            KeyCode::Char('G') | KeyCode::End => picker.state.go_to(len.saturating_sub(1), len),
+            KeyCode::Char(' ') => {
+                if let Err(refusal) = picker.toggle_shown() {
+                    self.message = Some(refusal);
+                }
+            }
+            KeyCode::Char('p') => picker.toggle_pinned(),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// `Enter`: adopt what the picker holds.
+    ///
+    /// The selection goes through `apply_view_command` like every other way of
+    /// narrowing the view, so the picker is a way of *writing* a `:select`
+    /// rather than a second mechanism that decides what shows.
+    fn apply_picker(&mut self) -> anyhow::Result<()> {
+        let Some(picker) = self.picker.take() else {
+            self.mode = AppMode::Normal;
+            return Ok(());
+        };
+        self.mode = AppMode::Normal;
+
+        let select = picker.selection();
+        if select.is_empty() {
+            // `toggle_shown` will not let it get here, and `View::apply` would
+            // refuse it as well. Belt and braces, because the alternative is a
+            // view with nothing in it.
+            self.message = Some("that would hide every column".to_string());
+            return Ok(());
+        }
+        self.apply_view_command(view::Command::Select(select))?;
+        self.adopt_pins(picker.pins());
+        Ok(())
+    }
+
+    /// Take the picker's pins, dropping any the screen has no room for.
+    ///
+    /// Trimmed rather than refused whole. The view change is what the user
+    /// came for, and giving it up over a pin that does not fit would be
+    /// abandoning the wrong half — so it keeps what fits and says what it
+    /// could not take, the way a filter that fills its row set keeps what it
+    /// has and reads `(first n)` rather than looking like the whole answer.
+    ///
+    /// Dropped from the right, because a pin is usually set on something that
+    /// belongs at the left edge, and the leftmost is the one most likely meant.
+    fn adopt_pins(&mut self, wanted: std::collections::BTreeSet<usize>) {
+        self.pinned = wanted;
+        let mut dropped = 0;
+        while !self.pins_fit() {
+            let Some(&rightmost) = self.display_pins().iter().next_back() else {
+                break;
+            };
+            let Some(source) = self
+                .store
+                .as_ref()
+                .and_then(|store| store.source_column(rightmost))
+            else {
+                break;
+            };
+            self.pinned.remove(&source);
+            dropped += 1;
+        }
+        if dropped > 0 {
+            self.message = Some(format!("no room for {dropped} of the pins"));
+        }
+    }
+
+    /// Whether what is pinned still leaves room to scroll in.
+    fn pins_fit(&self) -> bool {
+        match &self.store {
+            Some(store) => ui::pin_fits(
+                &store.current_view,
+                store.row_offset,
+                self.last_frame_width,
+                &self.widths,
+                &self.display_pins(),
+            ),
+            None => true,
+        }
+    }
+
     /// `-`: take the cursor column off the view.
     ///
     /// Sugar for typing `:hide <name>`, and deliberately nothing more: it
@@ -2583,21 +2776,9 @@ impl App {
         // predicting before means the check sees the block that would actually
         // be drawn, widths set by hand and all.
         self.pinned.insert(source);
-        let fits = match &self.store {
-            Some(store) => ui::pin_fits(
-                &store.current_view,
-                store.row_offset,
-                self.last_frame_width,
-                &self.widths,
-                &self.display_pins(),
-            ),
-            None => true,
-        };
-        if !fits {
+        if !self.pins_fit() {
             self.pinned.remove(&source);
-            self.message = Some(
-                "no room to pin: unpin one, or narrow one with z<".into(),
-            );
+            self.message = Some("no room to pin: unpin one, or narrow one with z<".into());
         }
         Ok(())
     }
@@ -4074,6 +4255,155 @@ mod tests {
         assert!(message.contains("too many"), "{message}");
     }
 
+    /// The picker holds a working copy, so leaving it costs nothing.
+    #[test]
+    fn escape_leaves_the_picker_changing_nothing() {
+        let mut app = app_sized("pick.csv", FOURCOL, 60);
+        press(&mut app, 'C');
+        assert!(matches!(app.mode, AppMode::Picker));
+
+        press(&mut app, 'j');
+        press(&mut app, ' '); // untick b
+        press(&mut app, 'p'); // and pin it
+        key(&mut app, KeyCode::Esc);
+
+        assert!(matches!(app.mode, AppMode::Normal));
+        assert!(app.picker.is_none());
+        assert_eq!(shown_columns(&app), ["a", "b", "c", "d"], "untouched");
+        assert!(app.pinned.is_empty(), "and the pin never happened");
+    }
+
+    /// Enter writes a `:select`, so the picker is a way of *typing* one rather
+    /// than a second thing that decides what shows.
+    #[test]
+    fn the_picker_applies_its_selection_as_a_select() {
+        let mut app = app_sized("pickapply.csv", FOURCOL, 60);
+        press(&mut app, 'C');
+        press(&mut app, 'j');
+        press(&mut app, ' '); // untick b
+        key(&mut app, KeyCode::Enter);
+
+        assert!(matches!(app.mode, AppMode::Normal));
+        assert_eq!(shown_columns(&app), ["a", "c", "d"]);
+        // It went through the view, so the view describes it and reset undoes it.
+        command(&mut app, "reset select");
+        assert_eq!(shown_columns(&app), ["a", "b", "c", "d"]);
+    }
+
+    /// A reordering `:select` has to survive a round trip: a picker that
+    /// quietly discards the order would be worse than no picker.
+    #[test]
+    fn opening_and_applying_the_picker_preserves_the_view_order() {
+        let mut app = app_sized("pickorder.csv", FOURCOL, 60);
+        command(&mut app, "select c a");
+        assert_eq!(shown_columns(&app), ["c", "a"]);
+
+        press(&mut app, 'C');
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(shown_columns(&app), ["c", "a"], "unchanged");
+    }
+
+    /// A column ticked back on lands where it is listed, which is where the
+    /// user was looking when they ticked it.
+    #[test]
+    fn a_column_ticked_back_on_lands_where_it_was_listed() {
+        let mut app = app_sized("pickback.csv", FOURCOL, 60);
+        command(&mut app, "select a c");
+        press(&mut app, 'C');
+        // Listed a c b d — the view's two, then the hidden ones.
+        press(&mut app, 'j');
+        press(&mut app, 'j'); // onto b
+        press(&mut app, ' ');
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(shown_columns(&app), ["a", "c", "b"]);
+    }
+
+    #[test]
+    fn the_picker_carries_pins_in_and_back_out() {
+        let mut app = app_sized("pickpin.csv", FOURCOL, 60);
+        key(&mut app, KeyCode::Tab);
+        press(&mut app, 'z');
+        press(&mut app, 'p'); // pin a the ordinary way
+
+        press(&mut app, 'C');
+        press(&mut app, 'j');
+        press(&mut app, 'p'); // and b from the list
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.pinned.iter().copied().collect::<Vec<_>>(), [0, 1]);
+
+        // Unpinning from the list works the same way round.
+        press(&mut app, 'C');
+        press(&mut app, 'p');
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.pinned.iter().copied().collect::<Vec<_>>(), [1]);
+    }
+
+    /// The view change is what the user came for, so pins that do not fit are
+    /// trimmed and named rather than taking the whole apply down with them.
+    #[test]
+    fn pins_that_do_not_fit_are_trimmed_not_refused() {
+        let mut app = app_sized("picktrim.csv", FOURCOL, 24);
+        press(&mut app, 'C');
+        press(&mut app, 'p'); // pin a
+        press(&mut app, 'j');
+        press(&mut app, 'p'); // and b
+        press(&mut app, 'j');
+        press(&mut app, ' '); // while also hiding c, so the view change is real
+        key(&mut app, KeyCode::Enter);
+
+        assert_eq!(shown_columns(&app), ["a", "b", "d"], "the view still applied");
+        assert!(
+            app.pinned.len() < 2,
+            "and the pins were trimmed to what fits: {:?}",
+            app.pinned
+        );
+        let said = app.message.clone().unwrap();
+        assert!(said.contains("no room for"), "{said}");
+    }
+
+    /// Unticking the last column is stopped where it is pressed, rather than
+    /// on Enter after a whole session of ticking.
+    #[test]
+    fn the_picker_refuses_to_untick_the_last_column() {
+        let mut app = app_sized("picklast.csv", FOURCOL, 60);
+        command(&mut app, "select a");
+        press(&mut app, 'C');
+        press(&mut app, ' ');
+        let refusal = app.message.clone().unwrap();
+        assert!(refusal.contains("hide every column"), "{refusal}");
+
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(shown_columns(&app), ["a"]);
+    }
+
+    /// Unlike `-`, the picker is a list of every column rather than an
+    /// operation on the one under the cursor, so it needs no column cursor.
+    #[test]
+    fn the_picker_opens_in_row_mode() {
+        let mut app = app_sized("pickrow.csv", FOURCOL, 60);
+        assert_eq!(app.selection_mode, SelectionMode::Row);
+        press(&mut app, 'C');
+        assert!(matches!(app.mode, AppMode::Picker));
+        press(&mut app, 'j');
+        press(&mut app, ' ');
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(shown_columns(&app), ["a", "c", "d"]);
+    }
+
+    /// The picker's keys are the least guessable in plv, and the status bar
+    /// drops its hints on a narrow terminal, so `?` has to reach them.
+    #[test]
+    fn the_help_overlay_follows_the_picker() {
+        let mut app = app_sized("pickhelp.csv", FOURCOL, 60);
+        press(&mut app, 'C');
+        press(&mut app, '?');
+        assert!(app.help_visible);
+        let sections = app.help_sections();
+        assert_eq!(sections.len(), 1, "just the picker's own keys");
+        let keys: Vec<&str> = sections[0].1.iter().map(|(key, _)| *key).collect();
+        assert!(keys.contains(&"Space") && keys.contains(&"p"), "{keys:?}");
+    }
+
     /// `-` is `:hide <name>` without the typing, so it goes through the same
     /// slot and shows up in the same place.
     #[test]
@@ -4226,7 +4556,11 @@ mod tests {
 
         command(&mut app, "select c a");
         assert_eq!(shown_columns(&app), ["c", "a"]);
-        assert_eq!(app.pinned.iter().copied().collect::<Vec<_>>(), [0], "still `a`");
+        assert_eq!(
+            app.pinned.iter().copied().collect::<Vec<_>>(),
+            [0],
+            "still `a`"
+        );
         assert_eq!(
             app.display_pins().iter().copied().collect::<Vec<_>>(),
             [1],

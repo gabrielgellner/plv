@@ -406,9 +406,7 @@ impl Widget for DataTable<'_> {
                 // into what is left rather than overflowing, because the space
                 // an overflow takes comes out of the pinned columns, undoing
                 // the one thing they were set to do.
-                w = inner_w
-                    .saturating_sub(consumed + sp)
-                    .max(MIN_COL_WIDTH);
+                w = inner_w.saturating_sub(consumed + sp).max(MIN_COL_WIDTH);
             }
             vis_cols.push(i);
             vis_widths.push(w);
@@ -1035,7 +1033,13 @@ mod tests {
     fn a_pinned_block_that_fills_the_screen_does_not_fit() {
         let df = pin_df();
         assert!(pin_fits(&df, 0, 40, &Widths::new(), &Pinned::new()));
-        assert!(pin_fits(&df, 0, 40, &Widths::new(), &[0].into_iter().collect()));
+        assert!(pin_fits(
+            &df,
+            0,
+            40,
+            &Widths::new(),
+            &[0].into_iter().collect()
+        ));
         assert!(!pin_fits(&df, 0, 40, &Widths::new(), &(0..6).collect()));
     }
 
