@@ -81,6 +81,16 @@ Undo history is a stack of **transactions**, not single cells, so one fill over
 a visual selection is one `u`. `Overlay::clear()` drops the history with the
 edits: undoing past a write would resurrect changes the user believes they saved.
 
+**Rows are added with ids past the end of the file.** `o` and `O` note a row in
+the overlay before some source row, and its cells live under an id numbered past
+`total_rows` — so `(row, column)` keys, the overlay stamping and `Store::edit`
+all work on a new row unchanged, and the two can never be confused. A page
+leaves a blank row where one was added and the overlay fills it in. On write the
+new rows go in ahead of the row they precede, with a field per column and the
+file's own line ending. Deleting an added row takes it back out of the buffer
+rather than striking it — there is no record in the file to drop, and the write
+would be refused.
+
 **Rows are struck, not removed.** `dd` and a visual `d` note a source row in
 the overlay's struck set; nothing leaves the file until `:w`, so `u` puts it
 back and the buffer stays proportional to what was changed rather than to the

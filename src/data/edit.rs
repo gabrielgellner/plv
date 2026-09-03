@@ -28,6 +28,9 @@ enum Undoable {
     Cell(Cell, Option<String>),
     /// Whether the row was already struck out before.
     Struck(usize, bool),
+    /// A row added before source row `before`, at this place among the rows
+    /// already there, with this id.
+    Added { before: usize, at: usize, id: usize },
 }
 
 type Change = Vec<Undoable>;
@@ -46,6 +49,15 @@ pub struct Overlay {
     /// Sorted, because every reader wants to ask how many come before a
     /// given row.
     struck: BTreeSet<usize>,
+    /// Rows added, keyed by the source row they go *before*, in the order
+    /// they should appear there. The values are ids, not contents: a new row's
+    /// cells live in `rows` like any other row's, under an id past the end of
+    /// the file, so everything that already reads or writes a cell works on
+    /// them unchanged.
+    added: BTreeMap<usize, Vec<usize>>,
+    /// Ids handed out so far. Never reused, so an undone row that is redone
+    /// cannot collide with one added in between.
+    issued: usize,
     len: usize,
     undo: Vec<Change>,
     redo: Vec<Change>,
@@ -62,13 +74,13 @@ impl Overlay {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.len == 0 && self.struck.is_empty()
+        self.len == 0 && self.struck.is_empty() && self.added.is_empty()
     }
 
     /// Everything pending, cells and struck rows together — what `[+n]` counts
     /// and what makes quitting ask first.
     pub fn pending(&self) -> usize {
-        self.len + self.struck.len()
+        self.len + self.struck.len() + self.added_count()
     }
 
     pub fn get(&self, (row, col): Cell) -> Option<&str> {
@@ -99,15 +111,44 @@ impl Overlay {
         self.redo.clear();
     }
 
-    /// Strike out rows, so the write leaves them out. One undoable step.
-    pub fn strike<I: IntoIterator<Item = usize>>(&mut self, rows: I) {
-        let change: Change = rows
-            .into_iter()
-            .map(|row| {
+    /// Delete rows: strike out the file's, take back the added ones.
+    ///
+    /// One undoable step covering both, since a `dd` over a run of rows
+    /// should not care which of them were in the file. `beyond` is the file's
+    /// row count, which is what tells the two apart.
+    ///
+    /// An added row is not in the file to strike out, so deleting it means
+    /// taking it back out of the buffer — and its cells with it, or the write
+    /// would find values with no row to put them in.
+    pub fn delete<I: IntoIterator<Item = usize>>(&mut self, rows: I, beyond: usize) {
+        let mut change = Change::new();
+        for row in rows {
+            if row < beyond {
                 let was = !self.struck.insert(row);
-                Undoable::Struck(row, was)
-            })
-            .collect();
+                change.push(Undoable::Struck(row, was));
+                continue;
+            }
+            let Some((before, at)) = self.locate(row) else {
+                continue;
+            };
+            if let Some(cells) = self.rows.remove(&row) {
+                self.len -= cells.len();
+                for (col, value) in cells {
+                    change.push(Undoable::Cell((row, col), Some(value)));
+                }
+            }
+            if let Some(ids) = self.added.get_mut(&before) {
+                ids.retain(|&other| other != row);
+                if ids.is_empty() {
+                    self.added.remove(&before);
+                }
+            }
+            change.push(Undoable::Added {
+                before,
+                at,
+                id: row,
+            });
+        }
         if change.is_empty() {
             return;
         }
@@ -131,8 +172,59 @@ impl Overlay {
         self.struck.range(..row).count()
     }
 
+    /// Struck rows in `range`.
+    pub fn struck_in(&self, range: std::ops::Range<usize>) -> usize {
+        self.struck.range(range).count()
+    }
+
     pub fn struck_count(&self) -> usize {
         self.struck.len()
+    }
+
+    /// Add an empty row before source row `before`, and return its id.
+    ///
+    /// `beyond` is the file's row count: ids start past it, so a new row can
+    /// never be mistaken for one that is in the file.
+    pub fn add_row(&mut self, before: usize, at: usize, beyond: usize) -> usize {
+        let id = beyond + self.issued;
+        self.issued += 1;
+        let group = self.added.entry(before).or_default();
+        let at = at.min(group.len());
+        group.insert(at, id);
+        self.undo.push(vec![Undoable::Added { before, at, id }]);
+        self.redo.clear();
+        id
+    }
+
+    /// Where an added row sits: which source row it precedes, and its place
+    /// among the rows added there.
+    pub fn locate(&self, id: usize) -> Option<(usize, usize)> {
+        self.added.iter().find_map(|(&before, ids)| {
+            ids.iter()
+                .position(|&other| other == id)
+                .map(|at| (before, at))
+        })
+    }
+
+    /// Rows added, by the source row they precede, in file order.
+    pub fn added(&self) -> impl Iterator<Item = (usize, &[usize])> {
+        self.added
+            .iter()
+            .map(|(&before, ids)| (before, ids.as_slice()))
+    }
+
+    /// Rows added before source row `before`.
+    pub fn added_at(&self, before: usize) -> &[usize] {
+        self.added.get(&before).map_or(&[], Vec::as_slice)
+    }
+
+    pub fn added_count(&self) -> usize {
+        self.added.values().map(Vec::len).sum()
+    }
+
+    /// How many added rows come at or before source row `row`.
+    pub fn added_before(&self, row: usize) -> usize {
+        self.added.range(..=row).map(|(_, ids)| ids.len()).sum()
     }
 
     pub fn can_undo(&self) -> bool {
@@ -169,6 +261,7 @@ impl Overlay {
     pub fn clear(&mut self) {
         self.rows.clear();
         self.struck.clear();
+        self.added.clear();
         self.len = 0;
         self.undo.clear();
         self.redo.clear();
@@ -186,6 +279,25 @@ impl Overlay {
                         None => self.remove(cell),
                     };
                     Undoable::Cell(cell, current)
+                }
+                Undoable::Added { before, at, id } => {
+                    // Undoing an addition takes the row out; redoing puts it
+                    // back where it was rather than at the end, or a row added
+                    // between two others would come back somewhere else.
+                    let present = self.added.get(&before).is_some_and(|ids| ids.contains(&id));
+                    if present {
+                        if let Some(ids) = self.added.get_mut(&before) {
+                            ids.retain(|&other| other != id);
+                            if ids.is_empty() {
+                                self.added.remove(&before);
+                            }
+                        }
+                    } else {
+                        let group = self.added.entry(before).or_default();
+                        let at = at.min(group.len());
+                        group.insert(at, id);
+                    }
+                    Undoable::Added { before, at, id }
                 }
                 Undoable::Struck(row, was) => {
                     let now = self.struck.contains(&row);
@@ -314,7 +426,7 @@ mod tests {
     #[test]
     fn striking_rows_is_one_undoable_step() {
         let mut o = Overlay::new();
-        o.strike([2, 5, 9]);
+        o.delete([2, 5, 9], usize::MAX);
         assert_eq!(o.struck_count(), 3);
         assert!(o.is_struck(5));
         assert!(!o.is_struck(4));
@@ -329,8 +441,8 @@ mod tests {
     #[test]
     fn striking_a_row_twice_does_not_double_count_or_undo_wrongly() {
         let mut o = Overlay::new();
-        o.strike([3]);
-        o.strike([3]);
+        o.delete([3], usize::MAX);
+        o.delete([3], usize::MAX);
         assert_eq!(o.struck_count(), 1);
 
         o.undo();
@@ -342,7 +454,7 @@ mod tests {
     #[test]
     fn struck_before_is_what_turns_a_position_back_into_a_row() {
         let mut o = Overlay::new();
-        o.strike([1, 4, 5]);
+        o.delete([1, 4, 5], usize::MAX);
         assert_eq!(o.struck_before(0), 0);
         assert_eq!(o.struck_before(1), 0, "the row itself does not count");
         assert_eq!(o.struck_before(2), 1);
@@ -354,7 +466,7 @@ mod tests {
     fn struck_rows_and_edited_cells_share_the_history() {
         let mut o = Overlay::new();
         set1(&mut o, (0, 0), "x");
-        o.strike([7]);
+        o.delete([7], usize::MAX);
         assert_eq!(o.pending(), 2, "one cell and one row");
         assert!(!o.is_empty());
 
@@ -363,6 +475,100 @@ mod tests {
         assert_eq!(o.get((0, 0)), Some("x"), "the cell edit is untouched");
         o.undo();
         assert!(o.is_empty());
+    }
+
+    #[test]
+    fn an_added_row_gets_an_id_past_the_end_of_the_file() {
+        let mut o = Overlay::new();
+        // A file of 3 rows: added rows are 3, 4, … so nothing collides with a
+        // row that is actually in it.
+        let first = o.add_row(1, usize::MAX, 3);
+        let second = o.add_row(1, usize::MAX, 3);
+        assert_eq!((first, second), (3, 4));
+        assert_eq!(o.added_at(1), [3, 4], "in the order they were added");
+        assert_eq!(o.added_count(), 2);
+        assert_eq!(o.pending(), 2);
+    }
+
+    #[test]
+    fn an_added_row_holds_its_cells_like_any_other() {
+        let mut o = Overlay::new();
+        let id = o.add_row(0, usize::MAX, 3);
+        o.set([((id, 1), "typed".to_string())]);
+        assert_eq!(o.get((id, 1)), Some("typed"));
+        assert!(o.row(id).is_some(), "the renderer finds it the usual way");
+    }
+
+    #[test]
+    fn adding_a_row_undoes_and_redoes() {
+        let mut o = Overlay::new();
+        let id = o.add_row(2, usize::MAX, 3);
+        assert!(o.undo());
+        assert_eq!(o.added_count(), 0);
+        assert!(o.redo());
+        assert_eq!(o.added_at(2), [id], "back where it was");
+    }
+
+    #[test]
+    fn an_undone_row_does_not_hand_its_id_to_the_next_one() {
+        let mut o = Overlay::new();
+        let first = o.add_row(0, usize::MAX, 3);
+        o.undo();
+        let second = o.add_row(0, usize::MAX, 3);
+        assert_ne!(first, second, "ids are never reused");
+    }
+
+    #[test]
+    fn added_before_counts_what_comes_at_or_above_a_row() {
+        let mut o = Overlay::new();
+        o.add_row(0, usize::MAX, 10);
+        o.add_row(4, usize::MAX, 10);
+        o.add_row(4, usize::MAX, 10);
+        assert_eq!(o.added_before(0), 1);
+        assert_eq!(o.added_before(3), 1);
+        assert_eq!(o.added_before(4), 3);
+        assert_eq!(o.added_before(99), 3);
+    }
+
+    #[test]
+    fn deleting_an_added_row_takes_it_back_rather_than_striking_it() {
+        // Striking it would leave the writer looking for a record to drop
+        // that was never in the file, and the write would be refused.
+        let mut o = Overlay::new();
+        let id = o.add_row(1, 0, 3);
+        o.set([((id, 0), "typed".to_string())]);
+        assert_eq!(o.pending(), 2);
+
+        o.delete([id], 3);
+        assert_eq!(o.added_count(), 0, "taken back out");
+        assert_eq!(o.struck_count(), 0, "and not struck");
+        assert_eq!(o.get((id, 0)), None, "its cells went with it");
+        assert!(o.is_empty());
+    }
+
+    #[test]
+    fn taking_back_an_added_row_undoes_with_its_cells() {
+        let mut o = Overlay::new();
+        let id = o.add_row(1, 0, 3);
+        o.set([((id, 0), "typed".to_string())]);
+        o.delete([id], 3);
+
+        assert!(o.undo());
+        assert_eq!(o.added_at(1), [id], "the row is back");
+        assert_eq!(o.get((id, 0)), Some("typed"), "and so is what was in it");
+    }
+
+    #[test]
+    fn one_delete_can_span_rows_of_the_file_and_added_ones() {
+        let mut o = Overlay::new();
+        let id = o.add_row(1, 0, 3);
+        o.delete([0, id, 1], 3);
+        assert_eq!(o.struck_count(), 2, "the file's rows are struck");
+        assert_eq!(o.added_count(), 0, "the added one is taken back");
+
+        assert!(o.undo(), "and all of it undoes together");
+        assert_eq!(o.struck_count(), 0);
+        assert_eq!(o.added_count(), 1);
     }
 
     #[test]

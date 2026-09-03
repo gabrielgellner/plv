@@ -130,7 +130,7 @@ pub fn splice<R: BufRead, W: Write>(
         }
         src.consume(read);
     }
-    let (rows, applied, dropped) = splicer.finish()?;
+    let (rows, applied, dropped, added) = splicer.finish()?;
 
     if rows != expected_rows {
         bail!(
@@ -144,6 +144,13 @@ pub fn splice<R: BufRead, W: Write>(
              (a row with fewer fields than the header)",
             overlay.len() - applied,
             overlay.len()
+        );
+    }
+    if added != overlay.added_count() {
+        bail!(
+            "refusing to write: {} of {} added rows had nowhere to go",
+            overlay.added_count() - added,
+            overlay.added_count()
         );
     }
     if dropped != overlay.struck_count() {
@@ -194,6 +201,12 @@ struct Splicer<'a, W: Write> {
     dropping: bool,
     /// Records dropped, checked against the overlay at the end.
     dropped: usize,
+    /// Rows added, likewise.
+    added: usize,
+    /// Fields a new row must have, so it lines up with the header.
+    columns: usize,
+    /// The line ending the file already uses, so added rows match it.
+    newline: &'static [u8],
 }
 
 impl<'a, W: Write> Splicer<'a, W> {
@@ -214,6 +227,9 @@ impl<'a, W: Write> Splicer<'a, W> {
             applied: 0,
             dropping: false,
             dropped: 0,
+            added: 0,
+            columns: 0,
+            newline: b"\n",
         }
     }
 
@@ -283,6 +299,10 @@ impl<'a, W: Write> Splicer<'a, W> {
             self.record_started = true;
             self.field = 0;
             self.field_started = false;
+            if self.record >= self.header_rows {
+                // Rows added before this one go in ahead of it.
+                self.write_added(self.record - self.header_rows)?;
+            }
             // Decided once per record: a struck row is written nowhere.
             self.dropping = self.record >= self.header_rows
                 && self.overlay.is_struck(self.record - self.header_rows);
@@ -311,6 +331,32 @@ impl<'a, W: Write> Splicer<'a, W> {
         Ok(())
     }
 
+    /// Write the rows added before source row `before`, if any.
+    ///
+    /// A new row is a row of the overlay like any other, so its cells come
+    /// from the same place an edit does — and the fields it never had typed
+    /// into come out empty, which is what an absent value is in this format.
+    fn write_added(&mut self, before: usize) -> Result<()> {
+        for &id in self.overlay.added_at(before) {
+            let cells = self.overlay.row(id);
+            for field in 0..self.columns {
+                if field > 0 {
+                    self.write_out(&[self.separator])?;
+                }
+                if let Some(value) = cells.and_then(|cells| cells.get(&field)) {
+                    let encoded = encode(value, self.separator);
+                    self.write_out(encoded.as_bytes())?;
+                    // Counted like any other cell written, so the tally at the
+                    // end covers a new row's contents too.
+                    self.applied += 1;
+                }
+            }
+            self.write_out(self.newline)?;
+            self.added += 1;
+        }
+        Ok(())
+    }
+
     fn end_field(&mut self) {
         self.field += 1;
         self.field_started = false;
@@ -320,8 +366,14 @@ impl<'a, W: Write> Splicer<'a, W> {
     /// Every line ending closes a record, blank lines included: Polars reads an
     /// empty line as a row of nulls rather than skipping it, and the row
     /// numbering here has to be the one the viewer is showing.
-    fn terminator(&mut self, eol: &[u8]) -> Result<()> {
+    fn terminator(&mut self, eol: &'static [u8]) -> Result<()> {
         self.begin_field()?;
+        if self.record == 0 {
+            // Learned from the header: how many fields a row has, and which
+            // line ending this file uses, so an added row matches both.
+            self.columns = self.field + 1;
+            self.newline = eol;
+        }
         self.end_field();
         self.record += 1;
         self.record_started = false;
@@ -333,8 +385,8 @@ impl<'a, W: Write> Splicer<'a, W> {
         self.raw(eol)
     }
 
-    /// Records seen, edits placed, and rows dropped.
-    fn finish(mut self) -> Result<(usize, usize, usize)> {
+    /// Records seen, edits placed, rows dropped and rows added.
+    fn finish(mut self) -> Result<(usize, usize, usize, usize)> {
         if self.pending_quote {
             self.emit(b"\"")?;
             self.in_quotes = false;
@@ -343,17 +395,29 @@ impl<'a, W: Write> Splicer<'a, W> {
             self.pending_cr = false;
             self.emit(b"\r")?;
         }
-        // A file whose last line has no terminator still ends a record.
-        if self.record_started {
+        // A file whose last line has no terminator still ends a record — and
+        // anything added after it needs one putting back first.
+        let unterminated = self.record_started;
+        if unterminated {
             self.begin_field()?;
             self.end_field();
             self.record += 1;
+        }
+
+        // Rows added after the last one in the file.
+        let rows = self.record.saturating_sub(self.header_rows);
+        if !self.overlay.added_at(rows).is_empty() {
+            if unterminated {
+                self.write_out(self.newline)?;
+            }
+            self.write_added(rows)?;
         }
         self.out.flush()?;
         Ok((
             self.record.saturating_sub(self.header_rows),
             self.applied,
             self.dropped,
+            self.added,
         ))
     }
 
@@ -542,7 +606,7 @@ mod tests {
     /// included.
     fn without(input: &str, struck: &[usize], rows: usize) -> String {
         let mut overlay = Overlay::new();
-        overlay.strike(struck.iter().copied());
+        overlay.delete(struck.iter().copied(), usize::MAX);
         let mut out = Vec::new();
         splice(input.as_bytes(), &mut out, b',', true, &overlay, rows).expect("splice failed");
         String::from_utf8(out).unwrap()
@@ -587,7 +651,7 @@ mod tests {
     fn a_row_can_be_edited_and_struck_in_the_same_write() {
         let mut overlay = Overlay::new();
         overlay.set([((0, 1), "99".to_string())]);
-        overlay.strike([1]);
+        overlay.delete([1], usize::MAX);
         let mut out = Vec::new();
         splice(
             "name,count\na,1\nb,2\nc,3\n".as_bytes(),
@@ -610,7 +674,7 @@ mod tests {
         // Contradictory, and the row wins: it is not in the file to edit.
         let mut overlay = Overlay::new();
         overlay.set([((1, 0), "zz".to_string())]);
-        overlay.strike([1]);
+        overlay.delete([1], usize::MAX);
         let mut out = Vec::new();
         splice(
             "name,count\na,1\nb,2\n".as_bytes(),
@@ -627,12 +691,121 @@ mod tests {
     #[test]
     fn a_deletion_that_finds_no_row_is_refused() {
         let mut overlay = Overlay::new();
-        overlay.strike([9]);
+        overlay.delete([9], usize::MAX);
         let mut out = Vec::new();
         let e = splice("a,b\n1,2\n".as_bytes(), &mut out, b',', true, &overlay, 1)
             .unwrap_err()
             .to_string();
         assert!(e.contains("deleted rows were not found"), "{e}");
+    }
+
+    /// Adding rows, spliced in at the row they were put before.
+    fn with_added(input: &str, at: &[(usize, &[(usize, &str)])], rows: usize) -> String {
+        let mut overlay = Overlay::new();
+        for &(before, cells) in at {
+            let id = overlay.add_row(before, usize::MAX, rows);
+            for &(field, value) in cells {
+                overlay.set([((id, field), value.to_string())]);
+            }
+        }
+        let mut out = Vec::new();
+        splice(input.as_bytes(), &mut out, b',', true, &overlay, rows).expect("splice failed");
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn an_added_row_goes_in_before_the_row_it_was_put_before() {
+        let input = "name,count\na,1\nb,2\n";
+        assert_eq!(
+            with_added(input, &[(1, &[(0, "new"), (1, "9")])], 2),
+            "name,count\na,1\nnew,9\nb,2\n"
+        );
+        assert_eq!(
+            with_added(input, &[(0, &[(0, "first")])], 2),
+            "name,count\nfirst,\na,1\nb,2\n",
+            "before the first row, and still under the header"
+        );
+    }
+
+    #[test]
+    fn a_row_added_past_the_last_one_lands_at_the_end() {
+        let input = "name,count\na,1\nb,2\n";
+        assert_eq!(
+            with_added(input, &[(2, &[(0, "last"), (1, "3")])], 2),
+            "name,count\na,1\nb,2\nlast,3\n"
+        );
+    }
+
+    #[test]
+    fn an_added_row_has_a_field_for_every_column() {
+        // Untyped fields come out empty, which is what an absent value is.
+        let input = "a,b,c\n1,2,3\n";
+        assert_eq!(
+            with_added(input, &[(1, &[(1, "only")])], 1),
+            "a,b,c\n1,2,3\n,only,\n"
+        );
+    }
+
+    #[test]
+    fn added_rows_keep_the_files_own_line_ending() {
+        let input = "a,b\r\n1,2\r\n";
+        assert_eq!(
+            with_added(input, &[(1, &[(0, "x"), (1, "y")])], 1),
+            "a,b\r\n1,2\r\nx,y\r\n"
+        );
+    }
+
+    #[test]
+    fn a_row_added_to_a_file_with_no_final_newline_gets_one_first() {
+        let input = "a,b\n1,2";
+        assert_eq!(
+            with_added(input, &[(1, &[(0, "x"), (1, "y")])], 1),
+            "a,b\n1,2\nx,y\n",
+            "or the added row would join the last one"
+        );
+    }
+
+    #[test]
+    fn several_rows_added_at_one_place_keep_their_order() {
+        let input = "a,b\n1,2\n";
+        let mut overlay = Overlay::new();
+        for name in ["one", "two", "three"] {
+            let id = overlay.add_row(1, usize::MAX, 1);
+            overlay.set([((id, 0), name.to_string())]);
+        }
+        let mut out = Vec::new();
+        splice(input.as_bytes(), &mut out, b',', true, &overlay, 1).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "a,b\n1,2\none,\ntwo,\nthree,\n"
+        );
+    }
+
+    #[test]
+    fn a_value_needing_quotes_is_quoted_in_an_added_row() {
+        let input = "a,b\n1,2\n";
+        assert_eq!(
+            with_added(input, &[(1, &[(0, "x,y"), (1, "say \"hi\"")])], 1),
+            "a,b\n1,2\n\"x,y\",\"say \"\"hi\"\"\"\n"
+        );
+    }
+
+    #[test]
+    fn a_row_added_where_no_row_exists_is_refused() {
+        let mut overlay = Overlay::new();
+        overlay.add_row(9, 0, 2);
+        let mut out = Vec::new();
+        let e = splice(
+            "a,b\n1,2\n3,4\n".as_bytes(),
+            &mut out,
+            b',',
+            true,
+            &overlay,
+            2,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("added rows had nowhere to go"), "{e}");
     }
 
     #[test]
