@@ -184,6 +184,15 @@ pub struct App {
     /// in the `View`: how wide a column is drawn is a fact about this screen,
     /// not about which rows and columns the file is being asked for.
     widths: ui::Widths,
+    /// Columns held at the left edge while the rest scroll past, by **source**
+    /// column index — so a pin follows its column through a `:select` that
+    /// reorders, exactly as `widths` does.
+    ///
+    /// Display state for the same reason widths are, and out of the `View` for
+    /// the same reason: which column stays in sight while you walk sideways is
+    /// a fact about this screen. `u` is the edit buffer's undo and does not
+    /// take a pin back; `zp` again does, and `z|` takes them all back.
+    pinned: std::collections::BTreeSet<usize>,
 }
 
 impl App {
@@ -226,6 +235,7 @@ impl App {
             relative_rows: true,
             cell_view: false,
             widths: ui::Widths::new(),
+            pinned: std::collections::BTreeSet::new(),
         }
     }
 
@@ -320,9 +330,13 @@ impl App {
         // Must be correct in a single pass: handle_events blocks on event::read
         // when no search is active, so multi-frame convergence never fires.
         if !matches!(self.selection_mode, SelectionMode::Row) {
-            if self.cursor_col < self.col_offset {
+            // A pinned column is drawn at every offset, so landing on one is
+            // never a reason to scroll: the view stays where it was and the
+            // cursor is visible in the pinned block.
+            let held = self.display_pins().contains(&self.cursor_col);
+            if !held && self.cursor_col < self.col_offset {
                 self.col_offset = self.cursor_col;
-            } else if self.cursor_col > self.last_vis_col {
+            } else if !held && self.cursor_col > self.last_vis_col {
                 // cursor is off the right edge — compute the col_offset that
                 // places cursor_col at the rightmost visible position.
                 self.col_offset = self.col_offset_to_show_at_right(self.cursor_col);
@@ -384,6 +398,7 @@ impl App {
                     selection: self.visual_range(),
                     relative_rows: self.relative_rows,
                     widths: &self.widths,
+                    pinned: &self.display_pins(),
                 },
                 table_area,
             );
@@ -557,6 +572,8 @@ impl App {
             ("0 / $", "Scroll to the first / last column"),
             ("Tab", "Cycle row \u{2192} column \u{2192} cell"),
             ("s", "Sort by cursor column"),
+            ("zp", "Pin / unpin the cursor column at the left edge"),
+            ("z|", "Unpin every column"),
         ];
         const SEARCH: &[(&str, &str)] = &[
             ("/", "Search (regex)"),
@@ -2169,6 +2186,15 @@ impl App {
             ('z', KeyCode::Char('>')) => self.resize_column(1),
             ('z', KeyCode::Char('<')) => self.resize_column(-1),
             ('z', KeyCode::Char('_')) => self.fit_column(),
+            ('z', KeyCode::Char('p')) => self.toggle_pin(),
+            // Unpinning the lot is `z|` and not `zP`, because the second key
+            // is lowercased above: a shifted letter cannot mean anything the
+            // unshifted one does not. The divider is what a pin draws, so the
+            // key names the thing it takes away.
+            ('z', KeyCode::Char('|')) => {
+                self.pinned.clear();
+                Ok(())
+            }
             ('z', KeyCode::Char('=')) => {
                 self.widths.clear();
                 self.message = Some("column widths reset".to_string());
@@ -2366,6 +2392,7 @@ impl App {
                 self.last_frame_width,
                 cursor_col,
                 &self.widths,
+                &self.display_pins(),
             ),
             None => 0,
         }
@@ -2377,7 +2404,9 @@ impl App {
             SelectionMode::Row => self.col_offset = self.col_offset.saturating_sub(n),
             SelectionMode::Column | SelectionMode::Cell => {
                 self.cursor_col = self.cursor_col.saturating_sub(n);
-                self.col_offset = self.col_offset.min(self.cursor_col);
+                if !self.display_pins().contains(&self.cursor_col) {
+                    self.col_offset = self.col_offset.min(self.cursor_col);
+                }
             }
         }
     }
@@ -2442,6 +2471,68 @@ impl App {
         };
         let widest = ui::natural_width(column);
         self.widths.insert(source, widest);
+        Ok(())
+    }
+
+    /// The pins as display positions.
+    ///
+    /// `Store`'s indices are source columns and everything above it counts
+    /// display positions, so the crossing happens here and the widget is
+    /// handed a set it can use against the frame it is drawing. A pin on a
+    /// column the current view hides simply is not in the set — it is not
+    /// forgotten, it has nowhere to be drawn.
+    fn display_pins(&self) -> ui::Pinned {
+        let Some(store) = &self.store else {
+            return ui::Pinned::new();
+        };
+        (0..store.column_count())
+            .filter(|&display| {
+                store
+                    .source_column(display)
+                    .is_some_and(|source| self.pinned.contains(&source))
+            })
+            .collect()
+    }
+
+    /// `zp`: hold the cursor column at the left edge, or let it go again.
+    ///
+    /// The use is comparison: a key or a label stays in sight while `h` and
+    /// `l` walk the columns it is being read against, which on a wide table
+    /// otherwise means scrolling back and forth and holding a value in your
+    /// head.
+    fn toggle_pin(&mut self) -> anyhow::Result<()> {
+        let Some(source) = self
+            .store
+            .as_ref()
+            .and_then(|store| store.source_column(self.cursor_col))
+        else {
+            return Ok(());
+        };
+        if self.pinned.remove(&source) {
+            return Ok(());
+        }
+
+        // Set the pin, then ask the layout whether what it makes still leaves
+        // room to scroll in, and take it back if not. Asking after rather than
+        // predicting before means the check sees the block that would actually
+        // be drawn, widths set by hand and all.
+        self.pinned.insert(source);
+        let fits = match &self.store {
+            Some(store) => ui::pin_fits(
+                &store.current_view,
+                store.row_offset,
+                self.last_frame_width,
+                &self.widths,
+                &self.display_pins(),
+            ),
+            None => true,
+        };
+        if !fits {
+            self.pinned.remove(&source);
+            self.message = Some(
+                "no room to pin: unpin one, or narrow one with z<".into(),
+            );
+        }
         Ok(())
     }
 
@@ -3915,6 +4006,126 @@ mod tests {
         assert_eq!(app.store.as_ref().unwrap().dirty(), 0);
         let message = app.message.clone().unwrap();
         assert!(message.contains("too many"), "{message}");
+    }
+
+    #[test]
+    fn zp_pins_the_cursor_column_and_pressing_it_again_lets_go() {
+        let mut app = app_sized("pin.csv", FOURCOL, 60);
+        key(&mut app, KeyCode::Tab); // column mode, so there is a column cursor
+        press(&mut app, 'l'); // onto b
+
+        press(&mut app, 'z');
+        press(&mut app, 'p');
+        assert_eq!(app.pinned.iter().copied().collect::<Vec<_>>(), [1]);
+
+        press(&mut app, 'z');
+        press(&mut app, 'p');
+        assert!(app.pinned.is_empty(), "the same key lets it go");
+    }
+
+    #[test]
+    fn z_bar_unpins_everything_at_once() {
+        let mut app = app_sized("unpinall.csv", FOURCOL, 60);
+        key(&mut app, KeyCode::Tab);
+        press(&mut app, 'z');
+        press(&mut app, 'p');
+        press(&mut app, 'l');
+        press(&mut app, 'z');
+        press(&mut app, 'p');
+        assert_eq!(app.pinned.len(), 2);
+
+        press(&mut app, 'z');
+        press(&mut app, '|');
+        assert!(app.pinned.is_empty());
+
+        // `zP` is `zp`: the prefix lowercases its second key, so a stray shift
+        // toggles the cursor column rather than clearing the lot.
+        press(&mut app, 'z');
+        press(&mut app, 'P');
+        assert_eq!(app.pinned.len(), 1);
+    }
+
+    /// A pin is kept against the source column, like a width, so reordering
+    /// the view moves the pin with its column rather than leaving it on
+    /// whatever now happens to sit in that position.
+    #[test]
+    fn a_pin_follows_its_column_through_a_select() {
+        let mut app = app_sized("pinselect.csv", FOURCOL, 60);
+        key(&mut app, KeyCode::Tab);
+        press(&mut app, 'z');
+        press(&mut app, 'p'); // pin `a`, source 0, display 0
+        assert_eq!(app.display_pins().iter().copied().collect::<Vec<_>>(), [0]);
+
+        command(&mut app, "select c a");
+        assert_eq!(shown_columns(&app), ["c", "a"]);
+        assert_eq!(app.pinned.iter().copied().collect::<Vec<_>>(), [0], "still `a`");
+        assert_eq!(
+            app.display_pins().iter().copied().collect::<Vec<_>>(),
+            [1],
+            "which `select` has moved to the second position"
+        );
+    }
+
+    /// A pin on a column the view hides is not forgotten — it has nowhere to
+    /// be drawn, and comes back when the column does.
+    #[test]
+    fn a_pin_on_a_hidden_column_waits_rather_than_being_dropped() {
+        let mut app = app_sized("pinhide.csv", FOURCOL, 60);
+        key(&mut app, KeyCode::Tab);
+        press(&mut app, 'z');
+        press(&mut app, 'p');
+
+        command(&mut app, "select b c");
+        assert!(app.display_pins().is_empty(), "nowhere to draw it");
+        assert_eq!(app.pinned.iter().copied().collect::<Vec<_>>(), [0]);
+
+        command(&mut app, "reset select");
+        assert_eq!(app.display_pins().iter().copied().collect::<Vec<_>>(), [0]);
+    }
+
+    /// Pinning the whole width would leave a table that cannot be moved
+    /// through and nothing on screen to say why, so the pin is refused and
+    /// says so — the call `sort_blocked` makes.
+    #[test]
+    fn a_pin_that_would_leave_nothing_to_scroll_in_is_refused() {
+        let mut app = app_sized("pinfull.csv", FOURCOL, 24);
+        key(&mut app, KeyCode::Tab);
+
+        let mut pinned = 0;
+        for _ in 0..4 {
+            press(&mut app, 'z');
+            press(&mut app, 'p');
+            if app.message.is_some() {
+                break;
+            }
+            pinned += 1;
+            press(&mut app, 'l');
+        }
+        assert!(pinned > 0, "some of them fit");
+        assert!(pinned < 4, "not all of them");
+        assert_eq!(app.pinned.len(), pinned, "the refused one is not kept");
+        let refusal = app.message.clone().unwrap();
+        assert!(refusal.contains("no room to pin"), "{refusal}");
+    }
+
+    /// A pinned column is on screen at every offset, so the cursor landing on
+    /// one must not drag the view back to where that column lives.
+    #[test]
+    fn the_cursor_on_a_pinned_column_does_not_scroll_the_view() {
+        let mut app = app_sized("pinscroll.csv", WIDE, 40);
+        key(&mut app, KeyCode::Tab);
+        press(&mut app, 'z');
+        press(&mut app, 'p'); // pin the first column
+
+        for _ in 0..5 {
+            press(&mut app, 'l');
+        }
+        app.col_offset = 4;
+        let before = app.col_offset;
+
+        app.cursor_col = 0; // back onto the pin, which is drawn regardless
+        app.column_left(0);
+        assert_eq!(app.col_offset, before, "the view stays where it was");
     }
 
     #[test]
