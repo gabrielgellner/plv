@@ -1156,8 +1156,10 @@ impl App {
                 }
             }
 
-            // z-prefix: zz (centre), zt (top), zb (bottom)
-            KeyCode::Char('z') => {
+            // z-prefix: zz (centre), zt (top), zb (bottom), and the column
+            // widths. `Z` opens it too: its second keys are shifted ones, and
+            // the shift tends to go down before the `z` does.
+            KeyCode::Char('z' | 'Z') => {
                 self.pending_num.clear();
                 self.pending_prefix = Some('z');
             }
@@ -2085,6 +2087,13 @@ impl App {
 
     /// The second key of a `g` or `z` sequence. Anything else cancels it.
     fn resolve_prefix(&mut self, prefix: char, code: KeyCode) -> anyhow::Result<()> {
+        // The second key is read case-insensitively. Every `z` width command
+        // takes a shifted key — `<`, `>`, `_` — and the shift naturally goes
+        // down before the `z` does, so both keys arrive capitalised.
+        let code = match code {
+            KeyCode::Char(c) => KeyCode::Char(c.to_ascii_lowercase()),
+            other => other,
+        };
         match (prefix, code) {
             ('z', KeyCode::Char('z')) => self.scroll_center(),
             ('z', KeyCode::Char('t')) => self.scroll_cursor_top(),
@@ -2417,9 +2426,23 @@ mod tests {
         (app, path)
     }
 
-    fn key(app: &mut App, code: KeyCode) {
-        app.handle_key_event(KeyEvent::new(code, KeyModifiers::NONE))
-            .unwrap();
+    fn key(app: &mut App, event: impl IntoKeyEvent) {
+        app.handle_key_event(event.into_key_event()).unwrap();
+    }
+
+    /// So a test can press a plain key or one with modifiers.
+    trait IntoKeyEvent {
+        fn into_key_event(self) -> KeyEvent;
+    }
+    impl IntoKeyEvent for KeyCode {
+        fn into_key_event(self) -> KeyEvent {
+            KeyEvent::new(self, KeyModifiers::NONE)
+        }
+    }
+    impl IntoKeyEvent for KeyEvent {
+        fn into_key_event(self) -> KeyEvent {
+            self
+        }
     }
 
     fn press(app: &mut App, c: char) {
@@ -3829,6 +3852,49 @@ mod tests {
         press(&mut app, 'z');
         press(&mut app, '=');
         assert!(app.widths.is_empty(), "and z= clears the lot");
+    }
+
+    /// `<`, `>` and `_` all need shift, and the shift goes down before the
+    /// `z` does — so both keys arrive capitalised and neither half matched.
+    #[test]
+    fn shift_held_through_a_z_command_still_works() {
+        let mut app = app_sized("shiftz.csv", FOURCOL, 60);
+        cell_mode(&mut app);
+        let start = app.drawn_width(0);
+
+        // Shift held from before the prefix: `Z` then `>`.
+        key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('Z'), KeyModifiers::SHIFT),
+        );
+        assert_eq!(app.pending_prefix, Some('z'), "`Z` opens the prefix too");
+        key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('>'), KeyModifiers::SHIFT),
+        );
+        assert!(app.widths.get(&0).is_some_and(|&w| w > start));
+    }
+
+    #[test]
+    fn a_shifted_second_key_still_reaches_the_unshifted_command() {
+        // A file with room to scroll: FOURCOL has two rows, so `zt` would
+        // have nowhere to put anything.
+        let mut app = tall_app("shiftzz.csv");
+        app.cursor_to(20).unwrap();
+        // `ZT` should be `zt`, not nothing.
+        key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('Z'), KeyModifiers::SHIFT),
+        );
+        key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT),
+        );
+        assert_eq!(
+            app.store.as_ref().unwrap().row_offset,
+            20,
+            "zt put the cursor row at the top"
+        );
     }
 
     #[test]
