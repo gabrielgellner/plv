@@ -167,6 +167,10 @@ pub struct App {
     /// Number rows by distance from the cursor, so `{n}j` and `{n}G` can be
     /// read off the gutter instead of worked out.
     relative_rows: bool,
+    /// Column widths set by hand, by source column index. Kept here and not
+    /// in the `View`: how wide a column is drawn is a fact about this screen,
+    /// not about which rows and columns the file is being asked for.
+    widths: ui::Widths,
 }
 
 impl App {
@@ -207,6 +211,7 @@ impl App {
             last_vp: 20,
             help_visible: false,
             relative_rows: true,
+            widths: ui::Widths::new(),
         }
     }
 
@@ -344,6 +349,7 @@ impl App {
                     edited: &edited,
                     selection: self.visual_range(),
                     relative_rows: self.relative_rows,
+                    widths: &self.widths,
                 },
                 table_area,
             );
@@ -492,6 +498,9 @@ impl App {
             ("gg / G", "First / last row"),
             ("{n}gg / {n}G", "Jump to row n"),
             ("zz / zt / zb", "Centre / top / bottom"),
+            ("z> / z<", "Widen / narrow the cursor column"),
+            ("z_", "Fit the column to what is on screen"),
+            ("z=", "Put every column width back"),
             ("#", "Relative or absolute row numbers"),
         ];
         const COLUMNS: &[(&str, &str)] = &[
@@ -2080,6 +2089,17 @@ impl App {
             ('z', KeyCode::Char('z')) => self.scroll_center(),
             ('z', KeyCode::Char('t')) => self.scroll_cursor_top(),
             ('z', KeyCode::Char('b')) => self.scroll_cursor_bottom(),
+            // Column widths. `z` is where display adjustments live, here as in
+            // vim, and a width is one: it changes how the table is drawn and
+            // nothing about the data.
+            ('z', KeyCode::Char('>')) => self.resize_column(1),
+            ('z', KeyCode::Char('<')) => self.resize_column(-1),
+            ('z', KeyCode::Char('_')) => self.fit_column(),
+            ('z', KeyCode::Char('=')) => {
+                self.widths.clear();
+                self.message = Some("column widths reset".to_string());
+                Ok(())
+            }
             // `gg` is the first row, or the nth when a count precedes it.
             // `dd` takes out the cursor row, `{n}dd` that many.
             ('d', KeyCode::Char('d')) => {
@@ -2267,6 +2287,7 @@ impl App {
                 store.row_offset,
                 self.last_frame_width,
                 cursor_col,
+                &self.widths,
             ),
             None => 0,
         }
@@ -2302,6 +2323,57 @@ impl App {
                 self.cursor_col = (self.cursor_col + n).min(last);
             }
         }
+    }
+
+    /// Widen or narrow the cursor column by `steps`, each of a few characters.
+    ///
+    /// Columns after it are pushed along and off the right edge rather than
+    /// squeezed, which is what a spreadsheet does and what `h`/`l` are for.
+    fn resize_column(&mut self, steps: isize) -> anyhow::Result<()> {
+        const STEP: isize = 4;
+        let Some(source) = self
+            .store
+            .as_ref()
+            .and_then(|store| store.source_column(self.cursor_col))
+        else {
+            return Ok(());
+        };
+        let current = match self.widths.get(&source) {
+            Some(&width) => width as isize,
+            None => self.drawn_width(source) as isize,
+        };
+        let want = (current + steps * STEP).max(ui::MIN_COLUMN as isize) as usize;
+        self.widths.insert(source, want);
+        Ok(())
+    }
+
+    /// Fit the cursor column to the widest value **on screen**.
+    ///
+    /// On screen and not in the file: the whole column is not in memory, and
+    /// reading it to measure would be the full scan the rest of plv works to
+    /// avoid.
+    fn fit_column(&mut self) -> anyhow::Result<()> {
+        let Some(store) = &self.store else {
+            return Ok(());
+        };
+        let Some(source) = store.source_column(self.cursor_col) else {
+            return Ok(());
+        };
+        let Some(column) = store.current_view.columns().get(self.cursor_col) else {
+            return Ok(());
+        };
+        let widest = ui::natural_width(column);
+        self.widths.insert(source, widest);
+        Ok(())
+    }
+
+    /// What the cursor column is drawn at right now.
+    fn drawn_width(&self, source: usize) -> usize {
+        self.store
+            .as_ref()
+            .and_then(|store| store.current_view.columns().get(self.cursor_col))
+            .map(|column| ui::drawn_width(column, source, self.last_frame_width, &self.widths))
+            .unwrap_or(ui::MIN_COLUMN)
     }
 
     /// The column the status bar names.
@@ -3737,6 +3809,69 @@ mod tests {
         command(&mut app, "nope");
         assert_eq!(app.message.as_deref(), Some("not a command: :nope"));
         assert!(!app.exit);
+    }
+
+    #[test]
+    fn a_column_can_be_widened_narrowed_and_put_back() {
+        let mut app = app_sized("widths.csv", FOURCOL, 60);
+        cell_mode(&mut app);
+        let start = app.drawn_width(0);
+
+        press(&mut app, 'z');
+        press(&mut app, '>');
+        let wider = *app.widths.get(&0).expect("a width was set");
+        assert!(wider > start, "{wider} should be wider than {start}");
+
+        press(&mut app, 'z');
+        press(&mut app, '<');
+        assert_eq!(*app.widths.get(&0).unwrap(), start, "back where it began");
+
+        press(&mut app, 'z');
+        press(&mut app, '=');
+        assert!(app.widths.is_empty(), "and z= clears the lot");
+    }
+
+    #[test]
+    fn a_width_belongs_to_the_column_not_to_its_place_on_screen() {
+        // `:select` renumbers the display positions; a width set before it
+        // has to follow its own column.
+        let mut app = app_sized("widthview.csv", FOURCOL, 60);
+        cell_mode(&mut app);
+        press(&mut app, 'l'); // display 1 is source column `b`
+        press(&mut app, 'z');
+        press(&mut app, '>');
+        let set = *app.widths.get(&1).expect("keyed by source column");
+
+        command(&mut app, "select d b");
+        assert_eq!(
+            app.widths.get(&1),
+            Some(&set),
+            "`b` keeps its width at its new position"
+        );
+    }
+
+    #[test]
+    fn fitting_a_column_uses_the_widest_value_on_screen() {
+        let mut app = app_sized("fit.csv", "a,b\nshort,x\nmuch longer value,y\n", 60);
+        cell_mode(&mut app);
+        press(&mut app, 'z');
+        press(&mut app, '_');
+        assert_eq!(
+            app.widths.get(&0),
+            Some(&"much longer value".len()),
+            "the widest value on the page, not a guess"
+        );
+    }
+
+    #[test]
+    fn a_column_cannot_be_narrowed_away_entirely() {
+        let mut app = app_sized("narrow.csv", FOURCOL, 60);
+        cell_mode(&mut app);
+        for _ in 0..20 {
+            press(&mut app, 'z');
+            press(&mut app, '<');
+        }
+        assert_eq!(*app.widths.get(&0).unwrap(), ui::MIN_COLUMN);
     }
 
     #[test]

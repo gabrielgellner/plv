@@ -43,6 +43,8 @@ pub struct DataTable<'a> {
     pub selection: Option<((usize, usize), (usize, usize))>,
     /// Number rows by their distance from the cursor rather than absolutely.
     pub relative_rows: bool,
+    /// Widths set by hand, by source column index.
+    pub widths: &'a Widths,
 }
 
 /// The row-number cell: each row's distance from the cursor, and on the cursor
@@ -191,11 +193,47 @@ fn truncate(s: &str, max_chars: usize) -> String {
 /// Lives beside the renderer that has to agree with it. The app layer used to
 /// keep its own copy of this arithmetic, and the two drifted — the copy was
 /// still measuring quoted strings in bytes after the renderer had stopped.
+/// Column widths the user has set by hand, by source column index.
+///
+/// A set width is used as given — the cap that keeps one column from taking
+/// the whole screen is a default, not a rule, and overriding it is the point.
+/// Columns after a widened one are pushed along and off the right edge, as a
+/// spreadsheet does, rather than everything shuffling to make room.
+pub type Widths = std::collections::HashMap<usize, usize>;
+
+/// The width to draw a column at: what was set for it, or what it needs.
+fn width_of(column: &Column, source: usize, set: &Widths, cap: usize) -> usize {
+    match set.get(&source) {
+        Some(&width) => width.max(MIN_COL_WIDTH),
+        None => natural_col_width(column).min(cap),
+    }
+}
+
+/// The narrowest a column may be made.
+pub const MIN_COLUMN: usize = MIN_COL_WIDTH;
+
+/// What a column needs to show every value on the current page in full.
+pub fn natural_width(column: &Column) -> usize {
+    natural_col_width(column)
+}
+
+/// What a column is drawn at right now, so an adjustment starts from what is
+/// on screen rather than from nothing.
+///
+/// Asked of the layout rather than worked out again by the caller: the app
+/// layer once kept its own copy of this arithmetic and the two drifted.
+pub fn drawn_width(column: &Column, source: usize, frame_width: u16, set: &Widths) -> usize {
+    let inner = (frame_width as usize).saturating_sub(2);
+    let cap = ((inner as f32 * MAX_COL_FRAC) as usize).max(MIN_COL_WIDTH);
+    width_of(column, source, set, cap)
+}
+
 pub fn col_offset_showing(
     df: &DataFrame,
     row_offset: usize,
     frame_width: u16,
     target: usize,
+    widths: &Widths,
 ) -> usize {
     let cols = df.columns();
     if cols.is_empty() {
@@ -206,7 +244,7 @@ pub fn col_offset_showing(
     let inner_w = (frame_width as usize).saturating_sub(2);
     let max_col = ((inner_w as f32 * MAX_COL_FRAC) as usize).max(MIN_COL_WIDTH);
     let row_num_w = row_num_width(row_offset, df.height());
-    let slot = |ci: usize| COLUMN_SPACING + natural_col_width(&cols[ci]).min(max_col);
+    let slot = |ci: usize| COLUMN_SPACING + width_of(&cols[ci], ci, widths, max_col);
 
     let Some(mut budget) = inner_w.saturating_sub(row_num_w).checked_sub(slot(target)) else {
         return target; // the target alone does not fit — show it at the left edge
@@ -234,7 +272,16 @@ impl Widget for DataTable<'_> {
         let max_col = ((inner_w as f32 * MAX_COL_FRAC) as usize).max(MIN_COL_WIDTH);
 
         let row_num_w = row_num_width(self.row_offset, self.df.height());
-        let naturals: Vec<usize> = cols.iter().map(natural_col_width).collect();
+        // What each column asks for: a width set by hand is what it asks for
+        // and what it gets, exempt from the cap below.
+        let naturals: Vec<usize> = cols
+            .iter()
+            .enumerate()
+            .map(|(index, column)| match self.widths.get(&index) {
+                Some(&width) => width.max(MIN_COL_WIDTH),
+                None => natural_col_width(column),
+            })
+            .collect();
 
         // ── Phase 1: greedily pick visible columns ────────────────────────
         // Row num slot = row_num_w (includes the │ char at end).
@@ -243,7 +290,11 @@ impl Widget for DataTable<'_> {
         let mut consumed = row_num_w;
 
         for (i, &nat) in naturals.iter().enumerate().skip(self.col_offset) {
-            let w = nat.min(max_col);
+            let w = if self.widths.contains_key(&i) {
+                nat
+            } else {
+                nat.min(max_col)
+            };
             if consumed + sp + w > inner_w && !vis_cols.is_empty() {
                 break;
             }
@@ -256,7 +307,16 @@ impl Widget for DataTable<'_> {
         }
 
         // ── Phase 2: redistribute leftover space to capped columns ────────
-        let capped: Vec<usize> = vis_cols.iter().map(|&i| naturals[i].min(max_col)).collect();
+        let capped: Vec<usize> = vis_cols
+            .iter()
+            .map(|&i| {
+                if self.widths.contains_key(&i) {
+                    naturals[i]
+                } else {
+                    naturals[i].min(max_col)
+                }
+            })
+            .collect();
         let slack = inner_w.saturating_sub(consumed);
         let vis_naturals: Vec<usize> = vis_cols.iter().map(|&i| naturals[i]).collect();
         let final_widths = redistribute(capped, &vis_naturals, slack);
@@ -644,6 +704,7 @@ mod tests {
             edited: &[],
             selection: None,
             relative_rows: relative,
+            widths: &Widths::new(),
         }
         .render(area, &mut buf);
         buf
@@ -742,6 +803,7 @@ mod tests {
             edited: &[],
             selection: None,
             relative_rows: true,
+            widths: &Widths::new(),
         }
         .render(area, &mut buf);
         buf

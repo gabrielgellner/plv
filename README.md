@@ -39,8 +39,16 @@ Press `?` at any time for the key bindings of whatever screen you are on.
 | `s` | Sort by cursor column; toggles asc ↔ desc; add more columns for multi-sort |
 | `zz` / `zt` / `zb` | Centre / top / bottom cursor in view |
 | `#` | Relative or absolute row numbers |
+| `z>` / `z<` | Widen / narrow the cursor column |
+| `z_` | Fit the column to the widest value on screen |
+| `z=` | Put every column width back |
 | `?` | Show key bindings for the current screen |
 | `q` | Quit |
+
+Widening a column pushes the ones after it along and off the right edge, as a
+spreadsheet does, rather than squeezing everything to make room — `h` and `l`
+reach what went past. Widths are remembered for the session and belong to the
+column, so they survive `:select` reordering it; `z=` puts them all back.
 
 Row numbers count from the cursor by default, the way nvim's hybrid
 `number` + `relativenumber` gutter does, so `3j` and `12G` can be read off
