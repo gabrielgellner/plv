@@ -181,8 +181,15 @@ There is no key that un-hides one column, since naming it is the only way to say
 which, so the message says `:reset select` at the moment the user might want it.
 
 `C` opens the **column picker** (`src/picker.rs`), the other direction: a list of
-every column with a tick for shown and one for pinned, `Space` and `p` to toggle,
-`Enter` to apply and `Esc` to leave. It holds a **working copy**, so cancelling
+every column with a tick for shown and one for pinned, `-` and `p` to toggle,
+`Enter` to apply and `Esc` to leave. `-` and not Space, so the key that takes a
+column off the view is the same one in the list as in the table — out there it
+can only hide, since there is nothing on screen to un-hide, while in here the
+state is in front of you and it toggles. `q` is deliberately **unbound**:
+everywhere else in vim it closes a window, and a window is a view, so closing one
+never destroys work — the picker holds changes that are not applied yet, so it
+cannot close harmlessly and does not borrow the letter. `Esc` discards, the way
+it discards a half-typed `:` line. It holds a **working copy**, so cancelling
 costs nothing and `Enter` is the only thing that changes anything — and what it
 produces is a `view::Command::Select` through `App::apply_view_command`, the same
 path `:select` and `-` take, so it is a way of *writing* a select rather than a
@@ -197,8 +204,8 @@ and named** rather than refused whole — the view change is what the user came
 for, and giving that up over a pin would be abandoning the wrong half, so it
 keeps what fits the way a filter that fills its row set keeps what it has. Unlike
 `-` it needs no column cursor and works in row mode. `?` reaches it, and its help
-is the picker's keys alone: `GENERAL`'s `q` means quit where the picker's means
-cancel, and one overlay must not say both.
+is the picker's keys alone, since `GENERAL`'s `q` would name a key the picker
+does not answer.
 `Store::sort` already worked this way.
 
 Evaluation order is fixed independently of the order commands were typed:
