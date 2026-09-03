@@ -11,7 +11,7 @@ pub use help::{Help, Section};
 pub use panel::{Panel, height as panel_height};
 pub use prompt::Prompt;
 pub use statusbar::StatusBar;
-pub use table::{DataTable, col_offset_showing};
+pub use table::{DataTable, MIN_COLUMN, Widths, col_offset_showing, drawn_width, natural_width};
 pub use theme::Theme;
 
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
