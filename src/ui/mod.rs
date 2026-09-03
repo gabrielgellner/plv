@@ -8,7 +8,7 @@ pub mod theme;
 
 pub use browser::{Browser, BrowserState};
 pub use help::{Help, Section};
-pub use panel::{Panel, height as panel_height};
+pub use panel::{CellView, Panel, cell_height, height as panel_height, wrap};
 pub use prompt::Prompt;
 pub use statusbar::StatusBar;
 pub use table::{DataTable, MIN_COLUMN, Widths, col_offset_showing, drawn_width, natural_width};

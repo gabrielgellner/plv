@@ -20,7 +20,8 @@ use crate::data::lake_db::{self, LakeDb};
 use crate::lake::{Lake, Level, Scope};
 use crate::search::{SearchQuery, SearchState, SearchStatus};
 use crate::ui::{
-    self, Browser, DataTable, Help, Panel, Prompt, Section, SelectionMode, StatusBar, Theme,
+    self, Browser, CellView, DataTable, Help, Panel, Prompt, Section, SelectionMode, StatusBar,
+    Theme,
 };
 use crate::view;
 use polars::prelude::DataType;
@@ -174,6 +175,11 @@ pub struct App {
     /// Number rows by distance from the cursor, so `{n}j` and `{n}G` can be
     /// read off the gutter instead of worked out.
     relative_rows: bool,
+    /// The cursor cell is being shown in full above the status bar.
+    ///
+    /// Stays on while the cursor moves, so a column of long values can be read
+    /// by walking down it — which is the thing a truncated column makes hard.
+    cell_view: bool,
     /// Column widths set by hand, by source column index. Kept here and not
     /// in the `View`: how wide a column is drawn is a fact about this screen,
     /// not about which rows and columns the file is being asked for.
@@ -218,6 +224,7 @@ impl App {
             last_vp: 20,
             help_visible: false,
             relative_rows: true,
+            cell_view: false,
             widths: ui::Widths::new(),
         }
     }
@@ -257,19 +264,39 @@ impl App {
         (terminal_height as usize).saturating_sub(4 + panel as usize)
     }
 
-    /// Rows the candidate panel wants right now.
-    fn panel_height(&self, width: u16) -> u16 {
-        match &self.completion {
-            Some(completion) => ui::panel_height(&completion.options, width),
-            None => 0,
+    /// Rows the strip above the status bar wants right now.
+    ///
+    /// Completion and the cell view share it. They cannot both be wanted —
+    /// one belongs to the command line and the other to the table — so
+    /// whichever is on gets it.
+    fn panel_height(&self, width: u16, height: u16) -> u16 {
+        if let Some(completion) = &self.completion {
+            return ui::panel_height(&completion.options, width);
         }
+        if self.cell_view {
+            // Never more than half the screen: the table is still the point.
+            let room = (height / 2).max(2);
+            return match self.cell_under_cursor() {
+                Some((_, value)) => ui::cell_height(&value, width, room),
+                None => 0,
+            };
+        }
+        0
+    }
+
+    /// The column name and full text of the cell under the cursor.
+    fn cell_under_cursor(&self) -> Option<(String, String)> {
+        let store = self.store.as_ref()?;
+        let (name, _) = store.column_info(self.cursor_col)?;
+        let value = store.cell_text(self.cursor_row, self.cursor_col)?;
+        Some((name, value))
     }
 
     fn draw(&mut self, frame: &mut Frame) {
         let area = frame.area();
         self.last_frame_width = area.width;
 
-        let panel = self.panel_height(area.width);
+        let panel = self.panel_height(area.width, area.height);
         let vp = Self::viewport_rows(area.height, panel);
         self.last_vp = vp;
         if let Some(s) = &mut self.store
@@ -474,6 +501,17 @@ impl App {
                 },
                 panel_area,
             );
+        } else if self.cell_view
+            && let Some((name, value)) = self.cell_under_cursor()
+        {
+            frame.render_widget(
+                CellView {
+                    name: &name,
+                    value: &value,
+                    theme: &self.theme,
+                },
+                panel_area,
+            );
         }
 
         self.draw_help(frame, area);
@@ -509,6 +547,7 @@ impl App {
             ("z> / z<", "Widen / narrow the cursor column"),
             ("z_", "Fit the column to what is on screen"),
             ("z=", "Put every column width back"),
+            ("K", "Show the cursor cell in full"),
             ("#", "Relative or absolute row numbers"),
         ];
         const COLUMNS: &[(&str, &str)] = &[
@@ -1312,6 +1351,16 @@ impl App {
                     self.delete_rows(first, last - first + 1)?;
                 }
             }
+            // `K` is vim's "tell me about the thing under the cursor", and
+            // that is what this is.
+            KeyCode::Char('K') => {
+                self.pending_num.clear();
+                if matches!(self.selection_mode, SelectionMode::Row) {
+                    self.selection_mode = SelectionMode::Cell;
+                    self.cursor_col = self.col_offset;
+                }
+                self.cell_view = !self.cell_view;
+            }
             KeyCode::Char('#') => {
                 self.pending_num.clear();
                 self.relative_rows = !self.relative_rows;
@@ -1332,6 +1381,10 @@ impl App {
                 self.mode = AppMode::Command;
             }
 
+            KeyCode::Esc if self.cell_view => {
+                self.pending_num.clear();
+                self.cell_view = false;
+            }
             KeyCode::Esc if self.visual_anchor.is_some() => {
                 self.pending_num.clear();
                 self.visual_anchor = None;
@@ -3160,7 +3213,7 @@ mod tests {
         tab(&mut app);
         let options = app.completion.as_ref().expect("a panel").options.clone();
         assert_eq!(options, ["alpha", "beta", "gamma"]);
-        assert_eq!(app.panel_height(60), 1, "the panel takes a row");
+        assert_eq!(app.panel_height(60, 24), 1, "the panel takes a row");
 
         // Nothing to extend — the three share no prefix — so Tab steps.
         assert_eq!(app.command_buf, "select ");
@@ -3179,7 +3232,7 @@ mod tests {
         press(&mut app, ':');
         typed(&mut app, "select ");
         tab(&mut app);
-        let after = App::viewport_rows(24, app.panel_height(60));
+        let after = App::viewport_rows(24, app.panel_height(60, 24));
         assert_eq!(
             after,
             before - 1,
@@ -3202,7 +3255,7 @@ mod tests {
         assert_eq!(app.command_buf, "select alpha ");
         key(&mut app, KeyCode::Esc);
         assert!(app.completion.is_none());
-        assert_eq!(app.panel_height(60), 0);
+        assert_eq!(app.panel_height(60, 24), 0);
     }
 
     #[test]
@@ -3870,6 +3923,51 @@ mod tests {
         command(&mut app, "nope");
         assert_eq!(app.message.as_deref(), Some("not a command: :nope"));
         assert!(!app.exit);
+    }
+
+    #[test]
+    fn k_shows_the_cursor_cell_and_follows_it() {
+        let long = "a,note\n1,\"a value far too long for any column to show\"\n2,short\n";
+        let mut app = app_sized("cellview.csv", long, 40);
+        assert_eq!(app.panel_height(40, 24), 0, "nothing showing yet");
+
+        press(&mut app, 'K');
+        assert!(app.cell_view);
+        assert_eq!(
+            app.selection_mode,
+            SelectionMode::Cell,
+            "a cell view needs a cell cursor, as an edit does"
+        );
+        let (name, value) = app.cell_under_cursor().unwrap();
+        assert_eq!(name, "a");
+        assert_eq!(value, "1");
+
+        // It follows the cursor rather than freezing on one cell.
+        press(&mut app, 'l');
+        let (name, value) = app.cell_under_cursor().unwrap();
+        assert_eq!(name, "note");
+        assert!(value.starts_with("a value far too long"));
+        assert!(app.panel_height(40, 24) > 1, "and takes room to show it");
+
+        key(&mut app, KeyCode::Esc);
+        assert!(!app.cell_view);
+        assert_eq!(app.panel_height(40, 24), 0);
+    }
+
+    #[test]
+    fn the_cell_view_gives_up_rows_to_show_itself() {
+        let long = "a\n\"".to_string() + &"x".repeat(500) + "\"\n";
+        let mut app = app_sized("cellroom.csv", &long, 40);
+        let before = App::viewport_rows(24, 0);
+        press(&mut app, 'K');
+        let panel = app.panel_height(40, 24);
+        assert!(panel > 0);
+        assert_eq!(
+            App::viewport_rows(24, panel),
+            before - panel as usize,
+            "the table gives up exactly what the panel takes"
+        );
+        assert!(panel <= 12, "and never more than half the screen");
     }
 
     #[test]

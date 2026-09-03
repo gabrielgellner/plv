@@ -19,6 +19,87 @@ const GAP: usize = 2;
 /// At most this many rows, so the panel cannot crowd out the table.
 const MAX_ROWS: u16 = 4;
 
+/// The cursor cell shown in full.
+///
+/// Shares the strip above the status bar with the completion panel, for the
+/// same reason: it appears while you are looking at something, takes its rows
+/// from the table rather than covering it, and goes away again.
+pub struct CellView<'a> {
+    pub name: &'a str,
+    pub value: &'a str,
+    pub theme: &'a Theme,
+}
+
+/// Break a value into lines that fit `width`.
+///
+/// Newlines already in the value are kept — a quoted field can hold them, and
+/// they are the author's own line breaks. Everything else is split on width,
+/// counting characters rather than bytes.
+pub fn wrap(value: &str, width: u16) -> Vec<String> {
+    let width = (width as usize).max(1);
+    let mut lines = Vec::new();
+    for line in value.split('\n') {
+        let chars: Vec<char> = line.chars().collect();
+        if chars.is_empty() {
+            lines.push(String::new());
+            continue;
+        }
+        for chunk in chars.chunks(width) {
+            lines.push(chunk.iter().collect());
+        }
+    }
+    lines
+}
+
+/// Rows the cell view wants: a heading plus the wrapped value, within
+/// `available`.
+pub fn cell_height(value: &str, width: u16, available: u16) -> u16 {
+    let wrapped = wrap(value, width).len() as u16;
+    (wrapped + 1).min(available.max(2))
+}
+
+impl Widget for CellView<'_> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        if area.height == 0 {
+            return;
+        }
+        let base = Style::new()
+            .bg(self.theme.status_bg)
+            .fg(self.theme.status_fg);
+        let heading = base.fg(self.theme.header).add_modifier(Modifier::BOLD);
+
+        let wrapped = wrap(self.value, area.width);
+        let room = area.height.saturating_sub(1) as usize;
+        let shown = wrapped.len().min(room);
+
+        let count = self.value.chars().count();
+        let mut lines = vec![Line::from(Span::styled(
+            format!(
+                "{} — {count} character{}",
+                self.name,
+                if count == 1 { "" } else { "s" }
+            ),
+            heading,
+        ))];
+        lines.extend(
+            wrapped
+                .iter()
+                .take(shown)
+                .map(|line| Line::from(Span::styled(line.clone(), base))),
+        );
+        // Say what was left out rather than stopping in silence.
+        if shown < wrapped.len() {
+            let last = lines.len() - 1;
+            lines[last] = Line::from(Span::styled(
+                format!("… {} more lines", wrapped.len() - shown + 1),
+                base.add_modifier(Modifier::ITALIC),
+            ));
+        }
+
+        Paragraph::new(lines).style(base).render(area, buf);
+    }
+}
+
 pub struct Panel<'a> {
     pub items: &'a [String],
     /// The candidate currently applied to the line, if the list is being
@@ -116,6 +197,64 @@ mod tests {
 
     fn items(n: usize) -> Vec<String> {
         (0..n).map(|i| format!("item{i:02}")).collect()
+    }
+
+    #[test]
+    fn wrapping_keeps_the_values_own_line_breaks() {
+        // A quoted field can hold newlines, and they are the author's.
+        assert_eq!(wrap("one\ntwo", 40), ["one", "two"]);
+        assert_eq!(wrap("", 40), [""], "an empty value is still a line");
+        assert_eq!(wrap("abcdef", 3), ["abc", "def"]);
+        assert_eq!(
+            wrap("ab\n\ncd", 40),
+            ["ab", "", "cd"],
+            "a blank line survives"
+        );
+    }
+
+    #[test]
+    fn wrapping_counts_characters_not_bytes() {
+        // Three characters, six bytes: a byte-wise split would cut one in half.
+        assert_eq!(wrap("éàü", 3), ["éàü"]);
+        assert_eq!(wrap("éàü", 2), ["éà", "ü"]);
+    }
+
+    #[test]
+    fn a_narrow_panel_does_not_divide_by_zero() {
+        assert_eq!(wrap("abc", 0), ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn the_cell_view_asks_for_a_heading_plus_its_lines() {
+        assert_eq!(cell_height("one line", 40, 10), 2, "heading and one line");
+        assert_eq!(cell_height("abcdef", 3, 10), 3, "heading and two");
+        // Never more than it is given.
+        assert_eq!(cell_height(&"x".repeat(400), 10, 6), 6);
+    }
+
+    #[test]
+    fn a_value_too_long_for_the_panel_says_how_much_is_missing() {
+        let theme = Theme::catppuccin_mocha();
+        let value = "x".repeat(200);
+        // Wide enough for the heading; the value is what should be cut.
+        let area = Rect::new(0, 0, 30, 4);
+        let mut buf = Buffer::empty(area);
+        CellView {
+            name: "note",
+            value: &value,
+            theme: &theme,
+        }
+        .render(area, &mut buf);
+
+        let lines: Vec<String> = (0..area.height)
+            .map(|y| (0..area.width).map(|x| buf[(x, y)].symbol()).collect())
+            .collect();
+        assert!(lines[0].contains("note"), "{lines:?}");
+        assert!(lines[0].contains("200 characters"), "{lines:?}");
+        assert!(
+            lines[area.height as usize - 1].contains("more lines"),
+            "{lines:?}"
+        );
     }
 
     #[test]

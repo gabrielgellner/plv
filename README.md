@@ -44,8 +44,14 @@ Press `?` at any time for the key bindings of whatever screen you are on.
 | `z>` / `z<` | Widen / narrow the cursor column |
 | `z_` | Fit the column to the widest value on screen |
 | `z=` | Put every column width back |
+| `K` | Show the cursor cell in full, above the status bar |
 | `?` | Show key bindings for the current screen |
 | `q` | Quit |
+
+A column can only be made so wide. `K` shows the cursor cell in full above the
+status bar instead — vim's "tell me about the thing under the cursor" — and
+stays on as the cursor moves, so a column of long values can be read by walking
+down it. Newlines inside a quoted field are kept as the author wrote them.
 
 Widening a column pushes the ones after it along and off the right edge, as a
 spreadsheet does, rather than squeezing everything to make room — `h` and `l`
