@@ -1344,17 +1344,21 @@ impl App {
                 self.hide_column()?;
             }
 
-            KeyCode::Char('s')
-                if matches!(
-                    self.selection_mode,
-                    SelectionMode::Column | SelectionMode::Cell
-                ) =>
-            {
+            // Sort by the cursor column. Row mode adopts one, as `-` and the
+            // edit keys do — and the selection it would reshape is one this
+            // key already clears, so there is nothing to make an exception
+            // for. `Esc` puts the order back.
+            KeyCode::Char('s') => {
                 self.visual_anchor = None;
+                // Asked before anything moves, so a refusal leaves the screen
+                // as it was — the selection mode included. Adopting a cursor
+                // for a sort that is then refused would be a visible change
+                // with nothing to show for it.
                 if let Some(reason) = self.store.as_ref().and_then(Store::sort_blocked) {
                     self.message = Some(reason);
                     return Ok(());
                 }
+                self.adopt_column_cursor();
                 if let Some(store) = &mut self.store {
                     self.sort_rx = Some(store.begin_sort(self.cursor_col));
                     self.cursor_row = 0;
@@ -4548,6 +4552,23 @@ mod tests {
 
         command(&mut app, "reset select");
         assert_eq!(shown_columns(&app), ["a", "b", "c", "d"]);
+    }
+
+    /// `s` adopts for the same reason `-` does. The selection it reshapes is
+    /// one it already clears, so there is nothing to make an exception for.
+    #[test]
+    fn sorting_in_row_mode_adopts_a_column_cursor() {
+        let mut app = app_sized("sortrow.csv", FOURCOL, 60);
+        assert_eq!(app.selection_mode, SelectionMode::Row);
+
+        press(&mut app, 's');
+        assert_eq!(app.selection_mode, SelectionMode::Cell, "as Tab would");
+        settle_sort(&mut app);
+        assert_eq!(
+            app.store.as_ref().unwrap().view.sort,
+            [(0, true)],
+            "and sorted by the column it landed on"
+        );
     }
 
     /// Row mode is what plv opens in, and a key that does nothing there is

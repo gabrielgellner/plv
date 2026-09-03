@@ -87,8 +87,11 @@ Press `Tab` to cycle through three selection modes:
 - **Column** — the current column is highlighted; search covers only that column; press `s` to sort, `Esc` to clear all sorts
 - **Cell** — only the cursor cell is highlighted; search covers only the current column; press `s` to sort, `Esc` to clear all sorts
 
-The mode also decides the shape of a `v` selection, and an edit key pressed in
-row mode adopts a column cursor rather than doing nothing.
+The mode also decides the shape of a `v` selection. Any key that acts on *a
+column* — an edit, `s`, `-` — adopts a column cursor when pressed in row mode
+rather than doing nothing, taking the leftmost visible column, which is where
+`Tab` would have put it. So none of them is stuck behind a mode switch in the
+mode plv opens in.
 
 ## Search
 
@@ -175,8 +178,7 @@ inside a query.
 
 `-` hides the cursor column: `:hide <name>` without the name. It accumulates, so
 pressing it again narrows further, and `:reset select` brings everything back.
-Pressed in row mode it takes a column cursor first, the leftmost visible one —
-where `Tab` would have put it — so it works straight from the mode plv opens in.
+In row mode it takes a column cursor first, as `s` and the edit keys do.
 
 `C` opens the **column picker** — every column in a list, with a tick for shown
 and a tick for pinned. It touches no column cursor at all, being a list of every
