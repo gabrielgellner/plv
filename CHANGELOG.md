@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.0] - 2026-09-03
+
+### Features
+
+- pin columns to the left edge with zp ([`f2b660e`](https://gitlab.com/gabrielgellner/plv/-/commit/f2b660e8334118ba31aeda330ac9ac04d8dc4325))
+- hide the cursor column with - ([`cf5935f`](https://gitlab.com/gabrielgellner/plv/-/commit/cf5935f95eca786917eb1fdb2d457740bd6aa8ab))
+
 ## [0.9.0] - 2026-09-03
 
 ### Bug Fixes
@@ -149,6 +156,8 @@ All notable changes to this project will be documented in this file.
 ### Styling
 
 - fix clippy warnings ([`5cb0dba`](https://gitlab.com/gabrielgellner/plv/-/commit/5cb0dba5f5d4bc0be4d3d3b09fd1e7cd00ff7722))
+
+[0.10.0]: https://gitlab.com/gabrielgellner/plv/-/compare/v0.9.0...v0.10.0
 
 [0.9.0]: https://gitlab.com/gabrielgellner/plv/-/compare/v0.8.0...v0.9.0
 
