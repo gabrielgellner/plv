@@ -27,6 +27,7 @@ src/
   lib.rs          library root (bin and examples both use it)
   app.rs          App layer: event loop, state, key bindings, two screens
   lake.rs         DuckLake browse state: table list ↔ file pane ↔ open scope
+  picker.rs       the column picker: what is on show and what is pinned
   data/
     loader.rs     detect format by extension, return LazyFrame
     store.rs      scroll state + data fetching (Polars or lake-backed)
@@ -62,7 +63,7 @@ src/
 - `App` owns `Option<Store>`, `col_offset`, and an optional `error: String`.
 - `run()`: loads the file into a `Store` sized to the terminal, then enters the event loop.
 - `draw()`: updates `store.viewport_rows` on resize, then renders `DataTable` + `StatusBar` (or an error/usage message if no file is loaded).
-- Vim key bindings: `j/k` (±1 row), `Ctrl+d`/`Ctrl+u` (half a screen: the view and the cursor move together, as in vim, rather than the cursor walking to the edge first), `gg/G` (top/bottom), `{n}gg`/`{n}G` (row n), `zz`/`zt`/`zb` (scroll the cursor row to the middle/top/bottom of the viewport), `h/l` and `{n}h`/`{n}l` (columns, counted like `j`/`k`), `0`/`$` (scroll so the first/last column sits at its edge), `H` (leftmost column), `zp`/`z|` (pin the cursor column at the left edge / unpin every column), `-` (hide the cursor column), `q` (quit). Arrow keys mirror `j/k/h/l`.
+- Vim key bindings: `j/k` (±1 row), `Ctrl+d`/`Ctrl+u` (half a screen: the view and the cursor move together, as in vim, rather than the cursor walking to the edge first), `gg/G` (top/bottom), `{n}gg`/`{n}G` (row n), `zz`/`zt`/`zb` (scroll the cursor row to the middle/top/bottom of the viewport), `h/l` and `{n}h`/`{n}l` (columns, counted like `j`/`k`), `0`/`$` (scroll so the first/last column sits at its edge), `H` (leftmost column), `zp`/`z|` (pin the cursor column at the left edge / unpin every column), `-` (hide the cursor column), `C` (the column picker), `q` (quit). Arrow keys mirror `j/k/h/l`.
 - Horizontal movement stops where the last column reaches the right edge, in every selection mode: scrolling past it would pad the view with empty space instead of data. `ui::col_offset_showing()` answers that question, and lives beside the renderer that has to agree with it — the app layer used to keep its own copy of the arithmetic and the two drifted apart.
 
 ## Editing
@@ -178,6 +179,26 @@ the key. The cursor is left where the column was, on whatever moved into that
 position — `dd`'s rule, and it falls out of the clamp in `after_view_change`.
 There is no key that un-hides one column, since naming it is the only way to say
 which, so the message says `:reset select` at the moment the user might want it.
+
+`C` opens the **column picker** (`src/picker.rs`), the other direction: a list of
+every column with a tick for shown and one for pinned, `Space` and `p` to toggle,
+`Enter` to apply and `Esc` to leave. It holds a **working copy**, so cancelling
+costs nothing and `Enter` is the only thing that changes anything — and what it
+produces is a `view::Command::Select` through `App::apply_view_command`, the same
+path `:select` and `-` take, so it is a way of *writing* a select rather than a
+second mechanism deciding what shows. It lists in the **view's** order with the
+hidden columns appended, and applies in the order listed, because `:select c a`
+sets an order as well as a set and listing in file order would silently undo it.
+Unticking the last column is refused where it is pressed rather than on `Enter`,
+after a whole session of ticking that cannot be applied. Pins go in and come back
+out, and are allowed on a hidden column, since a pin waits for its column
+anyway; on apply, pins the screen has no room for are **trimmed from the right
+and named** rather than refused whole — the view change is what the user came
+for, and giving that up over a pin would be abandoning the wrong half, so it
+keeps what fits the way a filter that fills its row set keeps what it has. Unlike
+`-` it needs no column cursor and works in row mode. `?` reaches it, and its help
+is the picker's keys alone: `GENERAL`'s `q` means quit where the picker's means
+cancel, and one overlay must not say both.
 `Store::sort` already worked this way.
 
 Evaluation order is fixed independently of the order commands were typed:
