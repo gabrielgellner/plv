@@ -33,7 +33,9 @@ This project uses [Conventional Commits](https://www.conventionalcommits.org/). 
 | `chore:` | `chore: update dependencies` | bumps patch |
 | `feat!:` or `BREAKING CHANGE:` in body | | bumps major |
 
-`chore(release):` commits are generated automatically by `just bump` and are excluded from the changelog.
+`chore(release):` commits are generated automatically by `just bump` and are excluded from the changelog. Merge commits are excluded too, so the changelog entry comes from the branch's own commit — give that one the type you want the release notes to read.
+
+**Polish is `feat:`, not `fix:`.** Reserve `fix:` for something that was actually broken. A change to what a key does, what the screen shows, or what the user can now reach is a feature even when it reads like correcting a wart — it is what the user will notice in the release. v0.12.0 shipped `-` and `s` gaining a column cursor and the sort-indicator rework as four `fix:` commits, so the notes had no **Features** heading and `just bump` proposed a patch when the release plainly was not one.
 
 ## Release workflow
 
