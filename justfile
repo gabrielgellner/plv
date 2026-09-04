@@ -1,4 +1,9 @@
 # plv release workflow
+#
+# `just --list` shows a recipe's *last* comment line and drops the rest, so
+# every recipe here puts its detail above and its one-line summary at the
+# bottom of the block. Written the other way round, the listing quotes a
+# fragment of the explanation instead of saying what the recipe does.
 
 # List available recipes
 default:
@@ -17,10 +22,14 @@ changelog-full:
 next-version:
     @git-cliff --bumped-version
 
-# Bump version: update Cargo.toml + CHANGELOG.md, commit, tag.
-# For the very first release pass the version explicitly: just bump v0.1.0
-# Subsequent releases can omit it and git-cliff will calculate the bump automatically.
-# Does NOT push — review with `git log --oneline -5`, then run `just release`.
+# For the very first release pass the version explicitly: `just bump v0.1.0`.
+# Otherwise omit it and git-cliff calculates the bump from the commit types
+# since the last tag — pass one by hand when that answer is wrong, as it is
+# for a release of polish committed under `fix:`.
+#
+# Nothing is pushed. Review with `git log --oneline -5`, then `just release`.
+#
+# Update Cargo.toml + CHANGELOG.md, commit and tag — without pushing
 bump version="":
     #!/usr/bin/env bash
     set -euo pipefail
@@ -55,8 +64,10 @@ bump version="":
     echo "Review with:  git log --oneline -5"
     echo "Then run:     just release"
 
-# Push the current branch + latest tag, then create the GitLab release.
-# Run after `just bump`.
+# Run after `just bump`. Publishes only: the binary on this machine is left
+# alone, and `just install` is the step that changes it.
+#
+# Push the branch and tag, then create the GitLab release
 release:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -82,8 +93,7 @@ release:
 # Separate from `release` on purpose: publishing to GitLab and replacing the
 # binary on this machine are different decisions, and a release cut from a
 # branch you are not running should not silently change what `plv` means in
-# your shell. `just --list` shows the last comment line, so the summary goes
-# at the bottom.
+# your shell.
 #
 # Install the working tree to ~/.cargo/bin and say what landed
 install:
