@@ -85,6 +85,18 @@ just release
 
 This pushes the branch and tag to GitLab and creates a GitLab release with the changelog section for this version as the release notes.
 
+### Update your own copy
+
+Publishing does not touch the binary on your machine — `plv` in your shell stays
+whatever you last installed, which is easy to miss for several releases running.
+
+```bash
+just install       # cargo install --path ., then prints what landed
+```
+
+It is deliberately a separate step: cutting a release from a branch you are not
+running should not silently change what `plv` means in your shell.
+
 ### Update the changelog without cutting a release
 
 ```bash
