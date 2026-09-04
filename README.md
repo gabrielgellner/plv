@@ -298,6 +298,9 @@ take — the bounds come from the machine rather than being compiled in.
 cargo install --path .
 ```
 
+From a checkout, `just install` does the same and then prints which version
+landed on your PATH.
+
 ## Build
 
 ```

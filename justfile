@@ -76,3 +76,19 @@ release:
         --notes "$NOTES"
 
     echo "Released $TAG to GitLab."
+    echo ""
+    echo "Your own copy is unchanged. Run: just install"
+
+# Separate from `release` on purpose: publishing to GitLab and replacing the
+# binary on this machine are different decisions, and a release cut from a
+# branch you are not running should not silently change what `plv` means in
+# your shell. `just --list` shows the last comment line, so the summary goes
+# at the bottom.
+#
+# Install the working tree to ~/.cargo/bin and say what landed
+install:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo install --path .
+    echo ""
+    echo "Now on PATH: $(plv --version) at $(command -v plv)"
