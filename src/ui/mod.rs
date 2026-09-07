@@ -1,4 +1,5 @@
 mod browser;
+pub mod cell;
 mod help;
 mod panel;
 mod prompt;
@@ -7,6 +8,7 @@ mod table;
 pub mod theme;
 
 pub use browser::{Browser, BrowserState};
+pub use cell::CellWindow;
 pub use help::{Help, Section};
 pub use panel::{CellView, Panel, cell_height, height as panel_height, wrap};
 pub use prompt::Prompt;
