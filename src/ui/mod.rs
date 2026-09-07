@@ -1,6 +1,7 @@
 mod browser;
 pub mod cell;
 mod help;
+pub mod json;
 mod panel;
 mod prompt;
 mod statusbar;
