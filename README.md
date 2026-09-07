@@ -48,7 +48,7 @@ Press `?` at any time for the key bindings of whatever screen you are on.
 | `zp` / `z\|` | Pin the cursor column to the left edge / unpin every column |
 | `-` | Hide the cursor column |
 | `C` | Open the column picker |
-| `K` | Open the cursor cell in a window of its own |
+| `K` | Open the cursor cell in a window of its own (`r` raw ↔ formatted) |
 | `zk` | Show the cursor cell in full, above the status bar |
 | `?` | Show key bindings for the current screen |
 | `q` | Quit |
@@ -60,6 +60,15 @@ column, its type and its size, and scrolled with `j`/`k`, `Ctrl+d`/`Ctrl+u` and
 `g`/`G`. It holds the keys while it is up, so `q` closes it rather than quitting
 plv, and it covers the table rather than taking rows from it — closing it puts
 the screen back exactly as it was.
+
+A cell that is a JSON document is shown as one: re-indented, coloured, and
+titled `note — json, 291 characters`. Detection is a real parse rather than a
+guess — a value is JSON only if it parses all the way to the end, and anything
+else is left as text — and the document is re-indented from its own bytes rather
+than rebuilt from a parsed model, so key order, number formatting, duplicate keys
+and escapes are exactly what the file says. `r` switches to the raw value and
+back, since the formatted view is an interpretation and the raw one is what gets
+edited and written.
 
 `zk` is the other half: the same value in the strip above the status bar, two or
 three lines of it, staying on as the cursor moves so a column of long values can

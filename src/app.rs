@@ -116,13 +116,20 @@ enum EditStart {
 /// which depends on how wide it is — all of it settled by `ui::cell_window`
 /// at layout time. A key pressed before the first frame simply moves by a
 /// line.
-#[derive(Default)]
 struct Inspect {
     /// First wrapped line on show. Not clamped here: `draw` knows how many
     /// lines there are and clamps it there, the way the picker's scroll is
     /// clamped, so `G` can just ask for the end.
     scroll: usize,
     rows: usize,
+    /// The value's display lines, formatted once when the window opened.
+    ///
+    /// Kept rather than rebuilt each frame because recognising a format is a
+    /// real parse of the whole value, and paying that on every `j` would make
+    /// scrolling a big document cost what opening it did. Nothing can change
+    /// it while it is held: the cursor cannot move while the window is up, so
+    /// the cell under it is fixed.
+    content: ui::cell::Content,
 }
 
 /// Which screen is in front: the lake catalog browser, or the data viewer.
@@ -545,10 +552,16 @@ impl App {
                             spinner_tick: self.spinner_tick,
                             sort_tick: self.sort_rx.as_ref().map(|_| self.spinner_tick),
                             filtering: store.filtering(),
-                            help: if self.inspect.is_some() {
+                            help: if let Some(inspect) = &self.inspect {
                                 // The window holds every key while it is up,
                                 // so the bar has to stop offering the table's.
-                                " j/k:↕  g/G:start/end  q:close "
+                                // `r` is named only where there is another
+                                // view of this value to switch to.
+                                match (inspect.content.switchable(), inspect.content.raw) {
+                                    (false, _) => " j/k:↕  g/G:start/end  q:close ",
+                                    (true, false) => " j/k:↕  g/G:start/end  r:raw  q:close ",
+                                    (true, true) => " j/k:↕  g/G:start/end  r:formatted  q:close ",
+                                }
                             } else if self.picker.is_some() {
                                 " -:show  a/A:all/one  p:pin  ⏎:apply  esc "
                             } else if self.lake.is_some() {
@@ -613,9 +626,11 @@ impl App {
         if self.inspect.is_none() {
             return;
         }
-        let Some((name, value)) = self.cell_under_cursor() else {
-            // Nothing left to read — the window holds every key while it is
-            // up, and one with nothing in it could only be escaped from.
+        // The value itself is not read here: the window holds the lines it
+        // formatted when it opened. This is the check that there is still a
+        // cell under the cursor at all — the window holds every key while it
+        // is up, and one with nothing in it could only be escaped from.
+        let Some((name, _)) = self.cell_under_cursor() else {
             self.inspect = None;
             return;
         };
@@ -625,21 +640,27 @@ impl App {
             .and_then(|store| store.column_info(self.cursor_col))
             .map_or_else(String::new, |(_, dtype)| dtype.to_string());
 
-        let title = ui::cell::title(&name, &dtype, &value);
-        let (popup, lines) = ui::cell::window(&value, &title, area);
-        let rows = ui::cell::text_rows(popup);
-        let Some(inspect) = &mut self.inspect else {
+        let Some(inspect) = &self.inspect else {
             return;
         };
-        inspect.rows = rows;
-        inspect.scroll = inspect.scroll.min(ui::cell::max_scroll(lines.len(), rows));
-        let scroll = inspect.scroll;
+        let title = ui::cell::title(&name, &dtype, &inspect.content);
+        let (popup, lines) = ui::cell::window(&inspect.content.lines, &title, area);
+        let rows = ui::cell::text_rows(popup);
+        let scroll = inspect.scroll.min(ui::cell::max_scroll(lines.len(), rows));
 
+        if let Some(inspect) = &mut self.inspect {
+            inspect.rows = rows;
+            inspect.scroll = scroll;
+        }
+
+        let Some(inspect) = &self.inspect else {
+            return;
+        };
         frame.render_widget(
             CellWindow {
                 name: &name,
                 dtype: &dtype,
-                value: &value,
+                content: &inspect.content,
                 scroll,
                 theme: &self.theme,
             },
@@ -788,6 +809,7 @@ impl App {
             ("Ctrl+d / Ctrl+u", "Half a window"),
             ("Ctrl+f / Ctrl+b", "A whole window"),
             ("g / G", "First / last line"),
+            ("r", "Raw ↔ formatted, where a format was recognised"),
             ("q / Esc / K", "Close"),
         ];
         const BROWSER: &[Section<'static>] = &[("Catalog", BROWSE), ("General", GENERAL)];
@@ -1349,6 +1371,21 @@ impl App {
             KeyCode::Char('g') | KeyCode::Home => inspect.scroll = 0,
             KeyCode::Char('G') | KeyCode::End => inspect.scroll = usize::MAX,
             KeyCode::Char('q') | KeyCode::Char('K') | KeyCode::Esc => self.inspect = None,
+            // Back and forth between the bytes and what plv made of them. The
+            // formatted view is an interpretation, and the raw value is the
+            // one that gets edited and written, so it has to be reachable.
+            // The scroll is kept and `draw` clamps it: the two views are the
+            // same value and roughly the same length, so landing back where
+            // you were reads better than being sent to the top.
+            KeyCode::Char('r') if !ctrl && inspect.content.switchable() => {
+                let raw = !inspect.content.raw;
+                if let Some((_, value)) = self.cell_under_cursor() {
+                    let content = ui::cell::Content::new(&value, raw, &self.theme);
+                    if let Some(inspect) = &mut self.inspect {
+                        inspect.content = content;
+                    }
+                }
+            }
             _ => {}
         }
         Ok(())
@@ -1601,8 +1638,12 @@ impl App {
                 self.adopt_column_cursor();
                 // Nothing to read means no window: it holds every key while
                 // it is up, so an empty one could only be escaped from.
-                if self.cell_under_cursor().is_some() {
-                    self.inspect = Some(Inspect::default());
+                if let Some((_, value)) = self.cell_under_cursor() {
+                    self.inspect = Some(Inspect {
+                        scroll: 0,
+                        rows: 0,
+                        content: ui::cell::Content::new(&value, false, &self.theme),
+                    });
                 }
             }
             KeyCode::Char('#') => {
@@ -5070,6 +5111,49 @@ mod tests {
 
         press(&mut app, 'q');
         assert_eq!(drawn(&mut app, 60, 16), plain, "and the table is back");
+    }
+
+    /// A JSON cell is shown as a document, and `r` gets back to the bytes.
+    #[test]
+    fn r_switches_between_the_formatting_and_the_value() {
+        let json = r#"{""id"":4821,""tags"":[""a"",""b""]}"#;
+        let file = format!("id,note\n1,\"{json}\"\n");
+        let mut app = app_sized("celljson.csv", &file, 80);
+        cell_mode(&mut app);
+        press(&mut app, 'l');
+
+        press(&mut app, 'K');
+        let content = &app.inspect.as_ref().unwrap().content;
+        assert_eq!(content.format, ui::cell::Format::Json);
+        assert!(!content.raw);
+        assert!(content.lines.len() > 1, "broken out over several lines");
+
+        press(&mut app, 'r');
+        let content = &app.inspect.as_ref().unwrap().content;
+        assert!(content.raw);
+        assert_eq!(content.lines.len(), 1, "the cell as it is written");
+        assert_eq!(
+            content.format,
+            ui::cell::Format::Json,
+            "still known for what it is, so there is a way back"
+        );
+
+        press(&mut app, 'r');
+        assert!(!app.inspect.as_ref().unwrap().content.raw);
+    }
+
+    /// A cell with nothing to recognise has nothing to switch to, and the key
+    /// does not pretend otherwise.
+    #[test]
+    fn r_does_nothing_where_no_format_was_recognised() {
+        let mut app = windowed("cellnojson.csv");
+        press(&mut app, 'K');
+        assert_eq!(
+            app.inspect.as_ref().unwrap().content.format,
+            ui::cell::Format::Text
+        );
+        press(&mut app, 'r');
+        assert!(!app.inspect.as_ref().unwrap().content.raw);
     }
 
     /// The two views of a cell are independent: one covers, one displaces.
