@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.13.0] - 2026-09-07
+
+### Documentation
+
+- polish is a feat, not a fix ([`1a92ab4`](https://gitlab.com/gabrielgellner/plv/-/commit/1a92ab4b5f1d4591106292d64d314cff761ff84a))
+
+### Features
+
+- `K` opens the cursor cell in a window of its own ([`7cf51f1`](https://gitlab.com/gabrielgellner/plv/-/commit/7cf51f156d4f2340c6e5cc576c392a8d026f5042))
+
+### Miscellaneous
+
+- a `just install` recipe ([`c5ef842`](https://gitlab.com/gabrielgellner/plv/-/commit/c5ef84228d2ebbaf698e8795fcdc3b7d2555996c))
+- recipe summaries that survive `just --list` ([`b9f630f`](https://gitlab.com/gabrielgellner/plv/-/commit/b9f630f89a5e7e35d323f06a47cd8e642fda8c35))
+
 ## [0.12.0] - 2026-09-03
 
 ### Bug Fixes
@@ -180,6 +195,8 @@ All notable changes to this project will be documented in this file.
 ### Styling
 
 - fix clippy warnings ([`5cb0dba`](https://gitlab.com/gabrielgellner/plv/-/commit/5cb0dba5f5d4bc0be4d3d3b09fd1e7cd00ff7722))
+
+[0.13.0]: https://gitlab.com/gabrielgellner/plv/-/compare/v0.12.0...v0.13.0
 
 [0.12.0]: https://gitlab.com/gabrielgellner/plv/-/compare/v0.11.0...v0.12.0
 
