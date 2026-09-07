@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.14.0] - 2026-09-07
+
+### Features
+
+- a JSON cell is shown as a document, not as a paragraph ([`4846e74`](https://gitlab.com/gabrielgellner/plv/-/commit/4846e7456512b1b08c2c4661fd95aba2fe8b4ab1))
+
 ## [0.13.0] - 2026-09-07
 
 ### Documentation
@@ -195,6 +201,8 @@ All notable changes to this project will be documented in this file.
 ### Styling
 
 - fix clippy warnings ([`5cb0dba`](https://gitlab.com/gabrielgellner/plv/-/commit/5cb0dba5f5d4bc0be4d3d3b09fd1e7cd00ff7722))
+
+[0.14.0]: https://gitlab.com/gabrielgellner/plv/-/compare/v0.13.0...v0.14.0
 
 [0.13.0]: https://gitlab.com/gabrielgellner/plv/-/compare/v0.12.0...v0.13.0
 
