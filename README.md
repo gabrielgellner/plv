@@ -48,14 +48,25 @@ Press `?` at any time for the key bindings of whatever screen you are on.
 | `zp` / `z\|` | Pin the cursor column to the left edge / unpin every column |
 | `-` | Hide the cursor column |
 | `C` | Open the column picker |
-| `K` | Show the cursor cell in full, above the status bar |
+| `K` | Open the cursor cell in a window of its own |
+| `zk` | Show the cursor cell in full, above the status bar |
 | `?` | Show key bindings for the current screen |
 | `q` | Quit |
 
-A column can only be made so wide. `K` shows the cursor cell in full above the
-status bar instead — vim's "tell me about the thing under the cursor" — and
-stays on as the cursor moves, so a column of long values can be read by walking
-down it. Newlines inside a quoted field are kept as the author wrote them.
+A column can only be made so wide, so there are two ways to see a value that
+does not fit. `K` — vim's "tell me about the thing under the cursor" — opens the
+cell in a window over the table: wrapped at word boundaries, titled with the
+column, its type and its size, and scrolled with `j`/`k`, `Ctrl+d`/`Ctrl+u` and
+`g`/`G`. It holds the keys while it is up, so `q` closes it rather than quitting
+plv, and it covers the table rather than taking rows from it — closing it puts
+the screen back exactly as it was.
+
+`zk` is the other half: the same value in the strip above the status bar, two or
+three lines of it, staying on as the cursor moves so a column of long values can
+be read by walking down it. One is for reading a cell, the other for scanning a
+column of them.
+
+Newlines inside a quoted field are kept as the author wrote them by both.
 
 Widening a column pushes the ones after it along and off the right edge, as a
 spreadsheet does, rather than squeezing everything to make room — `h` and `l`

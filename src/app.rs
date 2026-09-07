@@ -21,8 +21,8 @@ use crate::lake::{Lake, Level, Scope};
 use crate::picker::Picker;
 use crate::search::{SearchQuery, SearchState, SearchStatus};
 use crate::ui::{
-    self, Browser, CellView, DataTable, Help, Panel, Prompt, Section, SelectionMode, StatusBar,
-    Theme,
+    self, Browser, CellView, CellWindow, DataTable, Help, Panel, Prompt, Section, SelectionMode,
+    StatusBar, Theme,
 };
 use crate::view;
 use polars::prelude::DataType;
@@ -106,6 +106,23 @@ enum EditStart {
     End,
     /// `c`: an empty field.
     Empty,
+}
+
+/// The cell window, while it is up: where the value is scrolled to, and how
+/// much of it the window can hold.
+///
+/// The height is captured by `draw` rather than worked out by the key
+/// handler, because how tall the window is depends on how the value wrapped,
+/// which depends on how wide it is — all of it settled by `ui::cell_window`
+/// at layout time. A key pressed before the first frame simply moves by a
+/// line.
+#[derive(Default)]
+struct Inspect {
+    /// First wrapped line on show. Not clamped here: `draw` knows how many
+    /// lines there are and clamps it there, the way the picker's scroll is
+    /// clamped, so `G` can just ask for the end.
+    scroll: usize,
+    rows: usize,
 }
 
 /// Which screen is in front: the lake catalog browser, or the data viewer.
@@ -199,6 +216,13 @@ pub struct App {
     pinned: std::collections::BTreeSet<usize>,
     /// The column picker, while it is up.
     picker: Option<Picker>,
+    /// The cursor cell shown in a window of its own, over the table.
+    ///
+    /// Where `cell_view` is a band that stays on while the cursor moves, this
+    /// is modal and holds the keys while it is up: what `j` scrolls is the
+    /// value, not the table. Two views of one cell, because reading a long
+    /// value and walking a column of them are different things to want.
+    inspect: Option<Inspect>,
 }
 
 impl App {
@@ -243,6 +267,7 @@ impl App {
             widths: ui::Widths::new(),
             pinned: std::collections::BTreeSet::new(),
             picker: None,
+            inspect: None,
         }
     }
 
@@ -520,7 +545,11 @@ impl App {
                             spinner_tick: self.spinner_tick,
                             sort_tick: self.sort_rx.as_ref().map(|_| self.spinner_tick),
                             filtering: store.filtering(),
-                            help: if self.picker.is_some() {
+                            help: if self.inspect.is_some() {
+                                // The window holds every key while it is up,
+                                // so the bar has to stop offering the table's.
+                                " j/k:↕  g/G:start/end  q:close "
+                            } else if self.picker.is_some() {
                                 " -:show  a/A:all/one  p:pin  ⏎:apply  esc "
                             } else if self.lake.is_some() {
                                 " f:partitions  T:snapshots  b:back  ?:help "
@@ -567,8 +596,55 @@ impl App {
             );
         }
 
+        self.draw_inspect(frame, area);
         self.draw_help(frame, area);
         self.last_vis_col = vis_col_cell.get();
+    }
+
+    /// The cell window, drawn over the table and under the help overlay —
+    /// `?` explains what is in front, so it has to be in front.
+    ///
+    /// Where the scroll is clamped: this is the one place that knows both how
+    /// many lines the value wrapped to and how many the window holds, and it
+    /// runs before every frame, so a key handler can move the scroll freely
+    /// and `G` can simply ask for the end. The picker's scroll is clamped
+    /// here for the same reason.
+    fn draw_inspect(&mut self, frame: &mut Frame, area: ratatui::layout::Rect) {
+        if self.inspect.is_none() {
+            return;
+        }
+        let Some((name, value)) = self.cell_under_cursor() else {
+            // Nothing left to read — the window holds every key while it is
+            // up, and one with nothing in it could only be escaped from.
+            self.inspect = None;
+            return;
+        };
+        let dtype = self
+            .store
+            .as_ref()
+            .and_then(|store| store.column_info(self.cursor_col))
+            .map_or_else(String::new, |(_, dtype)| dtype.to_string());
+
+        let title = ui::cell::title(&name, &dtype, &value);
+        let (popup, lines) = ui::cell::window(&value, &title, area);
+        let rows = ui::cell::text_rows(popup);
+        let Some(inspect) = &mut self.inspect else {
+            return;
+        };
+        inspect.rows = rows;
+        inspect.scroll = inspect.scroll.min(ui::cell::max_scroll(lines.len(), rows));
+        let scroll = inspect.scroll;
+
+        frame.render_widget(
+            CellWindow {
+                name: &name,
+                dtype: &dtype,
+                value: &value,
+                scroll,
+                theme: &self.theme,
+            },
+            area,
+        );
     }
 
     fn draw_help(&self, frame: &mut Frame, area: ratatui::layout::Rect) {
@@ -600,7 +676,8 @@ impl App {
             ("z> / z<", "Widen / narrow the cursor column"),
             ("z_", "Fit the column to what is on screen"),
             ("z=", "Put every column width back"),
-            ("K", "Show the cursor cell in full"),
+            ("K", "Open the cursor cell in a window"),
+            ("zk", "Show the cursor cell above the status bar"),
             ("#", "Relative or absolute row numbers"),
         ];
         const COLUMNS: &[(&str, &str)] = &[
@@ -706,16 +783,28 @@ impl App {
             ("Enter", "Apply"),
             ("Esc", "Cancel, changing nothing"),
         ];
+        const READ: &[(&str, &str)] = &[
+            ("j / k", "Down / up a line"),
+            ("Ctrl+d / Ctrl+u", "Half a window"),
+            ("Ctrl+f / Ctrl+b", "A whole window"),
+            ("g / G", "First / last line"),
+            ("q / Esc / K", "Close"),
+        ];
         const BROWSER: &[Section<'static>] = &[("Catalog", BROWSE), ("General", GENERAL)];
         // No `General` section: its `q` means quit, and in the picker `q`
         // cancels — one overlay must not say both. The picker's own list
         // already covers every key it answers.
         const PICKER: &[Section<'static>] = &[("Columns", PICK)];
+        // Same reason the picker has no `General`: while the window is up `q`
+        // closes it rather than quitting, and one overlay must not say both.
+        const CELL: &[Section<'static>] = &[("Cell", READ)];
 
         // The status bar has room for a few hints and then degrades, so for a
         // modal screen whose keys are not guessable the overlay is the real
         // reference — which is the reason it exists.
-        if self.picker.is_some() {
+        if self.inspect.is_some() {
+            CELL
+        } else if self.picker.is_some() {
             PICKER
         } else if self.screen == Screen::Browser {
             BROWSER
@@ -1167,6 +1256,14 @@ impl App {
         if self.screen == Screen::Browser {
             return self.handle_browser_key(key);
         }
+        // The window is modal: it is opened to read one value, and every key
+        // that would move the table underneath is a key it wants for moving
+        // through that value. `q` closes it rather than quitting for the same
+        // reason it cancels the picker — closing a window never destroys
+        // work, and there is none here to destroy.
+        if self.inspect.is_some() && matches!(self.mode, AppMode::Normal) {
+            return self.handle_inspect_key(key);
+        }
         match self.mode {
             AppMode::Search => self.handle_search_key(key),
             AppMode::Edit => self.handle_edit_key(key),
@@ -1218,6 +1315,40 @@ impl App {
             KeyCode::Char(c) => {
                 self.search_buf.push(c);
             }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Keys while the cell window is up: the value scrolls, nothing else
+    /// moves.
+    ///
+    /// The scroll is only ever moved here — clamping is `draw`'s, which is
+    /// the only place that knows how far there is to go — so `G` asks for
+    /// further than there is and lands at the bottom.
+    fn handle_inspect_key(&mut self, key: KeyEvent) -> anyhow::Result<()> {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let Some(inspect) = &mut self.inspect else {
+            return Ok(());
+        };
+        let rows = inspect.rows.max(1);
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => inspect.scroll += 1,
+            KeyCode::Char('k') | KeyCode::Up => inspect.scroll = inspect.scroll.saturating_sub(1),
+            KeyCode::Char('d') if ctrl => inspect.scroll += (rows / 2).max(1),
+            KeyCode::Char('u') if ctrl => {
+                inspect.scroll = inspect.scroll.saturating_sub((rows / 2).max(1))
+            }
+            KeyCode::Char('f') if ctrl => inspect.scroll += rows,
+            KeyCode::PageDown => inspect.scroll += rows,
+            KeyCode::Char('b') if ctrl => inspect.scroll = inspect.scroll.saturating_sub(rows),
+            KeyCode::PageUp => inspect.scroll = inspect.scroll.saturating_sub(rows),
+            // A lone `g` is the top. There is no other `g` command in here to
+            // tell it apart from, and `gg` still works: the second one asks
+            // for the top again.
+            KeyCode::Char('g') | KeyCode::Home => inspect.scroll = 0,
+            KeyCode::Char('G') | KeyCode::End => inspect.scroll = usize::MAX,
+            KeyCode::Char('q') | KeyCode::Char('K') | KeyCode::Esc => self.inspect = None,
             _ => {}
         }
         Ok(())
@@ -1458,14 +1589,21 @@ impl App {
                 }
             }
             // `K` is vim's "tell me about the thing under the cursor", and
-            // that is what this is.
+            // vim opens a pager in a window of its own to answer — which is
+            // what a cell too big for its column needs. The strip is `zk`,
+            // with the rest of the display adjustments.
+            //
+            // Row mode has no column cursor, so it adopts one exactly as the
+            // edit keys do, rather than leaving the key dead in the mode plv
+            // opens in.
             KeyCode::Char('K') => {
                 self.pending_num.clear();
-                if matches!(self.selection_mode, SelectionMode::Row) {
-                    self.selection_mode = SelectionMode::Cell;
-                    self.cursor_col = self.col_offset;
+                self.adopt_column_cursor();
+                // Nothing to read means no window: it holds every key while
+                // it is up, so an empty one could only be escaped from.
+                if self.cell_under_cursor().is_some() {
+                    self.inspect = Some(Inspect::default());
                 }
-                self.cell_view = !self.cell_view;
             }
             KeyCode::Char('#') => {
                 self.pending_num.clear();
@@ -2307,6 +2445,16 @@ impl App {
             ('z', KeyCode::Char('<')) => self.resize_column(-1),
             ('z', KeyCode::Char('_')) => self.fit_column(),
             ('z', KeyCode::Char('p')) => self.toggle_pin(),
+            // The strip above the status bar. It lives in the `z` family
+            // because it is display state of exactly that kind: it stays on,
+            // it takes its rows out of the table, and it changes nothing
+            // about which rows and columns are being asked for. `K` is the
+            // window, which covers rather than displaces.
+            ('z', KeyCode::Char('k')) => {
+                self.adopt_column_cursor();
+                self.cell_view = !self.cell_view;
+                Ok(())
+            }
             // Unpinning the lot is `z|` and not `zP`, because the second key
             // is lowercased above: a shifted letter cannot mean anything the
             // unshifted one does not. The divider is what a pin draws, so the
@@ -4389,7 +4537,11 @@ mod tests {
         press(&mut app, '-'); // while also hiding c, so the view change is real
         key(&mut app, KeyCode::Enter);
 
-        assert_eq!(shown_columns(&app), ["a", "b", "d"], "the view still applied");
+        assert_eq!(
+            shown_columns(&app),
+            ["a", "b", "d"],
+            "the view still applied"
+        );
         assert!(
             app.pinned.len() < 2,
             "and the pins were trimmed to what fits: {:?}",
@@ -4444,7 +4596,11 @@ mod tests {
         press(&mut app, 'C');
         press(&mut app, 'a');
         key(&mut app, KeyCode::Enter);
-        assert_eq!(shown_columns(&app), ["b", "d", "a", "c"], "all back, listed order");
+        assert_eq!(
+            shown_columns(&app),
+            ["b", "d", "a", "c"],
+            "all back, listed order"
+        );
     }
 
     /// `q` closes a window everywhere else in vim, and a window is a view —
@@ -4597,7 +4753,11 @@ mod tests {
         assert_eq!(app.col_offset, 2);
 
         press(&mut app, '-');
-        assert_eq!(shown_columns(&app), ["a", "b", "d"], "c, where Tab would land");
+        assert_eq!(
+            shown_columns(&app),
+            ["a", "b", "d"],
+            "c, where Tab would land"
+        );
     }
 
     /// The two column features compose: a pin on a hidden column waits, and
@@ -4750,13 +4910,19 @@ mod tests {
         assert!(!app.exit);
     }
 
+    /// Press the two keys the strip now lives under.
+    fn strip(app: &mut App) {
+        press(app, 'z');
+        press(app, 'k');
+    }
+
     #[test]
-    fn k_shows_the_cursor_cell_and_follows_it() {
+    fn zk_shows_the_cursor_cell_and_follows_it() {
         let long = "a,note\n1,\"a value far too long for any column to show\"\n2,short\n";
         let mut app = app_sized("cellview.csv", long, 40);
         assert_eq!(app.panel_height(40, 24), 0, "nothing showing yet");
 
-        press(&mut app, 'K');
+        strip(&mut app);
         assert!(app.cell_view);
         assert_eq!(
             app.selection_mode,
@@ -4784,7 +4950,7 @@ mod tests {
         let long = "a\n\"".to_string() + &"x".repeat(500) + "\"\n";
         let mut app = app_sized("cellroom.csv", &long, 40);
         let before = App::viewport_rows(24, 0);
-        press(&mut app, 'K');
+        strip(&mut app);
         let panel = app.panel_height(40, 24);
         assert!(panel > 0);
         assert_eq!(
@@ -4793,6 +4959,130 @@ mod tests {
             "the table gives up exactly what the panel takes"
         );
         assert!(panel <= 12, "and never more than half the screen");
+    }
+
+    /// The long value used by the window's tests: more lines than any window
+    /// will hold, so there is something to scroll.
+    fn windowed(name: &str) -> App {
+        let value: String = (1..=200).map(|n| format!("line {n}. ")).collect();
+        let file = format!("a,note\n1,\"{value}\"\n");
+        let mut app = app_sized(name, &file, 60);
+        cell_mode(&mut app);
+        press(&mut app, 'l'); // onto `note`, which is the long one
+        app
+    }
+
+    #[test]
+    fn k_opens_a_window_on_the_cursor_cell() {
+        let mut app = windowed("cellwindow.csv");
+        assert!(app.inspect.is_none(), "nothing showing yet");
+
+        press(&mut app, 'K');
+        assert!(app.inspect.is_some());
+        assert_eq!(
+            app.selection_mode,
+            SelectionMode::Cell,
+            "a cell window needs a cell cursor, as an edit does"
+        );
+        let (name, value) = app.cell_under_cursor().unwrap();
+        assert_eq!(name, "note");
+        assert!(value.starts_with("line 1."));
+
+        // It covers rather than displaces: the table keeps every row it had.
+        assert_eq!(
+            app.panel_height(60, 24),
+            0,
+            "and takes nothing from the table"
+        );
+
+        press(&mut app, 'q');
+        assert!(app.inspect.is_none(), "q closes the window");
+        assert!(!app.exit, "and does not quit plv");
+    }
+
+    #[test]
+    fn the_window_holds_the_keys_while_it_is_up() {
+        let mut app = windowed("cellkeys.csv");
+        let row = app.cursor_row;
+        press(&mut app, 'K');
+        app.inspect.as_mut().unwrap().rows = 10; // normally captured by `draw`
+
+        press(&mut app, 'j');
+        assert_eq!(app.inspect.as_ref().unwrap().scroll, 1);
+        assert_eq!(app.cursor_row, row, "the table did not move under it");
+
+        press(&mut app, 'k');
+        press(&mut app, 'k');
+        assert_eq!(
+            app.inspect.as_ref().unwrap().scroll,
+            0,
+            "and stops at the top"
+        );
+
+        key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(app.inspect.as_ref().unwrap().scroll, 5, "half a window");
+        press(&mut app, 'g');
+        assert_eq!(app.inspect.as_ref().unwrap().scroll, 0);
+
+        // `G` asks for further than there is; `draw` is what clamps it.
+        press(&mut app, 'G');
+        assert_eq!(app.inspect.as_ref().unwrap().scroll, usize::MAX);
+
+        key(&mut app, KeyCode::Esc);
+        assert!(app.inspect.is_none());
+        assert!(app.search_state.is_none(), "and the Esc stopped there");
+    }
+
+    /// Rendered through `App::draw`, so what is asserted is the screen the
+    /// user gets and not the widget in isolation.
+    fn drawn(app: &mut App, width: u16, height: u16) -> Vec<String> {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        (0..height)
+            .map(|y| (0..width).map(|x| buf[(x, y)].symbol()).collect())
+            .collect()
+    }
+
+    /// It covers the table rather than taking rows from it, so the row under
+    /// it is still there when it closes.
+    #[test]
+    fn the_window_is_drawn_over_the_table() {
+        let mut app = windowed("celldraw.csv");
+        let plain = drawn(&mut app, 60, 16);
+        assert!(plain.iter().any(|line| line.contains("line 1.")));
+
+        press(&mut app, 'K');
+        let over = drawn(&mut app, 60, 16);
+        let middle = over.iter().filter(|line| line.contains('│')).count();
+        assert!(middle > 3, "the window is on screen: {over:?}");
+        assert!(
+            over.iter().any(|line| line.contains("note —")),
+            "titled with the column: {over:?}"
+        );
+        // The scroll is clamped where the layout is known, so the window has
+        // told the key handler how tall it is.
+        assert!(app.inspect.as_ref().unwrap().rows > 0);
+
+        press(&mut app, 'q');
+        assert_eq!(drawn(&mut app, 60, 16), plain, "and the table is back");
+    }
+
+    /// The two views of a cell are independent: one covers, one displaces.
+    #[test]
+    fn the_window_and_the_strip_are_different_keys() {
+        let mut app = windowed("cellboth.csv");
+        strip(&mut app);
+        assert!(app.cell_view);
+        assert!(app.inspect.is_none(), "zk is the strip and only the strip");
+
+        press(&mut app, 'K');
+        assert!(app.inspect.is_some());
+        assert!(app.cell_view, "which does not take the strip away");
     }
 
     #[test]
