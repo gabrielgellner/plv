@@ -1,0 +1,10 @@
+{"ts":"2026-09-07T10:00:00.114Z","level":"info","service":"api","msg":"listening","port":8080}
+{"ts":"2026-09-07T10:00:01.782Z","level":"info","service":"api","msg":"GET /health 200","dur_ms":0.9}
+{"ts":"2026-09-07T10:00:04.031Z","level":"info","service":"worker","msg":"job started","job":{"id":"j-9f21","kind":"reindex","attempt":1}}
+{"ts":"2026-09-07T10:00:09.550Z","level":"warn","service":"worker","msg":"slow query","dur_ms":1840.5,"query":"select * from events where ts > $1"}
+{"ts":"2026-09-07T10:00:12.006Z","level":"error","service":"api","msg":"upstream failed","err":{"code":502,"upstream":"billing","detail":"connection reset by peer","retryable":true},"trace":"7c1f0a2b"}
+{"ts":"2026-09-07T10:00:12.900Z","level":"info","service":"api","msg":"GET /orders 200","dur_ms":31.4}
+{"ts":"2026-09-07T10:00:18.442Z","level":"error","service":"worker","msg":"job failed","job":{"id":"j-9f21","kind":"reindex","attempt":2},"err":{"code":500,"detail":"deadlock detected\nretry advised","retryable":true}}
+{"ts":"2026-09-07T10:00:21.117Z","level":"info","service":"api","msg":"GET /health 200","dur_ms":1.1}
+{"ts":"2026-09-07T10:00:25.803Z","level":"debug","service":"worker","msg":"heartbeat","queue":{"depth":12,"oldest_ms":4100}}
+{"ts":"2026-09-07T10:00:30.220Z","level":"info","service":"api","msg":"POST /orders 201","dur_ms":88.2,"user":{"id":4821,"plan":"pro"}}

@@ -38,6 +38,11 @@ pub struct RowIndex {
     header: Vec<u8>,
     /// Length of the file the scan saw.
     len: u64,
+    /// Records are whole lines and there is no header — JSONL. Kept as a flag
+    /// of its own rather than read off an empty `header`, since a delimited
+    /// file whose first line is blank has an empty header and still wants one
+    /// put back in front of a page.
+    lines: bool,
 }
 
 impl RowIndex {
@@ -166,6 +171,65 @@ impl RowIndex {
             rows,
             header,
             len,
+            lines: false,
+        })
+    }
+
+    /// Scan a file whose records are whole lines, handing every byte to
+    /// `observe` on the way past.
+    ///
+    /// Separate from [`RowIndex::build`] rather than a mode inside it. That
+    /// loop is quote-aware and header-aware because a CSV record needs it to
+    /// be, and this one needs neither: a JSON string cannot hold a raw
+    /// newline, so a `\n` always ends a record. Putting a branch for that in
+    /// the hot loop of the scan that made 30GB files pageable would slow the
+    /// common case to share thirty lines.
+    ///
+    /// `observe` is how the JSONL reader learns the file's keys without a
+    /// second pass over it — see [`super::jsonl::Scan`].
+    pub fn build_lines(path: &Path, observe: &mut impl FnMut(u8)) -> Result<Self> {
+        let file = File::open(path).with_context(|| format!("cannot read {}", path.display()))?;
+        let len = file.metadata()?.len();
+        let mut reader = BufReader::with_capacity(1 << 20, file);
+
+        let mut position: u64 = 0;
+        let mut rows = 0usize;
+        let mut started = false;
+        let mut checkpoints = vec![0u64];
+
+        loop {
+            let chunk = reader.fill_buf()?;
+            if chunk.is_empty() {
+                break;
+            }
+            let read = chunk.len();
+            for (i, &byte) in chunk.iter().enumerate() {
+                observe(byte);
+                if byte == b'\n' {
+                    rows += 1;
+                    started = false;
+                    if rows % STRIDE == 0 {
+                        checkpoints.push(position + i as u64 + 1);
+                    }
+                } else {
+                    started = true;
+                }
+            }
+            position += read as u64;
+            reader.consume(read);
+        }
+
+        // A last line with no terminator is still a record.
+        if started {
+            rows += 1;
+        }
+
+        Ok(Self {
+            checkpoints,
+            rows,
+            header: Vec::new(),
+            len,
+            lines: true,
         })
     }
 }
@@ -252,8 +316,12 @@ pub fn read_span(path: &Path, index: &RowIndex, from: u64, to: u64) -> Result<Ve
     let mut file = File::open(path)?;
     file.seek(SeekFrom::Start(from))?;
     let mut buffer = Vec::with_capacity((to.saturating_sub(from) as usize).saturating_add(64));
-    buffer.extend_from_slice(index.header());
-    buffer.push(b'\n');
+    // A line-record file has no header to put back, and a blank line in front
+    // of the span would be one more record than the index counted.
+    if !index.lines {
+        buffer.extend_from_slice(index.header());
+        buffer.push(b'\n');
+    }
     file.take(to.saturating_sub(from))
         .read_to_end(&mut buffer)?;
     Ok(buffer)

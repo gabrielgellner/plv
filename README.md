@@ -1,8 +1,8 @@
 # plv
 
-A terminal viewer and editor for CSV, TSV, Parquet and [DuckLake](https://ducklake.select/) data, inspired by [csvlens](https://github.com/YS-L/csvlens). Built with [Polars](https://pola.rs/) and [ratatui](https://ratatui.rs/).
+A terminal viewer and editor for CSV, TSV, JSONL, Parquet and [DuckLake](https://ducklake.select/) data, inspired by [csvlens](https://github.com/YS-L/csvlens). Built with [Polars](https://pola.rs/) and [ratatui](https://ratatui.rs/).
 
-- Supports CSV, tab-separated text, Parquet, and DuckLake lakes
+- Supports CSV, tab-separated text, JSONL logs, Parquet, and DuckLake lakes
 - **Edits delimited text** — cells, blocks, whole rows — in a buffer, written with `:w`
 - **A view language** — `:select`, `:hide`, `:filter`, `:sort` — with Tab completion over the file's own column names
 - **Column control** — pin columns to the left edge, hide one with a keystroke, or pick from a list
@@ -15,6 +15,7 @@ A terminal viewer and editor for CSV, TSV, Parquet and [DuckLake](https://duckla
 ```
 plv <file.csv>
 plv <file.tsv>          # also .tab; .txt sniffs its delimiter
+plv <file.jsonl>        # also .ndjson: one JSON object per line
 plv <file.parquet>
 plv <lake.ducklake>      # a DuckLake catalog
 plv <bundle-dir>/        # a directory containing one
@@ -227,6 +228,51 @@ quietly put back into file order.
 `q` is deliberately not a picker key. Everywhere else in vim it closes a window,
 and a window is a view — closing one never destroys work — so it is not borrowed
 here for something that would discard everything ticked.
+
+## JSONL
+
+Point plv at a `.jsonl` or `.ndjson` file and each line's top-level keys become
+columns.
+
+```
+plv app.log.jsonl
+```
+
+**The columns are the file's real keys, not a sample of them.** plv already
+reads every byte of a file when it opens one, to count the rows; the same pass
+collects the keys, so the column set is exact and settled before anything is
+drawn. Columns are ordered by how many records carry them, most common first.
+
+**Rare keys are available but not shown.** A key in fewer than a fifth of the
+records is a column you can reach with `C` or `:select`, but the table does not
+open two hundred columns wide to hold it. plv says what it left out when the
+file opens; `:reset select` shows every key.
+
+**A key that only ever held one kind of thing is typed as it.** A `status` of
+whole numbers is a number column, so `:filter status > 400` compares numbers and
+not text. A key that ever held an object or an array is text — and that text is
+**the file's own bytes**, so `K` opens it as the document it is:
+
+```
+ level    service    msg              job
+ error    worker     job failed       {"id":"j-9f21","kind":"reindex","attempt":2}
+                              ┌ job — json, 44 characters ┐
+                              │ {                         │
+                              │   "id": "j-9f21",         │
+                              │   "kind": "reindex",      │
+                              │   "attempt": 2            │
+                              │ }                         │
+                              └ r raw   q close ──────────┘
+```
+
+Only top-level keys become columns; anything deeper stays inside its value,
+where `K` reads it. A line that is not a JSON object is still a row — dropping
+it would put every row number after it out by one — it simply has no fields.
+
+JSONL files are **read-only**, and cannot be sorted yet: every page is built
+from the byte span the row index points at, and there is no frame behind them to
+put in another order. `:filter` and `/` work, and pay the same linear scan a CSV
+does.
 
 ## DuckLake
 

@@ -10,6 +10,10 @@ pub enum FileFormat {
     /// Extension names nothing: `.txt`. The delimiter is sniffed from the file.
     Text,
     Parquet,
+    /// One JSON object per line: `.jsonl`, `.ndjson`. Read by
+    /// [`crate::data::jsonl`] rather than by Polars, so that a nested value
+    /// reaches the cell as the file's own bytes.
+    JsonLines,
     Unknown,
 }
 
@@ -19,6 +23,7 @@ pub fn detect_format(path: &Path) -> FileFormat {
         Some("tsv" | "tab") => FileFormat::Tsv,
         Some("txt") => FileFormat::Text,
         Some("parquet") => FileFormat::Parquet,
+        Some("jsonl" | "ndjson") => FileFormat::JsonLines,
         _ => FileFormat::Unknown,
     }
 }
@@ -30,9 +35,12 @@ pub fn load(path: &Path) -> Result<LazyFrame> {
         FileFormat::Tsv => Ok(delimited(pl_path, b'\t')?),
         FileFormat::Text => Ok(delimited(pl_path, sniff_delimiter(&read_sample(path)?))?),
         FileFormat::Parquet => Ok(LazyFrame::scan_parquet(pl_path, Default::default())?),
-        FileFormat::Unknown => {
-            anyhow::bail!("unsupported file format (use .csv, .tsv, .tab, .txt or .parquet)")
-        }
+        // Never reached: `Store::open_file` sends JSONL down its own path
+        // before asking for a frame.
+        FileFormat::JsonLines => anyhow::bail!("jsonl is not read through polars"),
+        FileFormat::Unknown => anyhow::bail!(
+            "unsupported file format (use .csv, .tsv, .tab, .txt, .jsonl or .parquet)"
+        ),
     }
 }
 
@@ -46,7 +54,7 @@ pub fn separator(path: &Path) -> Result<Option<u8>> {
         FileFormat::Csv => Ok(Some(b',')),
         FileFormat::Tsv => Ok(Some(b'\t')),
         FileFormat::Text => Ok(Some(sniff_delimiter(&read_sample(path)?))),
-        FileFormat::Parquet | FileFormat::Unknown => Ok(None),
+        FileFormat::Parquet | FileFormat::JsonLines | FileFormat::Unknown => Ok(None),
     }
 }
 
