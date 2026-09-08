@@ -364,6 +364,21 @@ are not stable across snapshots.
 
 ### How lake data is read
 
+Paging into a lake table used to cost `LIMIT n OFFSET m`, which makes DuckDB
+produce and discard every row up to the offset: 2.9 seconds for the last page of
+a 1.14-billion-row table. The rows are in parquet files, though, and the catalog
+records how many rows each file holds — so plv reads that arithmetic once when a
+table is opened and a page then seeks to the file its rows are in. The same page
+now costs under a millisecond, and the whole table pages in tens of
+milliseconds.
+
+The reader is still DuckDB's; this only ever answers *where*. It is also
+entirely optional: if the catalog will not say plainly — a delete file, rows
+inlined in the catalog, a column mapping, or file counts that do not add up to
+`count(*)` — plv silently pages the way it always did. A sort or a partition
+view goes to DuckDB too, since neither is a question about where rows sit in a
+file.
+
 Lake tables are read through DuckDB's `ducklake` extension — DuckLake's own
 reference reader. That means what you see is the **logical** table: rows that
 DuckLake has inlined into the catalog database are included, delete files are
@@ -389,9 +404,9 @@ plv is built for files that do not fit in memory. Measured on a census extract:
 
 | | 28GB CSV, 272M rows | 800MB parquet, 842M rows | DuckLake, 1.14B rows | 62MB JSONL, 500k lines |
 |---|---|---|---|---|
-| open | 31s | 55ms | 150ms | 157ms |
-| page anywhere | 3–7ms | <1ms | 0.14–2.9s | 2–3ms |
-| peak memory | 63MB | 126MB | 329MB | 30MB |
+| open | 31s | 55ms | 160ms | 157ms |
+| page anywhere | 3–7ms | <1ms | 0.4–34ms | 2–3ms |
+| peak memory | 63MB | 126MB | 140MB | 30MB |
 
 Opening a delimited file reads it once, to count the rows — and that pass also
 records where the rows are, so a page afterwards seeks to the nearest checkpoint

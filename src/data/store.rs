@@ -60,6 +60,9 @@ struct LakeQuery {
     conn: Connection,
     source: LakeSource,
     columns: Vec<String>,
+    /// The shape every page must come back in, and where the rows physically
+    /// are — asked once when the table was opened.
+    reader: lake_db::Reader,
 }
 
 /// How a file plv writes to is spelled: a delimited record, or a JSON one.
@@ -342,16 +345,28 @@ impl Store {
     pub fn new_lake(
         conn: Connection,
         source: LakeSource,
+        reader: lake_db::Reader,
         viewport_rows: usize,
         total_rows: usize,
     ) -> Result<Self> {
-        let columns = lake_db::column_names(&conn, &source)?;
+        let columns = match reader.columns.is_empty() {
+            true => lake_db::column_names(&conn, &source)?,
+            false => reader.names(),
+        };
         let query = LakeQuery {
             conn,
             source,
             columns,
+            reader,
         };
-        let current_view = lake_db::page_with(&query.conn, &query.source, &[], 0, viewport_rows)?;
+        let current_view = lake_db::page_with(
+            &query.conn,
+            &query.source,
+            &query.reader,
+            &[],
+            0,
+            viewport_rows,
+        )?;
 
         // Take the schema from the first page: it is the only place column
         // types are observable, and the viewer only needs names and arity.
@@ -623,6 +638,7 @@ impl Store {
             Source::Lake(query) => lake_db::page_with(
                 &query.conn,
                 &query.source,
+                &query.reader,
                 &self.sort_keys(),
                 offset,
                 height,
@@ -898,8 +914,14 @@ impl Store {
                     return rx;
                 };
                 let source = query.source.clone();
+                // A sort never takes the file path, but it still has to come
+                // back in the shape every other page comes back in.
+                let reader = lake_db::Reader {
+                    files: None,
+                    ..query.reader.clone()
+                };
                 thread::spawn(move || {
-                    if let Ok(df) = lake_db::page_with(&conn, &source, &keys, 0, vp) {
+                    if let Ok(df) = lake_db::page_with(&conn, &source, &reader, &keys, 0, vp) {
                         let _ = tx.send(df);
                     }
                 });

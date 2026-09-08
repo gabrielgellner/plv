@@ -1091,10 +1091,14 @@ impl App {
         };
 
         let source = lake.db.source(table, partition);
+        // Asked once when the table is opened: a page then seeks to the file
+        // its rows are in rather than counting its way there. `None` when the
+        // catalog will not say plainly, which is every page as it was.
+        let reader = lake.db.reader(Some(table), &source);
         let opened = lake
             .db
             .try_clone()
-            .and_then(|conn| Store::new_lake(conn, source, vp, rows as usize));
+            .and_then(|conn| Store::new_lake(conn, source, reader, vp, rows as usize));
 
         match opened {
             Ok(store) => {

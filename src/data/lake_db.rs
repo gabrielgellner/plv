@@ -123,6 +123,147 @@ impl LakeSource {
     }
 }
 
+/// What every page of one lake table needs to know beyond the query itself:
+/// the shape it must come back in, and where its rows physically are.
+///
+/// Built once when the table is opened.
+#[derive(Clone, Debug, Default)]
+pub struct Reader {
+    /// The table's columns and the types plv shows them as, asked of DuckDB
+    /// once rather than guessed per page.
+    ///
+    /// A page used to be typed by the first non-null value *in that page*, so
+    /// a column that is empty here and a number three screens down changed
+    /// type as you scrolled. The delimited path has said for a while that a
+    /// chunk must be given the schema rather than infer its own; this is the
+    /// same rule, arriving late.
+    pub columns: Vec<(String, DataType)>,
+    /// Where the rows are, when the catalog will say plainly enough to be
+    /// trusted. Absent means every page goes through `LIMIT`/`OFFSET`.
+    pub files: Option<FileMap>,
+}
+
+impl Reader {
+    pub fn names(&self) -> Vec<String> {
+        self.columns.iter().map(|(name, _)| name.clone()).collect()
+    }
+
+    /// Put a page into the shape the table declares, whichever way it was
+    /// read. A column DuckDB handed back as text because this page happened
+    /// to be empty becomes the number it is.
+    fn shape(&self, df: DataFrame) -> Result<DataFrame> {
+        if self.columns.is_empty() {
+            return Ok(df);
+        }
+        let cast: Vec<Column> = df
+            .columns()
+            .iter()
+            .map(|column| {
+                match self
+                    .columns
+                    .iter()
+                    .find(|(name, _)| name.as_str() == column.name().as_str())
+                {
+                    Some((_, dtype)) => column.cast(dtype).unwrap_or_else(|_| column.clone()),
+                    None => column.clone(),
+                }
+            })
+            .collect();
+        Ok(DataFrame::new(df.height(), cast)?)
+    }
+}
+
+/// Where a table's rows physically live, so a page can be seeked to rather
+/// than counted to.
+///
+/// `LIMIT n OFFSET m` makes DuckDB produce and discard every row up to the
+/// offset: measured against a 1.14-billion-row table, the last page costs 2.7
+/// seconds against 137ms for the first. The rows are in parquet files, though,
+/// and a parquet reader can seek by row group — the same data as a file reads
+/// anywhere in 26ms. All that is missing is which file a row number lands in,
+/// and the catalog knows: it records how many rows each file holds.
+///
+/// So this is the catalog's own arithmetic, kept to hand. It is **entirely
+/// optional**: every way of failing to build it, and every doubt while using
+/// it, returns `None` and leaves the query to go the way it always did. That
+/// is what makes reading the files directly safe here, where
+/// re-implementing the format's reader was not — the reader is still
+/// DuckDB's, and this only ever answers *where*.
+#[derive(Clone, Debug)]
+pub struct FileMap {
+    files: Vec<FileSpan>,
+    /// The columns the logical table has, in its order. A file that does not
+    /// have them all is a file this cannot read.
+    columns: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct FileSpan {
+    path: PathBuf,
+    /// Row number of this file's first row, in the table.
+    start: usize,
+    rows: usize,
+}
+
+impl FileMap {
+    /// One page, read straight out of the files it falls in — or `None` where
+    /// anything at all is not as this expects, which leaves the caller to ask
+    /// DuckDB the slow way.
+    pub fn page(&self, offset: usize, limit: usize) -> Option<DataFrame> {
+        let mut page: Option<DataFrame> = None;
+        let mut taken = 0usize;
+        for file in &self.files {
+            if taken >= limit {
+                break;
+            }
+            let wanted = offset + taken;
+            if wanted < file.start || wanted >= file.start + file.rows {
+                continue;
+            }
+            let local = wanted - file.start;
+            let take = (file.rows - local).min(limit - taken);
+            let part = self.read(file, local, take)?;
+            taken += part.height();
+            page = Some(match page {
+                None => part,
+                Some(mut so_far) => {
+                    so_far.vstack_mut(&part).ok()?;
+                    so_far
+                }
+            });
+        }
+        page.or_else(|| (offset >= self.rows()).then(DataFrame::empty))
+    }
+
+    /// Rows `offset..offset + limit` of one file.
+    ///
+    /// A file that gives back fewer rows than the catalog said it holds is a
+    /// file whose count disagrees with the catalog, and nothing after it can
+    /// be trusted to be where this map says it is — so that is a `None` too.
+    fn read(&self, file: &FileSpan, offset: usize, limit: usize) -> Option<DataFrame> {
+        let path = PlRefPath::try_from_path(&file.path).ok()?;
+        let frame = LazyFrame::scan_parquet(path, Default::default())
+            .ok()?
+            .slice(offset as i64, limit as u32)
+            // By name and in the table's order: a file written before a column
+            // was added, or with them in another order, must not be read as
+            // though its columns were the ones plv is showing.
+            .select(
+                self.columns
+                    .iter()
+                    .map(|name| col(name.as_str()))
+                    .collect::<Vec<_>>(),
+            )
+            .collect()
+            .ok()?;
+        (frame.height() == limit).then_some(frame)
+    }
+
+    fn rows(&self) -> usize {
+        self.files.last().map_or(0, |f| f.start + f.rows)
+    }
+}
+
 pub struct LakeDb {
     conn: Connection,
     pub path: PathBuf,
@@ -196,6 +337,12 @@ impl LakeDb {
 
     /// A second handle on the same attached lake, for a background thread.
     /// Sharing the attachment avoids paying the ~20ms ATTACH cost again.
+    /// The attachment itself, for a caller that wants to ask its own
+    /// question of the lake.
+    pub fn conn(&self) -> &Connection {
+        &self.conn
+    }
+
     pub fn try_clone(&self) -> Result<Connection> {
         Ok(self.conn.try_clone()?)
     }
@@ -364,6 +511,133 @@ impl LakeDb {
         }
     }
 
+    /// Where this table's rows are, if the catalog will say so plainly.
+    ///
+    /// `None` at the first sign of anything this cannot account for, and the
+    /// caller then pages the way it always did. The last check is the one that
+    /// does most of the work: the file counts must add up to what `count(*)`
+    /// says. A delete file that removed rows makes the sum too high, rows
+    /// inlined in the catalog make it too low, and a snapshot this read the
+    /// wrong file set for makes it one or the other — so the three of them are
+    /// caught by arithmetic rather than by a growing list of conditions.
+    ///
+    /// Only for the whole table: a partition is a `WHERE` clause, and which
+    /// files satisfy it is a question about physical layout that this
+    /// deliberately does not ask.
+    pub fn file_map(
+        &self,
+        table: &TableInfo,
+        source: &LakeSource,
+        columns: &[String],
+    ) -> Option<FileMap> {
+        if source.filter.is_some() {
+            return None;
+        }
+        let snapshot = self.snapshot.or_else(|| self.current_snapshot().ok())?;
+        let table_id = self.table_id(table)?;
+
+        // Paths as the extension resolves them, which is the one place that
+        // knows how a relative path in the catalog becomes a file on disk.
+        let mut stmt = self
+            .conn
+            .prepare(&format!(
+                "SELECT data_file, delete_file FROM ducklake_list_files({}, {}, schema => {})",
+                sql_str(ALIAS),
+                sql_str(&table.name),
+                sql_str(&table.schema)
+            ))
+            .ok()?;
+        let resolved: Vec<(String, Option<String>)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .ok()?
+            .collect::<std::result::Result<_, _>>()
+            .ok()?;
+        if resolved.iter().any(|(_, delete)| delete.is_some()) {
+            return None;
+        }
+
+        // Counts and order, from the catalog the extension keeps beside the
+        // lake. An internal name, so a version that renames it simply loses
+        // the fast path rather than breaking.
+        let mut stmt = self
+            .conn
+            .prepare(&format!(
+                "SELECT path, record_count, mapping_id
+                 FROM __ducklake_metadata_{ALIAS}.ducklake_data_file
+                 WHERE table_id = ?1
+                   AND begin_snapshot <= ?2
+                   AND (end_snapshot IS NULL OR end_snapshot > ?2)
+                 ORDER BY row_id_start, data_file_id"
+            ))
+            .ok()?;
+        let listed: Vec<(String, i64, Option<i64>)> = stmt
+            .query_map(params![table_id, snapshot], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .ok()?
+            .collect::<std::result::Result<_, _>>()
+            .ok()?;
+        if listed.is_empty() || listed.iter().any(|(_, _, mapping)| mapping.is_some()) {
+            // A mapping means the file's columns are not the table's, which is
+            // exactly the thing the extension exists to handle.
+            return None;
+        }
+
+        let mut files = Vec::with_capacity(listed.len());
+        let mut start = 0usize;
+        for (path, count, _) in listed {
+            // The catalog's path is relative to a prefix this does not try to
+            // reconstruct; the resolved list has the same file spelled whole.
+            let mut matches = resolved
+                .iter()
+                .filter(|(full, _)| full.ends_with(&path) || *full == path);
+            let (full, _) = matches.next()?;
+            if matches.next().is_some() {
+                return None; // ambiguous, so not worth guessing
+            }
+            let rows = usize::try_from(count).ok()?;
+            files.push(FileSpan {
+                path: PathBuf::from(full),
+                start,
+                rows,
+            });
+            start += rows;
+        }
+
+        (start == self.count(source).ok()?).then_some(FileMap {
+            files,
+            columns: columns.to_vec(),
+        })
+    }
+
+    /// The table's columns, in its order — what a file read has to produce.
+    pub fn column_names(&self, source: &LakeSource) -> Result<Vec<String>> {
+        column_names(&self.conn, source)
+    }
+
+    fn table_id(&self, table: &TableInfo) -> Option<i64> {
+        let mut stmt = self
+            .conn
+            .prepare(&format!(
+                "SELECT t.table_id
+                 FROM __ducklake_metadata_{ALIAS}.ducklake_table t
+                 JOIN __ducklake_metadata_{ALIAS}.ducklake_schema s
+                   ON s.schema_id = t.schema_id
+                 WHERE t.table_name = ?1 AND s.schema_name = ?2
+                   AND t.end_snapshot IS NULL"
+            ))
+            .ok()?;
+        let ids: Vec<i64> = stmt
+            .query_map(params![table.name, table.schema], |row| row.get(0))
+            .ok()?
+            .collect::<std::result::Result<_, _>>()
+            .ok()?;
+        match ids.as_slice() {
+            [only] => Some(*only),
+            _ => None,
+        }
+    }
+
     pub fn count(&self, source: &LakeSource) -> Result<usize> {
         let n: i64 = self.conn.query_row(
             &format!("SELECT count(*) FROM {}", source.relation()),
@@ -380,7 +654,43 @@ impl LakeDb {
         offset: usize,
         limit: usize,
     ) -> Result<DataFrame> {
-        page_with(&self.conn, source, sort, offset, limit)
+        page_with(
+            &self.conn,
+            source,
+            &self.reader(None, source),
+            sort,
+            offset,
+            limit,
+        )
+    }
+
+    /// The shape and layout of one table, asked once so every page agrees.
+    pub fn reader(&self, table: Option<&TableInfo>, source: &LakeSource) -> Reader {
+        let columns = self.column_types(source).unwrap_or_default();
+        let files = table.and_then(|table| {
+            let names: Vec<String> = columns.iter().map(|(name, _)| name.clone()).collect();
+            self.file_map(table, source, &names)
+        });
+        Reader { columns, files }
+    }
+
+    /// The table's columns and the types plv will show them as.
+    ///
+    /// `DESCRIBE` answers from the catalog rather than by reading anything,
+    /// and the mapping is the one the viewer has always used: integers,
+    /// floats and booleans keep their type and everything else is text.
+    fn column_types(&self, source: &LakeSource) -> Result<Vec<(String, DataType)>> {
+        let mut stmt = self
+            .conn
+            .prepare(&format!("DESCRIBE SELECT * FROM {}", source.relation()))?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        Ok(rows
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(|(name, sql_type)| (name, shown_as(&sql_type)))
+            .collect())
     }
 }
 
@@ -389,10 +699,24 @@ impl LakeDb {
 pub fn page_with(
     conn: &Connection,
     source: &LakeSource,
+    reader: &Reader,
     sort: &[(String, bool)],
     offset: usize,
     limit: usize,
 ) -> Result<DataFrame> {
+    // Straight to the rows when nothing has been asked that changes which
+    // rows they are. A sort puts them in an order no file holds, and a
+    // partition filter is a question about which files answer it — both go
+    // to DuckDB, which is what it is for.
+    if sort.is_empty()
+        && source.filter.is_none()
+        && let Some(page) = reader
+            .files
+            .as_ref()
+            .and_then(|map| map.page(offset, limit))
+    {
+        return reader.shape(page);
+    }
     let sql = format!("{} LIMIT {limit} OFFSET {offset}", source.ordered(sort));
     let mut stmt = conn.prepare(&sql)?;
     let names: Vec<String> = {
@@ -419,7 +743,7 @@ pub fn page_with(
         .zip(columns)
         .map(|(name, values)| series_from_values(name, values))
         .collect();
-    Ok(DataFrame::new(height, series)?)
+    reader.shape(DataFrame::new(height, series)?)
 }
 
 /// SQL selecting the 0-based row indices of matches within one chunk.
@@ -478,6 +802,20 @@ fn regex_match(column: &str, pattern: &str) -> String {
 /// Numeric and boolean columns keep their type so the table renders them as
 /// numbers; everything else (text, dates, timestamps, blobs, nested types) is
 /// rendered as text, which is what a viewer displays anyway.
+/// How plv shows a DuckDB type: numbers and booleans as themselves, and
+/// everything else — dates, timestamps, structs, lists — as text, which is
+/// what the viewer draws anyway.
+fn shown_as(sql_type: &str) -> DataType {
+    let head = sql_type.split('(').next().unwrap_or(sql_type).trim();
+    match head {
+        "BOOLEAN" => DataType::Boolean,
+        "TINYINT" | "SMALLINT" | "INTEGER" | "BIGINT" | "HUGEINT" | "UTINYINT" | "USMALLINT"
+        | "UINTEGER" | "UBIGINT" | "UHUGEINT" => DataType::Int64,
+        "FLOAT" | "DOUBLE" | "REAL" | "DECIMAL" | "NUMERIC" => DataType::Float64,
+        _ => DataType::String,
+    }
+}
+
 fn series_from_values(name: &str, values: Vec<Value>) -> Column {
     let kind = values.iter().find(|v| !matches!(v, Value::Null));
 
@@ -654,6 +992,110 @@ pub fn human_count(n: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Three files of known length, written as parquet, so the arithmetic
+    /// that turns a row number into a file and an offset is exercised against
+    /// a real reader rather than a mock of one.
+    fn three_files(name: &str) -> FileMap {
+        let dir = std::env::temp_dir().join("plv-lake-tests").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut files = Vec::new();
+        let mut start = 0usize;
+        for (i, rows) in [5usize, 3, 4].into_iter().enumerate() {
+            let path = dir.join(format!("part{i}.parquet"));
+            let n: Vec<i64> = (start..start + rows).map(|v| v as i64).collect();
+            let tag: Vec<String> = n.iter().map(|v| format!("row{v}")).collect();
+            let mut df = df! { "n" => n, "tag" => tag }.unwrap();
+            let mut out = std::fs::File::create(&path).unwrap();
+            ParquetWriter::new(&mut out).finish(&mut df).unwrap();
+            files.push(FileSpan { path, start, rows });
+            start += rows;
+        }
+        FileMap {
+            files,
+            columns: vec!["n".to_string(), "tag".to_string()],
+        }
+    }
+
+    fn ns(df: &DataFrame) -> Vec<i64> {
+        df.column("n")
+            .unwrap()
+            .i64()
+            .unwrap()
+            .into_no_null_iter()
+            .collect()
+    }
+
+    #[test]
+    fn a_page_is_read_from_the_file_its_rows_fall_in() {
+        let map = three_files("pages");
+        assert_eq!(ns(&map.page(0, 3).unwrap()), [0, 1, 2]);
+        assert_eq!(ns(&map.page(5, 3).unwrap()), [5, 6, 7], "the second file");
+        assert_eq!(ns(&map.page(8, 4).unwrap()), [8, 9, 10, 11], "the third");
+    }
+
+    #[test]
+    fn a_page_that_straddles_files_is_stitched_from_both() {
+        let map = three_files("straddle");
+        assert_eq!(ns(&map.page(3, 4).unwrap()), [3, 4, 5, 6]);
+        assert_eq!(
+            ns(&map.page(2, 10).unwrap()),
+            [2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+            "across all three"
+        );
+    }
+
+    #[test]
+    fn a_page_past_the_end_is_empty_rather_than_wrong() {
+        let map = three_files("past-end");
+        assert_eq!(map.page(12, 5).unwrap().height(), 0);
+        // A page that runs off the end gives what there is.
+        assert_eq!(ns(&map.page(10, 5).unwrap()), [10, 11]);
+    }
+
+    /// A file whose columns are not the table's is one this cannot read, and
+    /// saying so is what sends the caller back to DuckDB.
+    #[test]
+    fn a_file_without_the_tables_columns_is_refused() {
+        let mut map = three_files("columns");
+        map.columns.push("missing".to_string());
+        assert!(map.page(0, 3).is_none());
+    }
+
+    #[test]
+    fn a_type_is_what_the_table_says_it_is_not_what_a_page_happens_to_hold() {
+        assert_eq!(shown_as("BIGINT"), DataType::Int64);
+        assert_eq!(shown_as("DECIMAL(18,3)"), DataType::Float64);
+        assert_eq!(shown_as("BOOLEAN"), DataType::Boolean);
+        // Everything the viewer draws as text, whatever DuckDB calls it.
+        assert_eq!(shown_as("TIMESTAMP"), DataType::String);
+        assert_eq!(shown_as("STRUCT(a INTEGER)"), DataType::String);
+    }
+
+    /// The shape is applied whichever way the page was read, so a column that
+    /// is empty on this page is still the number the table says it is.
+    #[test]
+    fn a_page_is_cast_to_the_shape_the_table_declares() {
+        let reader = Reader {
+            columns: vec![
+                ("n".to_string(), DataType::Int64),
+                ("empty".to_string(), DataType::Float64),
+            ],
+            files: None,
+        };
+        let df = df! {
+            "n" => [1i64, 2],
+            // What a page of nothing but nulls comes back as.
+            "empty" => [None::<String>, None],
+        }
+        .unwrap();
+        let shaped = reader.shape(df).unwrap();
+        assert_eq!(
+            shaped.column("empty").unwrap().dtype(),
+            &DataType::Float64,
+            "so the column does not change type as you scroll"
+        );
+    }
 
     #[test]
     fn quoting_escapes_embedded_delimiters() {

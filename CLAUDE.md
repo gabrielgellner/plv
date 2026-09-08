@@ -439,6 +439,30 @@ so the same data can be compared across snapshots.
   shown come from a real `GROUP BY`.
 - **Row counts** come from `count(*)`, which the extension answers from catalog
   statistics — 0.01s on the 1.1B-row census table.
+- **Deep paging seeks rather than counts.** `LIMIT n OFFSET m` makes DuckDB
+  produce and discard every row up to the offset: 2.9s for the last page of the
+  1.14B-row census table against 137ms for the first. But the rows are in
+  parquet files and the catalog records each file's `record_count`, so
+  `LakeDb::file_map` reads that arithmetic once and `FileMap::page` reads the
+  page out of the file it falls in with Polars, which seeks by row group —
+  0.6ms for that same last page, 140MB peak. The reader is still DuckDB's; this
+  only answers *where*, which is what makes it safe where re-implementing the
+  format was not. It is **entirely optional**: a delete file, a column mapping,
+  an ambiguous path, a file short of its stated rows, or file counts that do not
+  add up to `count(*)` all return `None` and leave the query to go the way it
+  always did. That last check is the one doing most of the work — deletes,
+  inlined rows and a mis-read snapshot are all caught by arithmetic rather than
+  by a list of conditions. A sort or a partition filter never takes the path:
+  one asks for an order no file holds, the other for which files answer a
+  `WHERE`, which is a question about physical layout that plv deliberately does
+  not ask.
+- **A page is cast to the shape the table declares** (`Reader::columns`, from
+  `DESCRIBE`), not to what its own values suggest. A page used to be typed by
+  the first non-null value *in that page*, so a column empty here and numeric
+  three screens down changed type as you scrolled — the same drift the
+  delimited path avoids by handing each chunk the schema. It is also what lets
+  the two paging paths agree exactly, which is the property that makes the fast
+  one substitutable.
 - **Partition lists** cost a `GROUP BY` (~0.5s on that table), so they load on
   demand rather than up front.
 - **Background work** clones the connection with `try_clone()`, which shares the
