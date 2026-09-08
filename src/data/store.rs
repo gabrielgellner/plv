@@ -751,8 +751,30 @@ impl Store {
                     }
                 });
             }
-            // Unreachable: `sort_blocked` refuses first, and callers ask.
-            Source::Json(_) => {}
+            // The same held frame as a delimited file's, and the same
+            // `materialise` after it — only the reading is different, because
+            // there is no `LazyFrame` to start from. Building it is a full
+            // parse of the file, which is why it happens on the worker rather
+            // than in front of the user.
+            Source::Json(path) => {
+                let path = path.clone();
+                let Some(index) = self.row_index.clone() else {
+                    return rx;
+                };
+                let schema = self.schema.clone();
+                let filter = self.view.filter.clone();
+                let bytes = self.scan_bytes.unwrap_or_else(budget::scan_bytes);
+                thread::spawn(move || {
+                    // Built on the worker: an `Expr` is not `Send`.
+                    let predicate = filter.and_then(|f| rows::predicate(&f, &schema));
+                    let Ok(frame) = json_frame(&path, &index, &schema, bytes) else {
+                        return;
+                    };
+                    if let Ok(df) = Self::materialise(frame.lazy(), &keys, predicate) {
+                        let _ = tx.send(df);
+                    }
+                });
+            }
             Source::Lake(query) => {
                 // A cloned handle shares the attached lake, so the background
                 // thread does not pay the ATTACH cost again.
@@ -789,14 +811,10 @@ impl Store {
     /// Asked *before* a sort key is recorded, so a refusal leaves the view as
     /// it was rather than in an order nothing can produce.
     pub fn sort_blocked(&self) -> Option<String> {
-        // A sort needs the whole table in an order nothing on disk has, and
-        // the JSONL path has no frame to sort — every page is built from the
-        // bytes the row index points at. Refused for now rather than paid for
-        // by re-reading the file per page.
-        if matches!(self.source, Source::Json(_)) {
-            return Some("sorting a jsonl file is not supported yet".to_string());
-        }
-        if matches!(self.source, Source::Lazy(_)) && !self.sort_fits() {
+        // Lake tables sort through DuckDB, which spills to disk; everything
+        // plv sorts itself has to fit in memory, JSONL included — it is the
+        // same held frame, only built by a different reader.
+        if !matches!(self.source, Source::Lake(_)) && !self.sort_fits() {
             return Some(format!(
                 "{} rows across {} columns is more than there is memory to sort",
                 self.row_count(),
@@ -1559,6 +1577,50 @@ fn match_rows(hits: &DataFrame) -> Vec<usize> {
         .unwrap_or_default()
 }
 
+/// The whole of a JSONL file as one frame, read in chunks bounded by bytes.
+///
+/// The only way to sort one: a sort has to see every row, and there is no
+/// lazy frame here to hand that job to. Chunked by the same byte budget the
+/// filter scan uses, and read from the offsets the index points at, so the
+/// cost is one linear pass rather than a re-read per chunk. Whether the
+/// result will fit is `sort_blocked`'s question, asked before this is called.
+fn json_frame(path: &Path, index: &RowIndex, schema: &SchemaRef, bytes: u64) -> Result<DataFrame> {
+    let wanted: Vec<usize> = (0..schema.len()).collect();
+    let total = index.rows();
+    let mut frame: Option<DataFrame> = None;
+    let mut start = 0usize;
+
+    while start < total {
+        let end = index.chunk_end(start, bytes);
+        let (first_row, from) = index.seek(start);
+        let to = index.end_of(end);
+        let chunk = jsonl::page(
+            &index::read_span(path, index, from, to)?,
+            schema,
+            &wanted,
+            start - first_row,
+            end - start,
+        )?;
+        match &mut frame {
+            Some(so_far) => {
+                so_far.vstack_mut(&chunk)?;
+            }
+            None => frame = Some(chunk),
+        }
+        start = end;
+    }
+
+    match frame {
+        Some(mut frame) => {
+            // One run of chunks to sort rather than a few hundred stacked
+            // ones, each column aligned with the rest.
+            frame.align_chunks_par();
+            Ok(frame)
+        }
+        None => Ok(DataFrame::empty()),
+    }
+}
+
 /// How the bytes of a span become rows.
 ///
 /// The one place the two file kinds differ once the index has said which bytes
@@ -1780,10 +1842,86 @@ mod tests {
     }
 
     #[test]
-    fn a_jsonl_file_is_read_only_and_cannot_be_sorted() {
+    fn a_jsonl_file_is_read_only() {
         let store = Store::open_file(&log_file("log-blocked.jsonl"), 4).unwrap();
         assert_eq!(store.edit_blocked(), Some("jsonl files are read-only"));
-        assert!(store.sort_blocked().unwrap().contains("not supported yet"));
+        assert!(store.sort_blocked().is_none(), "but it can be sorted");
+    }
+
+    /// Sorting reads the file once into a held frame, exactly as a delimited
+    /// file's sort does — the reading is all that differs.
+    fn sorted_by(store: &mut Store, display_col: usize) {
+        let rx = store.begin_sort(display_col);
+        let df = rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the sort produced a frame");
+        store.adopt_sorted(df).unwrap();
+    }
+
+    #[test]
+    fn a_jsonl_file_sorts_by_holding_the_whole_table() {
+        let mut store = Store::open_file(&log_file("log-sort.jsonl"), 10).unwrap();
+        sorted_by(&mut store, 1); // `level`
+
+        assert_eq!(cell(&store.current_view, 1, 0).as_deref(), Some("error"));
+        assert_eq!(
+            store.source_row(0),
+            Some(8),
+            "and the sorted row still knows which line it came from"
+        );
+        assert_eq!(store.row_count(), 9, "every row is still there");
+
+        // Descending on the second press, as it does everywhere else.
+        sorted_by(&mut store, 1);
+        assert_eq!(cell(&store.current_view, 1, 0).as_deref(), Some("info"));
+    }
+
+    /// A held sort carries the filter, rather than a row-set scan running
+    /// beside it over a file that is already in memory.
+    #[test]
+    fn a_jsonl_sort_and_filter_compose() {
+        let mut store = Store::open_file(&log_file("log-sortfilter.jsonl"), 10).unwrap();
+        let mut view = store.view.clone();
+        view.filter = Some(
+            match crate::view::parse("filter n > 6", &store.schema).unwrap() {
+                crate::view::Command::Filter(filter) => filter,
+                other => panic!("{other:?}"),
+            },
+        );
+        store.apply_view(view).unwrap();
+        sorted_by(&mut store, 3); // `n`
+
+        assert_eq!(store.row_count(), 2, "rows 7 and 8");
+        assert_eq!(cell(&store.current_view, 3, 0).as_deref(), Some("7"));
+        assert_eq!(store.source_row(1), Some(8));
+    }
+
+    /// The interesting sort is one whose read crosses a chunk seam, since that
+    /// is where the row numbering would go wrong.
+    #[test]
+    fn a_jsonl_sort_reads_the_whole_file_across_its_chunks() {
+        let rows = 5_000;
+        let mut text = String::new();
+        for i in 0..rows {
+            text.push_str(&format!(
+                "{{\"i\":{},\"pad\":\"{}\"}}\n",
+                rows - i,
+                "x".repeat(40)
+            ));
+        }
+        let path = write_temp("log-sortchunks.jsonl", &text);
+        let mut store = Store::open_file(&path, 5).unwrap();
+        // Force several chunks out of a small fixture.
+        store.scan_bytes = Some(16 << 10);
+        sorted_by(&mut store, 0); // `i`, which counts down the file
+
+        assert_eq!(store.row_count(), rows);
+        assert_eq!(cell(&store.current_view, 0, 0).as_deref(), Some("1"));
+        assert_eq!(
+            store.source_row(0),
+            Some(rows - 1),
+            "the last line of the file sorts first"
+        );
     }
 
     /// Small fixtures never reach a second checkpoint, so the interesting

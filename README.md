@@ -269,10 +269,14 @@ Only top-level keys become columns; anything deeper stays inside its value,
 where `K` reads it. A line that is not a JSON object is still a row — dropping
 it would put every row number after it out by one — it simply has no fields.
 
-JSONL files are **read-only**, and cannot be sorted yet: every page is built
-from the byte span the row index points at, and there is no frame behind them to
-put in another order. `:filter` and `/` work, and pay the same linear scan a CSV
-does.
+`s` sorts, the same way a CSV sort works: the file is read once into a frame
+that is then held, so the pages after it are free. On a 62MB, 500,000-line log
+that is 220ms to sort and 4µs a page, in 350MB of memory — and past what there
+is memory for, plv refuses rather than trying. `:filter` composes with it, and
+both `:filter` and `/` pay the same linear scan a CSV does.
+
+JSONL files are **read-only**: an edit means rewriting a record, which is a
+different piece of work from splicing a field.
 
 ## DuckLake
 
