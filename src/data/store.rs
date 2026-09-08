@@ -62,10 +62,17 @@ struct LakeQuery {
     columns: Vec<String>,
 }
 
+/// How a file plv writes to is spelled: a delimited record, or a JSON one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Written {
+    Delimited(u8),
+    Json,
+}
+
 /// A file plv can write edits back to.
 struct EditTarget {
     path: PathBuf,
-    separator: u8,
+    written: Written,
     /// How the file looked when it was opened. A write checks this first, so
     /// it cannot clobber changes something else made in the meantime — the
     /// buffer's row numbers describe the file as it was read.
@@ -178,7 +185,7 @@ impl Store {
         if let Some(separator) = separator {
             store.edit = Some(EditTarget {
                 path: path.to_path_buf(),
-                separator,
+                written: Written::Delimited(separator),
                 stamp: Stamp::of(path)?,
             });
         }
@@ -220,7 +227,11 @@ impl Store {
             viewport_rows,
             current_view: DataFrame::empty(),
             view,
-            edit: None,
+            edit: Some(EditTarget {
+                path: path.to_path_buf(),
+                written: Written::Json,
+                stamp: Stamp::of(path)?,
+            }),
             overlay: Overlay::new(),
             filter_rows: None,
             row_index: Some(std::sync::Arc::new(index)),
@@ -788,10 +799,13 @@ impl Store {
                 file.path.clone(),
                 Records::Json(Arc::new(file.columns.clone())),
             )),
-            _ => self
-                .edit
-                .as_ref()
-                .map(|target| (target.path.clone(), Records::Delimited(target.separator))),
+            _ => self.edit.as_ref().and_then(|target| match target.written {
+                Written::Delimited(separator) => {
+                    Some((target.path.clone(), Records::Delimited(separator)))
+                }
+                // A JSONL file is always `Source::Json`, matched above.
+                Written::Json => None,
+            }),
         }
     }
 
@@ -1010,12 +1024,9 @@ impl Store {
         if self.edit.is_none() {
             return Some(match self.source {
                 Source::Lake(_) => "lake tables are read-only",
-                // A JSONL edit means rewriting a record, which is a different
-                // piece of work from splicing a field: the value's bytes are
-                // known, but its type, its escaping and the shape of the line
-                // around it are the record's business.
-                Source::Json(_) => "jsonl files are read-only",
-                Source::Lazy(_) => "only csv, tsv, tab and txt files can be edited",
+                Source::Json(_) | Source::Lazy(_) => {
+                    "only csv, tsv, tab, txt and jsonl files can be edited"
+                }
             });
         }
         if !self.view.sort.is_empty() && self.sorted.is_none() {
@@ -1170,11 +1181,22 @@ impl Store {
             );
         }
         let src = target.path.clone();
-        let separator = target.separator;
+        let written = target.written;
         let dst = dst.unwrap_or(&src).to_path_buf();
 
-        // plv always reads a header row, so record 0 is never data.
-        let stamp = writer::save(&src, &dst, separator, true, &self.overlay, self.total_rows)?;
+        let stamp = match written {
+            // plv always reads a header row, so record 0 is never data.
+            Written::Delimited(separator) => {
+                writer::save(&src, &dst, separator, true, &self.overlay, self.total_rows)?
+            }
+            Written::Json => writer::save_json(
+                &src,
+                &dst,
+                &self.json_columns(),
+                &self.overlay,
+                self.total_rows,
+            )?,
+        };
 
         if dst == src {
             self.overlay.clear();
@@ -1186,18 +1208,117 @@ impl Store {
         Ok(dst)
     }
 
+    /// Where each column lives in a record and what it may be written as.
+    ///
+    /// The paths are the ones pages are read through, so an edit lands in the
+    /// bytes the cell was read from — an `:expand`ed column included, which is
+    /// what lets a nested value be edited at all.
+    fn json_columns(&self) -> Vec<writer::JsonColumn> {
+        let Source::Json(file) = &self.source else {
+            return Vec::new();
+        };
+        file.columns
+            .iter()
+            .enumerate()
+            .map(|(at, path)| writer::JsonColumn {
+                path: path.clone(),
+                kind: match self.schema.get_at_index(at).map(|(_, dtype)| dtype) {
+                    Some(DataType::Int64) => writer::JsonType::Int,
+                    Some(DataType::Float64) => writer::JsonType::Float,
+                    Some(DataType::Boolean) => writer::JsonType::Bool,
+                    _ => writer::JsonType::Text,
+                },
+            })
+            .collect()
+    }
+
     /// Re-open the file after writing to it, in case an edit changed a
     /// column's inferred type. The row count cannot have changed: a value
     /// containing a newline is quoted, so it stays one record.
     fn reload(&mut self) -> Result<()> {
-        let Some(path) = self.edit.as_ref().map(|t| t.path.clone()) else {
+        let Some(target) = &self.edit else {
             return Ok(());
         };
+        let path = target.path.clone();
+        if matches!(target.written, Written::Json) {
+            return self.reload_json(&path);
+        }
         let mut lf = loader::load(&path)?;
         self.schema = lf.collect_schema()?;
         self.source = Source::Lazy(lf);
         // The held sort describes the file as it was before the write.
         self.sorted = None;
+        self.refresh()
+    }
+
+    /// Re-open a JSONL file after writing to it.
+    ///
+    /// More than the delimited reload does, because more can have changed: an
+    /// edit can widen a column's type, and a deleted or added record changes
+    /// both the row count and where every record after it begins. So the
+    /// index, the count and the keys are all read again — the same one pass
+    /// that opens the file.
+    ///
+    /// The view is put back **by name**, since the column numbers are only
+    /// meaningful against the schema they were written for, and any column
+    /// `:expand` made is re-appended: it is derived from the file rather than
+    /// found in it, so a re-read would otherwise quietly drop it along with
+    /// the edit that was just written through it.
+    fn reload_json(&mut self, path: &Path) -> Result<()> {
+        let expanded: Vec<(DataType, jsonl::KeyPath)> = match &self.source {
+            Source::Json(file) => file
+                .columns
+                .iter()
+                .enumerate()
+                .filter(|(_, path)| path.len() > 1)
+                .filter_map(|(at, path)| {
+                    let (_, dtype) = self.schema.get_at_index(at)?;
+                    Some((dtype.clone(), path.clone()))
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        let shown: Option<Vec<String>> = self.view.select.as_ref().map(|cols| {
+            cols.iter()
+                .filter_map(|&at| self.schema.get_at_index(at))
+                .map(|(name, _)| name.to_string())
+                .collect()
+        });
+
+        let mut scan = jsonl::Scan::new();
+        let index = RowIndex::build_lines(path, &mut |byte| scan.byte(byte))?;
+        let fields = scan.finish();
+        let mut schema = (*fields.schema()).clone();
+        let mut paths = fields.paths();
+        for (dtype, path) in expanded {
+            // Its parent may have been deleted along with the last record
+            // that carried it.
+            if !schema.contains(&path[0][..]) {
+                continue;
+            }
+            let name = unique_name(&schema, path.join("."));
+            schema.with_column(name.into(), dtype);
+            paths.push(path);
+        }
+
+        self.schema = Arc::new(schema);
+        self.source = Source::Json(JsonFile {
+            path: path.to_path_buf(),
+            columns: paths,
+        });
+        self.total_rows = index.rows();
+        self.row_index = Some(std::sync::Arc::new(index));
+        // The held sort describes the file as it was before the write.
+        self.sorted = None;
+        self.view.select = shown
+            .map(|names| {
+                names
+                    .iter()
+                    .filter_map(|name| self.schema.index_of(&name[..]))
+                    .collect::<Vec<_>>()
+            })
+            .filter(|cols: &Vec<usize>| !cols.is_empty());
+        self.row_offset = self.row_offset.min(self.row_count().saturating_sub(1));
         self.refresh()
     }
 
@@ -2017,10 +2138,168 @@ mod tests {
     }
 
     #[test]
-    fn a_jsonl_file_is_read_only() {
+    fn a_jsonl_file_can_be_edited_and_sorted() {
         let store = Store::open_file(&log_file("log-blocked.jsonl"), 4).unwrap();
-        assert_eq!(store.edit_blocked(), Some("jsonl files are read-only"));
-        assert!(store.sort_blocked().is_none(), "but it can be sorted");
+        assert_eq!(store.edit_blocked(), None);
+        assert!(store.sort_blocked().is_none());
+    }
+
+    /// An edit replaces the value's bytes and nothing else: key order,
+    /// spacing and every other record survive exactly.
+    #[test]
+    fn writing_a_jsonl_edit_touches_only_that_value() {
+        let path = write_temp(
+            "log-write.jsonl",
+            concat!(
+                r#"{"ts": "10:00:00", "level":"info","n":1}"#,
+                "\n",
+                r#"{"ts": "10:00:01", "level":"error","n":2}"#,
+                "\n"
+            ),
+        );
+        let mut store = Store::open_file(&path, 10).unwrap();
+        store.edit([((1, 1), "warn".to_string())]).unwrap();
+        store.save(None, false).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            concat!(
+                r#"{"ts": "10:00:00", "level":"info","n":1}"#,
+                "\n",
+                r#"{"ts": "10:00:01", "level":"warn","n":2}"#,
+                "\n"
+            ),
+            "the spacing of the untouched record is its own"
+        );
+        assert_eq!(store.dirty(), 0, "and the buffer is clean afterwards");
+    }
+
+    #[test]
+    fn a_number_is_written_as_a_number_and_anything_else_as_text() {
+        let path = write_temp(
+            "log-types.jsonl",
+            "{\"n\":1,\"b\":true}\n{\"n\":2,\"b\":false}\n",
+        );
+        let mut store = Store::open_file(&path, 10).unwrap();
+        store.edit([((0, 0), "42".to_string())]).unwrap();
+        store.edit([((1, 1), "true".to_string())]).unwrap();
+        store.save(None, false).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{\"n\":42,\"b\":true}\n{\"n\":2,\"b\":true}\n"
+        );
+
+        // A value the column cannot hold is written as text rather than
+        // refused, and the column widens when the file is read again.
+        let mut store = Store::open_file(&path, 10).unwrap();
+        store.edit([((0, 0), "n/a".to_string())]).unwrap();
+        store.save(None, false).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{\"n\":\"n/a\",\"b\":true}\n{\"n\":2,\"b\":true}\n"
+        );
+        assert_eq!(store.schema.get_at_index(0).unwrap().1, &DataType::String);
+    }
+
+    #[test]
+    fn a_key_the_record_lacks_is_added_and_an_empty_edit_is_null() {
+        let path = write_temp("log-add-key.jsonl", "{\"a\":1,\"b\":2}\n{\"a\":3}\n");
+        let mut store = Store::open_file(&path, 10).unwrap();
+        store.edit([((1, 1), "9".to_string())]).unwrap(); // `b`, which record 1 lacks
+        store.edit([((0, 1), String::new())]).unwrap(); // cleared
+        store.save(None, false).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{\"a\":1,\"b\":null}\n{\"a\":3,\"b\":9}\n"
+        );
+    }
+
+    /// Editing an `:expand`ed column writes into the document it came out of.
+    #[test]
+    fn an_expanded_column_writes_back_into_its_document() {
+        let path = write_temp(
+            "log-nested-write.jsonl",
+            "{\"err\":{\"code\":500,\"why\":\"boom\"}}\n{\"err\":{\"code\":502,\"why\":\"gone\"}}\n",
+        );
+        let mut store = Store::open_file(&path, 10).unwrap();
+        store.expand(0).unwrap();
+        // `edit` counts columns the way the screen does, and after an expand
+        // the children stand where their parent stood.
+        let code = store
+            .display_column(store.schema.index_of("err.code").unwrap())
+            .unwrap();
+        store.edit([((0, code), "503".to_string())]).unwrap();
+        store.save(None, false).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{\"err\":{\"code\":503,\"why\":\"boom\"}}\n{\"err\":{\"code\":502,\"why\":\"gone\"}}\n",
+            "only the number changed"
+        );
+        // The re-read keeps the expansion, or the edit would have written
+        // through a column that then vanished.
+        assert!(store.schema.contains("err.code"), "{:?}", store.schema);
+    }
+
+    /// Adding a key one level in would mean inventing the documents above it,
+    /// which is a bigger decision than an edit. Refused, and the file is left
+    /// exactly as it was.
+    #[test]
+    fn writing_refuses_to_invent_a_document_for_a_nested_key() {
+        let original = "{\"err\":{\"code\":1}}\n{\"err\":{\"why\":\"x\"}}\n";
+        let path = write_temp("log-nested-refuse.jsonl", original);
+        let mut store = Store::open_file(&path, 10).unwrap();
+        store.expand(0).unwrap();
+        let code = store
+            .display_column(store.schema.index_of("err.code").unwrap())
+            .unwrap();
+
+        store.edit([((1, code), "7".to_string())]).unwrap();
+        let refusal = store.save(None, false).unwrap_err().to_string();
+        assert!(refusal.contains("no key to land in"), "{refusal}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            original,
+            "and nothing was written"
+        );
+        assert_eq!(store.dirty(), 1, "the edit is still pending");
+    }
+
+    #[test]
+    fn deleting_and_adding_records_reaches_the_file() {
+        let path = write_temp("log-rows.jsonl", "{\"a\":1}\n{\"a\":2}\n{\"a\":3}\n");
+        let mut store = Store::open_file(&path, 10).unwrap();
+        store.delete_rows([1usize]).unwrap();
+        store.save(None, false).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{\"a\":1}\n{\"a\":3}\n"
+        );
+        assert_eq!(store.row_count(), 2, "and the view knows the file shrank");
+
+        let added = store.add_row(0, true).unwrap();
+        store.edit([((added, 0), "9".to_string())]).unwrap();
+        store.save(None, false).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{\"a\":1}\n{\"a\":9}\n{\"a\":3}\n"
+        );
+        assert_eq!(store.row_count(), 3);
+    }
+
+    /// Escapes are the file's own on the way in and plv's on the way out, and
+    /// a value that came back unchanged has to land byte for byte.
+    #[test]
+    fn escapes_survive_a_round_trip() {
+        let original = "{\"m\":\"a \\\"quote\\\" and a \\n\",\"n\":1}\n";
+        let path = write_temp("log-escapes.jsonl", original);
+        let mut store = Store::open_file(&path, 10).unwrap();
+        let read = store.cell_text(0, 0).unwrap();
+        assert_eq!(read, "a \"quote\" and a \n");
+
+        store.edit([((0, 0), read)]).unwrap();
+        store.save(None, false).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
     }
 
     /// Sorting reads the file once into a held frame, exactly as a delimited

@@ -3,7 +3,7 @@
 A terminal viewer and editor for CSV, TSV, JSONL, Parquet and [DuckLake](https://ducklake.select/) data, inspired by [csvlens](https://github.com/YS-L/csvlens). Built with [Polars](https://pola.rs/) and [ratatui](https://ratatui.rs/).
 
 - Supports CSV, tab-separated text, JSONL logs, Parquet, and DuckLake lakes
-- **Edits delimited text** — cells, blocks, whole rows — in a buffer, written with `:w`
+- **Edits delimited text and JSONL** — cells, blocks, whole rows — in a buffer, written with `:w`
 - **A view language** — `:select`, `:hide`, `:filter`, `:sort`, `:expand` — with Tab completion over the file's own column names
 - **Column control** — pin columns to the left edge, hide one with a keystroke, or pick from a list
 - Works on files larger than memory: a 30GB CSV opens, pages anywhere, edits and writes back within about 60MB
@@ -127,10 +127,9 @@ Type a regex pattern after `/` and press `Enter`. In Row mode, search covers all
 
 ## Editing
 
-CSV, TSV and `.txt` files can be edited. Parquet stays read-only — it is
+CSV, TSV, `.txt` and JSONL files can be edited. Parquet stays read-only — it is
 genuinely typed, so a one-cell change would mean rewriting the whole file
-against a schema — as do lake tables and JSONL, where an edit would mean
-rewriting a record rather than splicing a field.
+against a schema — as do lake tables.
 
 | Key | Action |
 |-----|--------|
@@ -296,8 +295,16 @@ that is 220ms to sort and 4µs a page, in 350MB of memory — and past what ther
 is memory for, plv refuses rather than trying. `:filter` composes with it, and
 both `:filter` and `/` pay the same linear scan a CSV does.
 
-JSONL files are **read-only**: an edit means rewriting a record, which is a
-different piece of work from splicing a field.
+JSONL files are **editable**, and written the same way a CSV is: the record's
+own bytes are streamed through and only the edited value is replaced, so key
+order, spacing, escaping and every other record survive exactly. A value is
+written as a number or a boolean when the text will pass as one and as a string
+otherwise; an empty cell is `null`. A key the record does not have is added at
+the end of it — but only at the top level, since adding one further in would
+mean inventing the documents above it, and that is refused with a reason rather
+than guessed at. `dd` and `o` work too: a struck record leaves no blank line
+behind, and a new one is a document built from the cells you typed, nesting
+included.
 
 ## DuckLake
 
