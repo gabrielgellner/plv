@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.15.0] - 2026-09-08
+
+### Features
+
+- read JSONL logs into the grid ([`1bb015a`](https://gitlab.com/gabrielgellner/plv/-/commit/1bb015adc8c5f798ed6028b80a63407595248bb4))
+
 ## [0.14.0] - 2026-09-07
 
 ### Features
@@ -201,6 +207,8 @@ All notable changes to this project will be documented in this file.
 ### Styling
 
 - fix clippy warnings ([`5cb0dba`](https://gitlab.com/gabrielgellner/plv/-/commit/5cb0dba5f5d4bc0be4d3d3b09fd1e7cd00ff7722))
+
+[0.15.0]: https://gitlab.com/gabrielgellner/plv/-/compare/v0.14.0...v0.15.0
 
 [0.14.0]: https://gitlab.com/gabrielgellner/plv/-/compare/v0.13.0...v0.14.0
 
