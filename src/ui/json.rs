@@ -20,28 +20,9 @@
 //! could be half-right: a value is JSON if this walks all the way to the end
 //! of it, and text otherwise.
 
-/// What a piece of a document is, for colour. Nothing here is about *how* it
-/// is coloured — that is the theme's, and this module holds no ratatui.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Kind {
-    /// An object key, quotes included.
-    Key,
-    Str,
-    Num,
-    /// `true`, `false`, `null`.
-    Lit,
-    /// Braces, brackets, commas, colons — and the indentation, which is
-    /// structure too.
-    Punct,
-}
-
-/// A run of text of one kind. `text` is always a slice of the original value,
-/// or whitespace this module added.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct Piece {
-    pub kind: Kind,
-    pub text: String,
-}
+/// Pieces are the shared ones: a JSON key and an XML element name are the
+/// same kind of thing, and one place decides what colour that is.
+use super::syntax::{Kind, Piece};
 
 /// Nesting past this is refused rather than recursed into. A cell nested 64
 /// deep is not a thing anyone is reading in a table viewer, and the parser
@@ -106,10 +87,7 @@ impl Parser<'_> {
     }
 
     fn push(&mut self, kind: Kind, text: impl Into<String>) {
-        self.line.push(Piece {
-            kind,
-            text: text.into(),
-        });
+        self.line.push(Piece::new(kind, text));
     }
 
     /// End the line and open the next one at `indent`.
@@ -160,7 +138,7 @@ impl Parser<'_> {
             self.space();
             if object {
                 let key = self.string()?;
-                self.push(Kind::Key, key);
+                self.push(Kind::Name, key);
                 self.space();
                 self.take(b':')?;
                 self.push(Kind::Punct, ": ");
@@ -347,7 +325,7 @@ mod tests {
         let kinds: Vec<Kind> = doc[1].iter().map(|piece| piece.kind).collect();
         assert_eq!(
             kinds,
-            [Kind::Punct, Kind::Key, Kind::Punct, Kind::Str, Kind::Punct],
+            [Kind::Punct, Kind::Name, Kind::Punct, Kind::Str, Kind::Punct],
             "indent, key, colon, value, comma"
         );
         assert_eq!(doc[2][3].kind, Kind::Num);

@@ -25,7 +25,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph, Widget},
 };
 
-use super::{Theme, json};
+use super::{Theme, json, markup, syntax};
 
 /// Borders and a column of padding either side, which the value does not get
 /// to write in.
@@ -49,6 +49,9 @@ pub enum Format {
     #[default]
     Text,
     Json,
+    /// XML or HTML, told apart by which of the two's rules the document
+    /// needed — see [`markup::Flavour`].
+    Markup(markup::Flavour),
 }
 
 impl Format {
@@ -57,6 +60,7 @@ impl Format {
         match self {
             Format::Text => None,
             Format::Json => Some("json"),
+            Format::Markup(flavour) => Some(flavour.label()),
         }
     }
 }
@@ -81,13 +85,20 @@ impl Content {
         // Parsed either way, so a raw view still knows what it is looking at
         // and can offer the way back. It is one parse per open or toggle, not
         // one per keypress.
-        let document = json::reindent(value);
-        let format = match document {
-            Some(_) => Format::Json,
-            None => Format::Text,
+        //
+        // The formats are tried in turn, and each is a whole parse of the
+        // value rather than a look at its first character — so nothing is
+        // claimed on the strength of a `{` or a `<`. They cannot both
+        // succeed: a JSON document does not begin with a tag.
+        let (format, document) = match json::reindent(value) {
+            Some(document) => (Format::Json, Some(document)),
+            None => match markup::reindent(value) {
+                Some((document, flavour)) => (Format::Markup(flavour), Some(document)),
+                None => (Format::Text, None),
+            },
         };
         let lines = match document {
-            Some(document) if !raw => coloured(&document, theme),
+            Some(document) if !raw => syntax::lines(&document, theme),
             _ => plain(value),
         };
         Self {
@@ -111,29 +122,6 @@ fn plain(value: &str) -> Vec<Line<'static>> {
     value
         .split('\n')
         .map(|line| Line::raw(line.to_string()))
-        .collect()
-}
-
-/// A parsed document, coloured by what each run of it is.
-fn coloured(document: &[Vec<json::Piece>], theme: &Theme) -> Vec<Line<'static>> {
-    document
-        .iter()
-        .map(|line| {
-            Line::from(
-                line.iter()
-                    .map(|piece| {
-                        let colour = match piece.kind {
-                            json::Kind::Key => theme.syntax_key,
-                            json::Kind::Str => theme.syntax_string,
-                            json::Kind::Num => theme.syntax_number,
-                            json::Kind::Lit => theme.syntax_literal,
-                            json::Kind::Punct => theme.syntax_punct,
-                        };
-                        Span::styled(piece.text.clone(), Style::new().fg(colour))
-                    })
-                    .collect::<Vec<_>>(),
-            )
-        })
         .collect()
 }
 
@@ -733,10 +721,37 @@ mod tests {
     }
 
     #[test]
+    fn a_markup_cell_is_laid_out_and_named_for_what_it_is() {
+        let html = content(r#"<div class="note"><p>Hi <b>there</b></p><br></div>"#);
+        assert_eq!(html.format, Format::Markup(markup::Flavour::Html));
+        assert_eq!(
+            text(&html.lines),
+            [
+                r#"<div class="note">"#,
+                "  <p>Hi <b>there</b></p>",
+                "  <br>",
+                "</div>",
+            ]
+        );
+        assert!(title("note", "str", &html).contains("html,"));
+
+        // Closed the way XML asks, and it is XML.
+        let xml = content("<note><to>you</to></note>");
+        assert_eq!(xml.format, Format::Markup(markup::Flavour::Xml));
+        assert!(title("note", "str", &xml).contains("xml,"));
+        assert!(xml.switchable(), "and `r` gets back to the bytes");
+    }
+
+    /// Prose with an angle bracket in it is prose. A format is claimed only
+    /// when the whole value parses as one.
+    #[test]
     fn a_value_that_is_not_a_document_is_left_alone() {
-        let content = content("just a note, {not} json");
+        let content = content("just a note, {not} json, and 3 < 4 <p>");
         assert_eq!(content.format, Format::Text);
         assert!(!content.switchable(), "and offers no way back");
-        assert_eq!(text(&content.lines), ["just a note, {not} json"]);
+        assert_eq!(
+            text(&content.lines),
+            ["just a note, {not} json, and 3 < 4 <p>"]
+        );
     }
 }

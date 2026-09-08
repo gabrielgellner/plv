@@ -62,14 +62,26 @@ column, its type and its size, and scrolled with `j`/`k`, `Ctrl+d`/`Ctrl+u` and
 plv, and it covers the table rather than taking rows from it — closing it puts
 the screen back exactly as it was.
 
-A cell that is a JSON document is shown as one: re-indented, coloured, and
-titled `note — json, 291 characters`. Detection is a real parse rather than a
-guess — a value is JSON only if it parses all the way to the end, and anything
-else is left as text — and the document is re-indented from its own bytes rather
-than rebuilt from a parsed model, so key order, number formatting, duplicate keys
-and escapes are exactly what the file says. `r` switches to the raw value and
-back, since the formatted view is an interpretation and the raw one is what gets
-edited and written.
+A cell that is a **document** is shown as one: re-indented, coloured, and titled
+`note — json, 291 characters` or `body — html, 209 characters`. JSON, XML and
+HTML are recognised.
+
+Detection is a real parse rather than a guess — a value is JSON only if it parses
+all the way to the end, and markup only if every tag closes in the right order,
+so prose with a `{` or a `<` in it stays prose. The document is re-indented from
+its **own bytes** rather than rebuilt from a parsed model, so JSON's key order,
+number formatting and duplicate keys survive, and so do markup's attribute
+quoting and entities. `r` switches to the raw value and back, since the formatted
+view is an interpretation and the raw one is what gets edited and written.
+
+Markup has to be well-formed. Real HTML often is not — an unclosed `<p>`, an
+`<li>` left hanging — and those cells stay text, deliberately: a half-parsed
+document drawn as a tree is a claim about where things nest, and getting that
+wrong is worse than not indenting at all. Void elements (`<br>`, `<img>`) are the
+exception, since closing themselves is their rule; needing that rule, or a bare
+or unquoted attribute, is what makes a document `html` rather than `xml`. An
+element holding text is left on one line — breaking prose apart to show
+structure would be showing structure that is not there.
 
 `zk` is the other half: the same value in the strip above the status bar, two or
 three lines of it, staying on as the cursor moves so a column of long values can
