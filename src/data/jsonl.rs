@@ -25,6 +25,9 @@
 //! true one *and* settled before anything is on screen.
 
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::{BufRead, BufReader};
+use std::path::Path;
 
 use anyhow::Result;
 use polars::prelude::*;
@@ -146,6 +149,16 @@ impl Fields {
         Arc::new(schema)
     }
 
+    /// Where each of [`Fields::columns`] lives in a record. A discovered key
+    /// is one step down; `:expand` builds longer ones by prefixing these with
+    /// the column it opened.
+    pub fn paths(&self) -> Vec<KeyPath> {
+        self.columns()
+            .iter()
+            .map(|field| vec![field.name.clone()])
+            .collect()
+    }
+
     /// What opening the file turned up that is worth saying once: keys that
     /// did not fit the table, lines that were not records. `None` when there
     /// is nothing to report, which is the ordinary case.
@@ -206,11 +219,31 @@ pub struct Scan {
     line: Vec<u8>,
     at: HashMap<Vec<u8>, usize>,
     found: Fields,
+    /// What to descend to before looking for keys. Empty for the record
+    /// itself, which is how a file is opened; set by `:expand`, which asks
+    /// the same question one level in.
+    under: KeyPath,
+    /// Records that actually had a document at `under`, which is what bounds
+    /// a sample: a key on one line in a thousand needs a thousand lines read
+    /// before there is anything to say about it.
+    carrying: usize,
 }
 
 impl Scan {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A scan of what is *inside* one column, for `:expand`.
+    pub fn under(path: KeyPath) -> Self {
+        Self {
+            under: path,
+            ..Self::default()
+        }
+    }
+
+    pub fn carrying(&self) -> usize {
+        self.carrying
     }
 
     #[inline]
@@ -241,6 +274,27 @@ impl Scan {
             self.line = line;
             self.line.clear();
             return;
+        }
+
+        // Looking one level in: the record's own keys are not the answer, the
+        // keys of the document at `under` are. A record that does not carry it
+        // is not malformed, it simply has nothing to say here.
+        if !self.under.is_empty() {
+            let inner = fields
+                .iter()
+                .find(|(name, _, _)| *name == self.under[0].as_bytes())
+                .and_then(|(_, kind, raw)| descend(*kind, raw, &self.under[1..]))
+                .filter(|(kind, _)| *kind == Kind::Nested)
+                .map(|(_, raw)| raw);
+            fields.clear();
+            match inner.filter(|raw| fields_of(raw, &mut fields)) {
+                Some(_) => self.carrying += 1,
+                None => {
+                    self.line = line;
+                    self.line.clear();
+                    return;
+                }
+            }
         }
 
         for (name, kind, _) in fields {
@@ -276,6 +330,59 @@ impl Scan {
     }
 }
 
+/// Records to look inside before answering what a column holds.
+///
+/// DuckDB's `sample_size` default, and for its reason: the answer wanted is
+/// the shape of a document, and the shape is usually the same by the twentieth
+/// record, let alone the twenty-thousandth. Counted in records that *carry*
+/// the column, not lines read, so a key on one line in a thousand is still
+/// sampled properly.
+pub const SAMPLE_RECORDS: usize = 20_480;
+
+/// And a hard stop on the reading, for a key so rare the count above would
+/// mean walking a whole large file to find it. `:expand` runs in front of the
+/// user, so it has to come back.
+pub const SAMPLE_BYTES: u64 = 256 << 20;
+
+/// What a sample found, and whether it saw the whole file.
+pub struct Sample {
+    pub fields: Fields,
+    /// The scan reached the end of the file, so these keys are all of them.
+    /// False means a bound was hit and the answer is what was in reach.
+    pub complete: bool,
+}
+
+/// The keys of the documents inside one column.
+///
+/// A second pass over the file, unlike the key discovery that happens when a
+/// file opens — that one rides along with the row index, which is already
+/// reading every byte, and this one has nothing to ride. So it is bounded,
+/// and says when a bound is what stopped it.
+pub fn sample_under(file: &Path, under: &KeyPath) -> Result<Sample> {
+    let mut scan = Scan::under(under.clone());
+    let mut reader = BufReader::with_capacity(1 << 20, File::open(file)?);
+    let mut read = 0u64;
+    let complete = loop {
+        let chunk = reader.fill_buf()?;
+        if chunk.is_empty() {
+            break true;
+        }
+        let taken = chunk.len();
+        for &byte in chunk {
+            scan.byte(byte);
+        }
+        read += taken as u64;
+        reader.consume(taken);
+        if scan.carrying() >= SAMPLE_RECORDS || read >= SAMPLE_BYTES {
+            break false;
+        }
+    };
+    Ok(Sample {
+        fields: scan.finish(),
+        complete,
+    })
+}
+
 /// A page of records, as the columns `wanted` names.
 ///
 /// `bytes` is whole lines: the index only ever hands out spans that begin and
@@ -286,20 +393,25 @@ impl Scan {
 pub fn page(
     bytes: &[u8],
     schema: &SchemaRef,
+    paths: &[KeyPath],
     wanted: &[usize],
     skip: usize,
     take: usize,
 ) -> Result<DataFrame> {
-    let picked: Vec<(&str, &DataType)> = wanted
+    let picked: Vec<(&str, &DataType, &KeyPath)> = wanted
         .iter()
-        .filter_map(|&at| schema.get_at_index(at))
-        .map(|(name, dtype)| (name.as_str(), dtype))
+        .filter_map(|&at| Some((schema.get_at_index(at)?, paths.get(at)?)))
+        .map(|((name, dtype), path)| (name.as_str(), dtype, path))
         .collect();
-    let column_at: HashMap<&[u8], usize> = picked
-        .iter()
-        .enumerate()
-        .map(|(at, (name, _))| (name.as_bytes(), at))
-        .collect();
+    // Grouped by the key a column *starts* at, so one walk over a record's
+    // fields still serves every column — an expanded one included, which
+    // simply carries on down from the field it found.
+    let mut column_at: HashMap<&[u8], Vec<usize>> = HashMap::new();
+    for (at, (_, _, path)) in picked.iter().enumerate() {
+        if let Some(first) = path.first() {
+            column_at.entry(first.as_bytes()).or_default().push(at);
+        }
+    }
 
     let mut lines: Vec<&[u8]> = bytes.split(|&byte| byte == b'\n').collect();
     // A file's final newline closes the last record; it does not open another.
@@ -320,21 +432,52 @@ pub fn page(
             continue;
         }
         for (name, kind, raw) in &fields {
-            let Some(&at) = column_at.get(name) else {
+            let Some(columns) = column_at.get(name) else {
                 continue;
             };
-            let last = values[at].len() - 1;
-            values[at][last] = text(*kind, raw);
+            for &at in columns {
+                let path = picked[at].2;
+                let Some((kind, raw)) = descend(*kind, raw, &path[1..]) else {
+                    continue;
+                };
+                let last = values[at].len() - 1;
+                values[at][last] = text(kind, raw);
+            }
         }
     }
 
     let columns: Vec<Column> = picked
         .iter()
         .zip(values)
-        .map(|((name, dtype), values)| column(name, dtype, values))
+        .map(|((name, dtype, _), values)| column(name, dtype, values))
         .collect();
     let height = columns.first().map_or(0, |c| c.len());
     Ok(DataFrame::new(height, columns)?)
+}
+
+/// Where a column's value lives in a record: `["err"]` for a key, or
+/// `["err", "code"]` for one lifted out of a document by `:expand`.
+///
+/// A path rather than a dotted name, because a JSON key may itself contain a
+/// dot and splitting `err.code` would then be a guess about which of the two
+/// it was. The name is for reading; this is for finding.
+pub type KeyPath = Vec<String>;
+
+/// Follow `rest` down from a value already found, or `None` where the record
+/// does not go that deep.
+fn descend<'a>(kind: Kind, raw: &'a [u8], rest: &[String]) -> Option<(Kind, &'a [u8])> {
+    let Some(key) = rest.first() else {
+        return Some((kind, raw));
+    };
+    if kind != Kind::Nested {
+        return None;
+    }
+    let mut inner = Vec::new();
+    if !fields_of(raw, &mut inner) {
+        return None;
+    }
+    let (_, kind, raw) = inner.iter().find(|(name, _, _)| *name == key.as_bytes())?;
+    descend(*kind, raw, &rest[1..])
 }
 
 /// What a cell holds.
@@ -669,6 +812,7 @@ mod tests {
         let df = page(
             LOG.as_bytes(),
             &schema,
+            &fields.paths(),
             &(0..schema.len()).collect::<Vec<_>>(),
             0,
             usize::MAX,
@@ -690,7 +834,15 @@ mod tests {
         let line = "{\"msg\":\"one\\ntwo \\\"quoted\\\" \\u00e9\"}\n";
         let fields = scan(line);
         let schema = fields.schema();
-        let df = page(line.as_bytes(), &schema, &[0], 0, usize::MAX).unwrap();
+        let df = page(
+            line.as_bytes(),
+            &schema,
+            &fields.paths(),
+            &[0],
+            0,
+            usize::MAX,
+        )
+        .unwrap();
         assert_eq!(cell(&df, "msg", 0), "one\ntwo \"quoted\" é");
     }
 
@@ -701,6 +853,7 @@ mod tests {
         let df = page(
             LOG.as_bytes(),
             &schema,
+            &fields.paths(),
             &(0..schema.len()).collect::<Vec<_>>(),
             0,
             usize::MAX,
@@ -722,7 +875,15 @@ mod tests {
         assert_eq!(fields.malformed, 1);
 
         let schema = fields.schema();
-        let df = page(text.as_bytes(), &schema, &[0], 0, usize::MAX).unwrap();
+        let df = page(
+            text.as_bytes(),
+            &schema,
+            &fields.paths(),
+            &[0],
+            0,
+            usize::MAX,
+        )
+        .unwrap();
         assert_eq!(df.height(), 3);
         assert_eq!(cell(&df, "a", 0), "1");
         assert!(df.column("a").unwrap().get(1).unwrap().is_null());
@@ -792,16 +953,72 @@ mod tests {
     fn a_page_builds_only_the_window_it_was_asked_for() {
         let fields = scan(LOG);
         let schema = fields.schema();
-        let df = page(LOG.as_bytes(), &schema, &[0], 1, 1).unwrap();
+        let df = page(LOG.as_bytes(), &schema, &fields.paths(), &[0], 1, 1).unwrap();
         assert_eq!(df.height(), 1);
         assert_eq!(cell(&df, "ts", 0), "2026-09-07T10:00:01Z");
+    }
+
+    #[test]
+    fn what_is_inside_a_column_is_found_by_looking_under_it() {
+        let path = std::env::temp_dir().join("plv-jsonl-sample.jsonl");
+        std::fs::write(&path, LOG).unwrap();
+        let sample = sample_under(&path, &vec!["err".to_string()]).unwrap();
+        assert!(sample.complete, "the whole file fits inside the bounds");
+        assert_eq!(
+            sample
+                .fields
+                .columns()
+                .iter()
+                .map(|field| field.name.as_str())
+                .collect::<Vec<_>>(),
+            ["code", "why"]
+        );
+        assert_eq!(sample.fields.columns()[0].dtype(), DataType::Int64);
+    }
+
+    #[test]
+    fn a_column_can_be_read_from_inside_another() {
+        let fields = scan(LOG);
+        let mut schema = (*fields.schema()).clone();
+        schema.with_column("err.code".into(), DataType::Int64);
+        let schema = Arc::new(schema);
+        let mut paths = fields.paths();
+        paths.push(vec!["err".to_string(), "code".to_string()]);
+
+        let at = schema.len() - 1;
+        let df = page(LOG.as_bytes(), &schema, &paths, &[at], 0, usize::MAX).unwrap();
+        assert!(
+            df.column("err.code").unwrap().get(0).unwrap().is_null(),
+            "the record with no err has nothing there"
+        );
+        assert_eq!(cell(&df, "err.code", 1), "500");
+    }
+
+    /// A key may itself contain a dot, so a column's name is not a route to
+    /// its value — the path is.
+    #[test]
+    fn a_dotted_key_is_not_mistaken_for_a_path() {
+        let line = r#"{"a.b":1,"a":{"b":2}}"#.to_string() + "\n";
+        let fields = scan(&line);
+        let schema = fields.schema();
+        let paths = fields.paths();
+        let df = page(line.as_bytes(), &schema, &paths, &[0], 0, usize::MAX).unwrap();
+        assert_eq!(cell(&df, "a.b", 0), "1", "the key, not the route");
     }
 
     #[test]
     fn a_page_only_builds_the_columns_it_was_asked_for() {
         let fields = scan(LOG);
         let schema = fields.schema();
-        let df = page(LOG.as_bytes(), &schema, &[1], 0, usize::MAX).unwrap();
+        let df = page(
+            LOG.as_bytes(),
+            &schema,
+            &fields.paths(),
+            &[1],
+            0,
+            usize::MAX,
+        )
+        .unwrap();
         assert_eq!(df.get_column_names(), ["level"]);
         assert_eq!(cell(&df, "level", 1), "error");
     }

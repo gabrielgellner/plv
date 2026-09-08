@@ -13,7 +13,7 @@
 use polars::prelude::Schema;
 
 /// Verbs that shape the view. A test keeps this in step with the parser.
-pub const VIEW_VERBS: &[&str] = &["select", "hide", "filter", "sort", "reset"];
+pub const VIEW_VERBS: &[&str] = &["select", "hide", "expand", "filter", "sort", "reset"];
 /// Verbs that act on the file. Owned by the app layer, not the view language.
 pub const FILE_VERBS: &[&str] = &["w", "wq", "q", "x"];
 
@@ -108,7 +108,7 @@ fn candidates_for(head: &str, schema: &Schema) -> Vec<(String, String)> {
     };
 
     match *verb {
-        "select" | "hide" | "sort" => columns(),
+        "select" | "hide" | "expand" | "sort" => columns(),
         "reset" => plain(SLOTS),
         "filter" => {
             // Inside a filter the positions repeat: column, operator, value,
@@ -195,16 +195,29 @@ mod tests {
 
     /// The list of verbs offered has to be the list the parser accepts, or
     /// completion will happily type something that then fails.
+    ///
+    /// A verb on its own need not *succeed* — `:expand` alone has nothing to
+    /// expand and says so — it only has to be recognised. What is being ruled
+    /// out is completion typing a word the parser has never heard of.
     #[test]
     fn every_offered_view_verb_is_one_the_parser_knows() {
         let schema = schema();
         for verb in VIEW_VERBS {
+            let refusal = view::parse(verb, &schema)
+                .err()
+                .map(|e| e.message)
+                .unwrap_or_default();
             assert!(
-                view::parse(verb, &schema).is_ok(),
-                "completion offers :{verb}, which the parser rejects"
+                !refusal.starts_with("not a command"),
+                "completion offers :{verb}, which the parser does not know"
             );
         }
-        assert!(view::parse("frobnicate", &schema).is_err());
+        assert!(
+            view::parse("frobnicate", &schema)
+                .unwrap_err()
+                .message
+                .starts_with("not a command")
+        );
     }
 
     #[test]

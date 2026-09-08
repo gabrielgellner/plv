@@ -44,7 +44,16 @@ enum Source {
     /// is built from the byte span the row index points at, which is the
     /// cheap path anyway, and the only one that keeps a nested value as the
     /// document it was.
-    Json(PathBuf),
+    Json(JsonFile),
+}
+
+/// A JSONL file and where each of its columns lives in a record.
+///
+/// The paths are in the schema's own order, one per column. A column found
+/// when the file opened is one key deep; `:expand` adds longer ones.
+struct JsonFile {
+    path: PathBuf,
+    columns: Vec<jsonl::KeyPath>,
 }
 
 struct LakeQuery {
@@ -201,7 +210,10 @@ impl Store {
         };
 
         let mut store = Self {
-            source: Source::Json(path.to_path_buf()),
+            source: Source::Json(JsonFile {
+                path: path.to_path_buf(),
+                columns: fields.paths(),
+            }),
             schema,
             total_rows: index.rows(),
             row_offset: 0,
@@ -219,6 +231,92 @@ impl Store {
         store.notes = fields.notes();
         store.current_view = store.fetch(0, viewport_rows)?;
         Ok(store)
+    }
+
+    /// Lift the documents in one column out into columns of their own.
+    ///
+    /// The other direction from `K`, which reads one document whole: this is
+    /// for when the same shape is in every record and the interesting part is
+    /// comparing one field of it down the file. VisiData's `(`, and the reason
+    /// it has one.
+    ///
+    /// **Additive.** The new columns go on the end of the schema and the
+    /// parent's place in the view is taken by its children — the parent is
+    /// still there, one `:reset select` or `C` away, and so is `K` on it.
+    /// Appending rather than inserting is what keeps every source column index
+    /// meaning what it did: the widths, the pins and the edit overlay are all
+    /// keyed by those numbers, and renumbering them under a display command
+    /// would quietly move somebody's pin. For the same reason there is no
+    /// un-expand: hiding the columns is `-`, and taking them out of the schema
+    /// would renumber everything after them.
+    pub fn expand(&mut self, source_col: usize) -> Result<String> {
+        let Source::Json(file) = &self.source else {
+            bail!("only jsonl columns can be expanded");
+        };
+        let Some(path) = file.columns.get(source_col).cloned() else {
+            bail!("no such column");
+        };
+        let name = match self.schema.get_at_index(source_col) {
+            Some((name, _)) => name.to_string(),
+            None => bail!("no such column"),
+        };
+
+        let sample = jsonl::sample_under(&file.path, &path)?;
+        let children = sample.fields.columns();
+        if children.is_empty() {
+            bail!("nothing to expand: no documents in {name}");
+        }
+        if children
+            .iter()
+            .all(|child| self.schema.contains(&format!("{name}.{}", child.name)[..]))
+        {
+            bail!("{name} is already expanded");
+        }
+
+        // Read before the schema grows, since it is the old numbering that
+        // the view is written in.
+        let mut shown = self.view.columns(self.schema.len());
+        let mut schema = (*self.schema).clone();
+        let mut paths = file.columns.clone();
+        let mut added = Vec::new();
+        for child in children {
+            let name = unique_name(&schema, format!("{name}.{}", child.name));
+            added.push(schema.len());
+            schema.with_column(name.into(), child.dtype());
+            paths.push([path.clone(), vec![child.name.clone()]].concat());
+        }
+
+        let count = added.len();
+        match shown.iter().position(|col| *col == source_col) {
+            // The children stand where their parent stood, so the table does
+            // not shuffle sideways around the column being read.
+            Some(at) => {
+                shown.splice(at..=at, added);
+            }
+            // Expanding a column that is not on show puts them at the end,
+            // which is where a column with no place of its own goes.
+            None => shown.extend(added),
+        }
+
+        self.schema = Arc::new(schema);
+        if let Source::Json(file) = &mut self.source {
+            file.columns = paths;
+        }
+        self.view.select = Some(shown);
+        // The held frame was built against the old schema and has no such
+        // columns; the caller re-sorts.
+        self.sorted = None;
+        self.refresh()?;
+
+        Ok(match sample.complete {
+            true => format!("{name} expanded into {count} columns"),
+            // What was read is what was in reach, and a key further down the
+            // file would not be here. Said out loud, as `(first n)` is.
+            false => format!(
+                "{name} expanded into {count} columns (from the first {} records with it)",
+                jsonl::SAMPLE_RECORDS
+            ),
+        })
     }
 
     /// What the store wants said about the file when it opened, if anything.
@@ -686,7 +784,10 @@ impl Store {
     /// the two paths that read the file themselves: a page, and a scan.
     fn records(&self) -> Option<(PathBuf, Records)> {
         match &self.source {
-            Source::Json(path) => Some((path.clone(), Records::Json)),
+            Source::Json(file) => Some((
+                file.path.clone(),
+                Records::Json(Arc::new(file.columns.clone())),
+            )),
             _ => self
                 .edit
                 .as_ref()
@@ -756,8 +857,9 @@ impl Store {
             // there is no `LazyFrame` to start from. Building it is a full
             // parse of the file, which is why it happens on the worker rather
             // than in front of the user.
-            Source::Json(path) => {
-                let path = path.clone();
+            Source::Json(file) => {
+                let path = file.path.clone();
+                let paths = file.columns.clone();
                 let Some(index) = self.row_index.clone() else {
                     return rx;
                 };
@@ -767,7 +869,7 @@ impl Store {
                 thread::spawn(move || {
                     // Built on the worker: an `Expr` is not `Send`.
                     let predicate = filter.and_then(|f| rows::predicate(&f, &schema));
-                    let Ok(frame) = json_frame(&path, &index, &schema, bytes) else {
+                    let Ok(frame) = json_frame(&path, &index, &schema, &paths, bytes) else {
                         return;
                     };
                     if let Ok(df) = Self::materialise(frame.lazy(), &keys, predicate) {
@@ -1577,6 +1679,22 @@ fn match_rows(hits: &DataFrame) -> Vec<usize> {
         .unwrap_or_default()
 }
 
+/// A name no column has yet.
+///
+/// Only reachable by a record holding both `err` and a literal `err.code` at
+/// the top level, and then only when the first is expanded. Rare enough to
+/// deserve a suffix rather than a refusal — the name still says where the
+/// column came from, and no data is lost.
+fn unique_name(schema: &Schema, wanted: String) -> String {
+    if !schema.contains(&wanted[..]) {
+        return wanted;
+    }
+    (2..)
+        .map(|n| format!("{wanted}#{n}"))
+        .find(|name| !schema.contains(&name[..]))
+        .expect("an unused name")
+}
+
 /// The whole of a JSONL file as one frame, read in chunks bounded by bytes.
 ///
 /// The only way to sort one: a sort has to see every row, and there is no
@@ -1584,7 +1702,13 @@ fn match_rows(hits: &DataFrame) -> Vec<usize> {
 /// filter scan uses, and read from the offsets the index points at, so the
 /// cost is one linear pass rather than a re-read per chunk. Whether the
 /// result will fit is `sort_blocked`'s question, asked before this is called.
-fn json_frame(path: &Path, index: &RowIndex, schema: &SchemaRef, bytes: u64) -> Result<DataFrame> {
+fn json_frame(
+    path: &Path,
+    index: &RowIndex,
+    schema: &SchemaRef,
+    paths: &[jsonl::KeyPath],
+    bytes: u64,
+) -> Result<DataFrame> {
     let wanted: Vec<usize> = (0..schema.len()).collect();
     let total = index.rows();
     let mut frame: Option<DataFrame> = None;
@@ -1597,6 +1721,7 @@ fn json_frame(path: &Path, index: &RowIndex, schema: &SchemaRef, bytes: u64) -> 
         let chunk = jsonl::page(
             &index::read_span(path, index, from, to)?,
             schema,
+            paths,
             &wanted,
             start - first_row,
             end - start,
@@ -1625,10 +1750,12 @@ fn json_frame(path: &Path, index: &RowIndex, schema: &SchemaRef, bytes: u64) -> 
 ///
 /// The one place the two file kinds differ once the index has said which bytes
 /// to read — everything above this treats them the same.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum Records {
     Delimited(u8),
-    Json,
+    /// The paths of every column, shared rather than copied: a scan hands
+    /// them to a worker thread and a page reads them on this one.
+    Json(Arc<Vec<jsonl::KeyPath>>),
 }
 
 impl Records {
@@ -1639,7 +1766,7 @@ impl Records {
     /// afterwards: the JSONL reader can then walk past the records ahead of
     /// the page instead of building them.
     fn parse(
-        self,
+        &self,
         bytes: Vec<u8>,
         schema: &SchemaRef,
         wanted: &[usize],
@@ -1648,9 +1775,9 @@ impl Records {
     ) -> Result<DataFrame> {
         match self {
             Records::Delimited(separator) => {
-                Ok(parse_span(bytes, schema, separator)?.slice(skip as i64, take))
+                Ok(parse_span(bytes, schema, *separator)?.slice(skip as i64, take))
             }
-            Records::Json => jsonl::page(&bytes, schema, wanted, skip, take),
+            Records::Json(paths) => jsonl::page(&bytes, schema, paths, wanted, skip, take),
         }
     }
 }
@@ -1839,6 +1966,54 @@ mod tests {
             cell(&store.current_view, 0, 3).as_deref(),
             Some(&*(STRIDE + 1).to_string())
         );
+    }
+
+    #[test]
+    fn expand_lifts_a_document_into_columns_where_its_parent_stood() {
+        let mut store = Store::open_file(&log_file("log-expand.jsonl"), 10).unwrap();
+        // `err` is rare, so it opens hidden; show everything first.
+        store.apply_view(View::default()).unwrap();
+        let err = store.schema.len() - 1;
+
+        let said = store.expand(err).unwrap();
+        assert!(said.contains("err expanded into 1 column"), "{said}");
+
+        let names: Vec<String> = store.schema.iter_names().map(|n| n.to_string()).collect();
+        assert_eq!(
+            names,
+            ["ts", "level", "msg", "n", "err", "err.code"],
+            "appended, so every column index still means what it did"
+        );
+        assert_eq!(
+            store.schema.get("err.code"),
+            Some(&DataType::Int64),
+            "and typed by what was inside it"
+        );
+
+        // The child stands where its parent stood, and the parent is still a
+        // column — just not on show.
+        let shown: Vec<String> = store
+            .current_view
+            .get_column_names()
+            .iter()
+            .map(|n| n.to_string())
+            .collect();
+        assert_eq!(shown, ["ts", "level", "msg", "n", "err.code"]);
+        assert_eq!(cell(&store.current_view, 4, 8).as_deref(), Some("500"));
+        assert!(store.schema.contains("err"), "the document is still there");
+    }
+
+    #[test]
+    fn expand_refuses_what_holds_no_documents() {
+        let mut store = Store::open_file(&log_file("log-expand-flat.jsonl"), 10).unwrap();
+        let refusal = store.expand(2).unwrap_err().to_string(); // `msg`
+        assert!(refusal.contains("no documents in msg"), "{refusal}");
+
+        store.apply_view(View::default()).unwrap();
+        let err = store.schema.len() - 1;
+        store.expand(err).unwrap();
+        let again = store.expand(err).unwrap_err().to_string();
+        assert!(again.contains("already expanded"), "{again}");
     }
 
     #[test]

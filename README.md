@@ -269,6 +269,23 @@ Only top-level keys become columns; anything deeper stays inside its value,
 where `K` reads it. A line that is not a JSON object is still a row — dropping
 it would put every row number after it out by one — it simply has no fields.
 
+`:expand err` lifts the documents in a column out into columns of their own —
+`err.code`, `err.detail`, `err.retryable` — which is how you compare one field
+of a nested object down the file rather than opening each one with `K`:
+
+```
+ level   service   err.code   err.detail                     err.retryable
+ error   api       502        connection reset by peer       true
+ error   worker    500        deadlock detected              true
+```
+
+The children take their parent's place in the view, and the parent stays a
+column — `:reset select` or `C` brings it back, and `K` still opens it. The keys
+come from reading the file, bounded at 20,480 records carrying the column, and
+plv says when a bound is what stopped it rather than letting a partial answer
+look complete. There is no un-expand: `-` hides a column, and taking one out of
+the schema would renumber the columns that widths and pins are keyed by.
+
 `s` sorts, the same way a CSV sort works: the file is read once into a frame
 that is then held, so the pages after it are free. On a 62MB, 500,000-line log
 that is 220ms to sort and 4µs a page, in 350MB of memory — and past what there
