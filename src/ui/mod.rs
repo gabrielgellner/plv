@@ -2,9 +2,11 @@ mod browser;
 pub mod cell;
 mod help;
 pub mod json;
+pub mod markup;
 mod panel;
 mod prompt;
 mod statusbar;
+pub mod syntax;
 mod table;
 pub mod theme;
 

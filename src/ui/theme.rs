@@ -33,6 +33,8 @@ pub struct Theme {
     /// a run of text *is* rather than for JSON, since the next format to be
     /// recognised will have keys, strings and numbers too.
     pub syntax_key: Color,
+    /// An attribute name, which is a name subordinate to the element's.
+    pub syntax_attr: Color,
     pub syntax_string: Color,
     pub syntax_number: Color,
     pub syntax_literal: Color,
@@ -65,6 +67,7 @@ impl Theme {
             selection_bg: Color::Rgb(88, 91, 112),     // Surface2
             selection_fg: Color::Rgb(205, 214, 244),   // Text
             syntax_key: Color::Rgb(137, 180, 250),     // Blue
+            syntax_attr: Color::Rgb(249, 226, 175),    // Yellow
             syntax_string: Color::Rgb(166, 227, 161),  // Green
             syntax_number: Color::Rgb(250, 179, 135),  // Peach
             syntax_literal: Color::Rgb(203, 166, 247), // Mauve
