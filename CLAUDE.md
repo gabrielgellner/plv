@@ -150,6 +150,20 @@ and it puts the view back **by name** and re-appends the `:expand`ed columns,
 which are derived rather than found and would otherwise vanish along with the
 edit just written through them.
 
+**The write hands back the index of the file it wrote.** After a `:w` the row
+count and every byte offset describe a file that no longer exists: a deleted
+record is gone, an added one is new, and an edit that changed a field's length
+moved everything after it. Rebuilding the index by reading the file again would
+cost a full pass after every write — 31s on the 28GB CSV — so the splicer notes
+it on the way past instead, since it is already walking every record of its own
+output. `index::Building` collects the checkpoints and `writer::Saved` carries
+them back beside the `Stamp`; `Store::save` adopts both, but only when it wrote
+to the file it read from, since `:w path` leaves this buffer describing its own
+file. That is also why every byte the splicer emits goes through `write_out`
+and not to the writer directly — it is the one place that counts what the new
+file is made of, and a replacement that went around it left the offsets after
+it short by its own length.
+
 Two guards run before the rename: the record count must match the view's row
 count, and every edit must have found a field to land in (which catches ragged
 rows). The output is fsynced beside the target and moved into place, so a failed
