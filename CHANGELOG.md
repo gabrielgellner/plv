@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.17.0] - 2026-09-08
+
+### Features
+
+- `:expand` lifts a JSONL document into columns ([`721ee85`](https://gitlab.com/gabrielgellner/plv/-/commit/721ee858ebf5a14421a8d28a89ce1e70f634df5f))
+
 ## [0.16.0] - 2026-09-08
 
 ### Features
@@ -213,6 +219,8 @@ All notable changes to this project will be documented in this file.
 ### Styling
 
 - fix clippy warnings ([`5cb0dba`](https://gitlab.com/gabrielgellner/plv/-/commit/5cb0dba5f5d4bc0be4d3d3b09fd1e7cd00ff7722))
+
+[0.17.0]: https://gitlab.com/gabrielgellner/plv/-/compare/v0.16.0...v0.17.0
 
 [0.16.0]: https://gitlab.com/gabrielgellner/plv/-/compare/v0.15.0...v0.16.0
 
