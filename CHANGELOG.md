@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.18.0] - 2026-09-08
+
+### Bug Fixes
+
+- a write hands back the index of the file it wrote ([`a5bcafd`](https://gitlab.com/gabrielgellner/plv/-/commit/a5bcafd6fbd6d4d90ee765471a10a7adef38712e))
+
+### Features
+
+- write JSONL edits back, splicing the record's own bytes ([`bf5e647`](https://gitlab.com/gabrielgellner/plv/-/commit/bf5e6474a4ade853b997bb1e20b9e645bf0a2f44))
+
 ## [0.17.1] - 2026-09-08
 
 ### Bug Fixes
@@ -225,6 +235,8 @@ All notable changes to this project will be documented in this file.
 ### Styling
 
 - fix clippy warnings ([`5cb0dba`](https://gitlab.com/gabrielgellner/plv/-/commit/5cb0dba5f5d4bc0be4d3d3b09fd1e7cd00ff7722))
+
+[0.18.0]: https://gitlab.com/gabrielgellner/plv/-/compare/v0.17.1...v0.18.0
 
 [0.17.1]: https://gitlab.com/gabrielgellner/plv/-/compare/v0.17.0...v0.17.1
 
