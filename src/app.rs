@@ -587,8 +587,10 @@ impl App {
             );
         } else {
             frame.render_widget(
-                Paragraph::new("Usage: plv <file.csv|file.parquet|lake.ducklake|bundle-dir>")
-                    .centered(),
+                Paragraph::new(
+                    "Usage: plv <file.csv|file.jsonl|file.parquet|lake.ducklake|bundle-dir>",
+                )
+                .centered(),
                 table_area,
             );
         }
@@ -779,10 +781,14 @@ impl App {
             ("h / Esc", "Back"),
         ];
 
+        // `Views` is in every one of these: `:select`, `:filter` and `:sort`
+        // work on whatever is open, so a read-only file used to get an
+        // overlay that named none of the commands it answers.
         const VIEWER: &[Section<'static>] = &[
             ("Rows", MOVE),
             ("Columns", COLUMNS),
             ("Search", SEARCH),
+            ("Views", VIEWS),
             ("General", GENERAL),
         ];
         const VIEWER_LAKE: &[Section<'static>] = &[
@@ -790,6 +796,7 @@ impl App {
             ("Columns", COLUMNS),
             ("Search", SEARCH),
             ("Lake", LAKE),
+            ("Views", VIEWS),
             ("General", GENERAL),
         ];
         const VIEWER_EDIT: &[Section<'static>] = &[
@@ -5274,6 +5281,23 @@ mod tests {
             app.message.clone().unwrap().contains("no column"),
             "{:?}",
             app.message
+        );
+    }
+
+    /// The overlay calls itself the authoritative in-app reference, so a file
+    /// that cannot be edited must still see the commands it does answer.
+    #[test]
+    fn the_help_for_a_read_only_file_still_names_the_view_commands() {
+        let path = std::path::PathBuf::from("samples/log.jsonl");
+        let mut app = App::new(Some(path.clone()));
+        app.store = Some(Store::open_file(&path, 12).unwrap());
+        assert!(!app.store.as_ref().unwrap().is_editable());
+
+        let headings: Vec<&str> = app.help_sections().iter().map(|(name, _)| *name).collect();
+        assert!(headings.contains(&"Views"), "{headings:?}");
+        assert!(
+            !headings.contains(&"Edit"),
+            "but not the ones it refuses: {headings:?}"
         );
     }
 

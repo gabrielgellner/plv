@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`plv` is a terminal UI viewer and editor for CSV, TSV and Parquet files, built with Rust. It uses [Polars](https://pola.rs/) for lazy data loading (larger-than-memory files) and [ratatui](https://ratatui.rs/) + crossterm for the TUI. The goal is a csvlens-like viewer with vim navigation.
+`plv` is a terminal UI viewer and editor for CSV, TSV, JSONL and Parquet files, built with Rust. It uses [Polars](https://pola.rs/) for lazy data loading (larger-than-memory files) and [ratatui](https://ratatui.rs/) + crossterm for the TUI. The goal is a csvlens-like viewer with vim navigation.
 
 ## Commands
 
@@ -12,6 +12,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 cargo build
 cargo build --release      # optimized: LTO + strip
 cargo run -- path/to/file.csv
+cargo run -- path/to/file.jsonl        # or .ndjson: one JSON object per line
 cargo run -- path/to/file.parquet
 cargo run -- path/to/bundle/          # DuckLake bundle (dir containing *.ducklake)
 cargo run --example lakedump -- path/to/bundle/   # dump what the catalog reader sees
@@ -50,7 +51,7 @@ src/
 
 **Data layer (`src/data/`)**
 - `index.rs`: a delimited file has to be read through once to know how many rows it has, so that pass records where the rows are too — the byte offset of every `STRIDE`th row. A page then seeks to the nearest checkpoint and parses forward a bounded number of rows instead of counting from the top. On a 30GB CSV that is 46s → 3ms for the last page, and the scan holds nothing: peak memory for opening, paging, editing and rewriting that file is 57MB. The scan is quote-aware, and a test holds it, `writer.rs` and Polars to the same answer about what a record is. A page parsed out of the middle is given the schema plv already inferred, or a chunk would type its columns by whatever happens to be in those rows and the types would change as you scroll.
-- `loader.rs`: detects `.csv`, `.tsv`/`.tab`, `.txt` and `.parquet` by extension and opens a `LazyFrame`. Delimited text goes through `LazyCsvReader` with an explicit `with_separator`. `.txt` names no delimiter, so `sniff_delimiter()` picks one: it counts tab/comma/semicolon/pipe outside quoted spans on the first few lines and takes the candidate that occurs the same non-zero number of times on every line, falling back to a tab. Paths are converted to `PlRefPath` for the polars 0.53 API.
+- `loader.rs`: detects `.csv`, `.tsv`/`.tab`, `.txt`, `.jsonl`/`.ndjson` and `.parquet` by extension. Everything but JSONL opens as a `LazyFrame`; JSONL is answered by `Store::open_jsonl` before a frame is ever asked for. Delimited text goes through `LazyCsvReader` with an explicit `with_separator`. `.txt` names no delimiter, so `sniff_delimiter()` picks one: it counts tab/comma/semicolon/pipe outside quoted spans on the first few lines and takes the candidate that occurs the same non-zero number of times on every line, falling back to a tab. Paths are converted to `PlRefPath` for the polars 0.53 API.
 - `store.rs`: `Store` owns the `LazyFrame` and tracks `row_offset`/`viewport_rows`. Every scroll calls `lf.clone().slice(offset, height).collect()` — only the visible rows are ever materialized. Also exposes `schema: SchemaRef` for column metadata, and owns the edit `Overlay` (see below).
 - `jsonl.rs`: a `.jsonl`/`.ndjson` file is read by **plv, not by Polars**. Polars' ndjson reader will put a nested value in a `String` column, but writes it in its own `ValueDisplay` form — `{x: 1}`, unquoted keys, documented as "not guaranteed to be valid JSON" — and the whole point of reading logs here is that `K` opens the nested field *as a document*. So a nested value is carried through as the **exact bytes of the file**, the promise `writer.rs` makes on the way out. Record boundaries are simpler than CSV's, not harder: a JSON string cannot hold a raw newline, so every `\n` ends a record and `RowIndex::build_lines` needs no quote state. **The columns are the file's true keys**, collected during that same index pass — which is already reading every byte and finishes before the first frame — rather than sampled like DuckDB's 20,480 records or discovered as they arrive like VisiData's, which moves the table sideways while you read. Keys are ordered by how many records carry them; past `MAX_COLUMNS` (1024, ClickHouse's number) they stop becoming columns and are counted out loud. A key in fewer than `SHOWN_SHARE` of the records (a fifth, Splunk's rule) opens hidden behind `C` and `:select`: a table 200 columns wide has answered no question, and what was hidden is said once when the file opens. A key whose values were all one kind is typed as it, so `:filter status > 400` compares numbers; anything that ever held an object or an array is text holding the document. A line that is not a JSON object is still a row, because the row numbers are the file's lines and dropping one would put every number after it out by one. Read-only: `Store` holds no `LazyFrame` for a JSONL file, so `Source::Json` builds every page from the byte span the index points at — and `Records` is the one place that decides how a span becomes rows. `:expand col` lifts the documents in a column into columns of their own (`err` → `err.code`, `err.detail`), which is the other direction from `K`: one reads a document whole, the other compares one field of it down the file — VisiData's `(`, and its reason. It is **additive**: the new columns go on the *end* of the schema and take the parent's place in the view, because widths, pins and the edit overlay are all keyed by source column index and inserting would quietly move somebody's pin. For the same reason there is no un-expand — `-` hides a column, and removing one would renumber everything after it. A column's value is found by a **`KeyPath`**, not by splitting its name on `.`: a JSON key may contain a dot, and `err.code` would then be a guess about which of the two it was. Discovery is a second pass over the file (unlike the key scan at open, which rides along with the row index), so it is **bounded** — 20,480 records that carry the column, DuckDB's `sample_size`, and a hard 256MB — and says which bound stopped it. `view::Command::Expand` is parsed and checked like every other command, so a bad column name is underlined at the prompt, but it writes to no slot of the `View`: what columns *exist* is the store's business, and `App::apply_view_command` sends it there before the view is asked.
 
@@ -78,8 +79,9 @@ A **sort** is the one thing that needs the whole table, so `json_frame` reads th
 ## Editing
 
 Delimited text — `.csv`, `.tsv`, `.tab`, `.txt` — can be edited in place.
-Parquet and lake tables stay read-only: Parquet is genuinely typed, so a
-one-cell change means rewriting the whole file against a schema.
+Parquet, lake tables and JSONL stay read-only: Parquet is genuinely typed, so a
+one-cell change means rewriting the whole file against a schema, and a JSONL
+edit means rewriting a record rather than splicing a field.
 
 **Edits live in a buffer, not in a frame.** A `LazyFrame` cannot be mutated, and
 collecting the file to edit it would throw away the larger-than-memory property
@@ -161,8 +163,9 @@ and edited cells render in red.
 
 ## The view language (`src/view.rs`)
 
-`:select`, `:hide`, `:filter` and `:sort` shape what the viewer shows. The
-module parses and checks; nothing in it touches a `LazyFrame`.
+`:select`, `:hide`, `:filter` and `:sort` shape what the viewer shows, and
+`:expand` (JSONL only) changes what columns there are to show. The module parses
+and checks; nothing in it touches a `LazyFrame`.
 
 **Validation happens when the line is typed, not when the frame collects.**
 Polars is lazy, so `filter count > abc` does not fail where it was written — it
@@ -323,7 +326,7 @@ is trying to type exactly, where a prefix match is predictable and a fuzzy one
 is a guess. Fuzzy matching belongs on `/`, over the data.
 
 What is offered depends on where in the line the cursor is: verbs at the front,
-column names after `:select`/`:hide`/`:sort`, slot names after `:reset`, and
+column names after `:select`/`:hide`/`:expand`/`:sort`, slot names after `:reset`, and
 inside a `:filter` the positions cycle through column, operator, value, `and` —
 a value being the file's own data, which is not a vocabulary to complete
 against. A test asserts every verb completion offers is one `view::parse`

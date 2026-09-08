@@ -7,10 +7,10 @@ use plv::app::App;
 #[command(
     name = "plv",
     version,
-    about = "Polars CSV/TSV/Parquet/DuckLake viewer"
+    about = "Polars CSV/TSV/JSONL/Parquet/DuckLake viewer"
 )]
 struct Args {
-    /// File to open: .csv, .tsv/.tab/.txt, .parquet, a .ducklake catalog, or a bundle directory
+    /// File to open: .csv, .tsv/.tab/.txt, .jsonl/.ndjson, .parquet, a .ducklake catalog, or a bundle directory
     file: Option<PathBuf>,
 }
 
