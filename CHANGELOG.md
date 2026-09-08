@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.20.0] - 2026-09-08
+
+### Features
+
+- a deep page seeks to its file instead of counting to it ([`3c4f55a`](https://gitlab.com/gabrielgellner/plv/-/commit/3c4f55a2d7db5078a0c725c7189239343b2f8e59))
+
 ## [0.19.0] - 2026-09-08
 
 ### Features
@@ -241,6 +247,8 @@ All notable changes to this project will be documented in this file.
 ### Styling
 
 - fix clippy warnings ([`5cb0dba`](https://gitlab.com/gabrielgellner/plv/-/commit/5cb0dba5f5d4bc0be4d3d3b09fd1e7cd00ff7722))
+
+[0.20.0]: https://gitlab.com/gabrielgellner/plv/-/compare/v0.19.0...v0.20.0
 
 [0.19.0]: https://gitlab.com/gabrielgellner/plv/-/compare/v0.18.0...v0.19.0
 
