@@ -5288,9 +5288,11 @@ mod tests {
     /// that cannot be edited must still see the commands it does answer.
     #[test]
     fn the_help_for_a_read_only_file_still_names_the_view_commands() {
-        let path = std::path::PathBuf::from("samples/log.jsonl");
+        // A frame with no file behind it: the viewer at its most read-only.
+        let (_, path) = app_with("helpviews.csv", SAMPLE);
         let mut app = App::new(Some(path.clone()));
-        app.store = Some(Store::open_file(&path, 12).unwrap());
+        let lf = crate::data::loader::load(&path).unwrap();
+        app.store = Some(Store::new(lf, 12).unwrap());
         assert!(!app.store.as_ref().unwrap().is_editable());
 
         let headings: Vec<&str> = app.help_sections().iter().map(|(name, _)| *name).collect();

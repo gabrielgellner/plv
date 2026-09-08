@@ -27,6 +27,7 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
+use std::ops::Range;
 use std::path::Path;
 
 use anyhow::Result;
@@ -381,6 +382,55 @@ pub fn sample_under(file: &Path, under: &KeyPath) -> Result<Sample> {
         fields: scan.finish(),
         complete,
     })
+}
+
+/// Where the value at `path` lives in a record, as a byte range.
+///
+/// What the writer splices over. The parse that finds it is the same one the
+/// reader uses, so the bytes a cell was read from are exactly the bytes its
+/// edit replaces — nothing else in the record is touched, which is the promise
+/// `data/writer.rs` already makes for a delimited field.
+pub fn locate(line: &[u8], path: &KeyPath) -> Option<Range<usize>> {
+    let mut fields = Vec::new();
+    if !fields_of(line, &mut fields) {
+        return None;
+    }
+    let key = path.first()?;
+    let (_, kind, raw) = fields.iter().find(|(name, _, _)| *name == key.as_bytes())?;
+    let (_, raw) = descend(*kind, raw, &path[1..])?;
+    Some(span_of(line, raw))
+}
+
+/// Where a key that the record does not have would go, and whether it would
+/// need a comma in front of it.
+///
+/// The closing brace of the record, which is where a new member goes: a
+/// document is not an ordered thing to a reader, and the end is the only place
+/// that does not disturb what is already written.
+pub fn insert_point(line: &[u8]) -> Option<(usize, bool)> {
+    let mut fields = Vec::new();
+    if !fields_of(line, &mut fields) {
+        return None;
+    }
+    let close = line.iter().rposition(|&byte| byte == b'}')?;
+    Some((close, !fields.is_empty()))
+}
+
+/// Where `inner` sits inside `outer`.
+///
+/// The parse hands back slices of the record rather than offsets into it, and
+/// this turns one into the other. Sound because every slice it is given came
+/// out of `outer` — a subslice's address is an offset from the start of what
+/// it was cut from.
+fn span_of(outer: &[u8], inner: &[u8]) -> Range<usize> {
+    let at = inner.as_ptr() as usize - outer.as_ptr() as usize;
+    at..at + inner.len()
+}
+
+/// Whether `text` is a JSON number, so it can be written into a record
+/// without quotes. The one definition of that, shared with the reader.
+pub fn is_number(text: &str) -> bool {
+    matches!(number_end(text.as_bytes(), 0), Some((_, end)) if end == text.len())
 }
 
 /// A page of records, as the columns `wanted` names.

@@ -21,7 +21,10 @@ use std::time::SystemTime;
 
 use anyhow::{Context, Result, bail};
 
+use std::collections::BTreeMap;
+
 use super::edit::Overlay;
+use super::jsonl;
 
 /// What a file looked like when plv opened it, so a write cannot clobber
 /// changes made underneath it by something else.
@@ -59,6 +62,35 @@ pub fn save(
     overlay: &Overlay,
     expected_rows: usize,
 ) -> Result<Stamp> {
+    replace(src, dst, |input, output| {
+        splice(input, output, separator, has_header, overlay, expected_rows)
+    })
+}
+
+/// The same, for a JSONL file: `columns` says where each column's value lives
+/// in a record and what it may be written as.
+pub fn save_json(
+    src: &Path,
+    dst: &Path,
+    columns: &[JsonColumn],
+    overlay: &Overlay,
+    expected_rows: usize,
+) -> Result<Stamp> {
+    replace(src, dst, |input, output| {
+        splice_json(input, output, columns, overlay, expected_rows)
+    })
+}
+
+/// Build the new file beside `dst` and move it into place.
+///
+/// The rename is what makes a failed or interrupted write harmless: the
+/// original is still there until a complete file is ready to take its place,
+/// and the fsync before it means a crash leaves one or the other rather than a
+/// truncated new one.
+fn replace<F>(src: &Path, dst: &Path, write: F) -> Result<Stamp>
+where
+    F: FnOnce(BufReader<File>, &mut BufWriter<File>) -> Result<()>,
+{
     let dir = dst.parent().unwrap_or_else(|| Path::new("."));
     let name = dst
         .file_name()
@@ -73,14 +105,7 @@ pub fn save(
         let file =
             File::create(&tmp).with_context(|| format!("cannot write beside {}", dst.display()))?;
         let mut output = BufWriter::new(file);
-        splice(
-            input,
-            &mut output,
-            separator,
-            has_header,
-            overlay,
-            expected_rows,
-        )?;
+        write(input, &mut output)?;
         output.flush()?;
         // Durable before the rename: a crash should leave either the old file
         // or the new one, never a truncated new one.
@@ -161,6 +186,310 @@ pub fn splice<R: BufRead, W: Write>(
         );
     }
     Ok(())
+}
+
+/// One column of a JSONL file, as the writer needs it.
+pub struct JsonColumn {
+    /// Where the value lives in a record: `["err"]`, or `["err", "code"]` for
+    /// a column `:expand` made.
+    pub path: Vec<String>,
+    /// What the column may be written as without quotes.
+    pub kind: JsonType,
+}
+
+/// What a column's values are, which decides how an edit is encoded.
+///
+/// The file is untyped in the sense that matters here — each record says what
+/// its own values are — so this is only ever an offer: a value that will not
+/// pass as a number is written as a string, and the column widens to text the
+/// next time the file is read. That is the same rule the delimited path
+/// follows, where a value that does not fit leaves the column as text.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum JsonType {
+    Int,
+    Float,
+    Bool,
+    Text,
+}
+
+/// Copy `src` to `out`, replacing the values `overlay` names.
+///
+/// A record is a line, so this works a line at a time where the delimited
+/// splicer works a byte at a time: a JSON string cannot hold a raw newline, so
+/// there is no such thing as a record that spans two lines, and memory is
+/// bounded by the longest record rather than by the file.
+///
+/// A record with nothing to change is copied **verbatim**, terminator and all.
+/// One with an edit keeps every byte outside the value being replaced, so
+/// key order, spacing, escaping and the record's own idea of how to write a
+/// number all survive — the same promise the delimited path makes about
+/// quoting style.
+pub fn splice_json<R: BufRead, W: Write>(
+    mut src: R,
+    mut out: W,
+    columns: &[JsonColumn],
+    overlay: &Overlay,
+    expected_rows: usize,
+) -> Result<()> {
+    let mut line = Vec::new();
+    let mut record = 0usize;
+    let (mut applied, mut dropped, mut added) = (0usize, 0usize, 0usize);
+    // The file's own line ending, so an added record matches what is there.
+    let mut newline: &[u8] = b"\n";
+    let mut unterminated = false;
+
+    loop {
+        line.clear();
+        if src.read_until(b'\n', &mut line)? == 0 {
+            break;
+        }
+        let body_len = line.len() - terminator(&line).len();
+        let (body, term) = line.split_at(body_len);
+        if !term.is_empty() {
+            newline = if term == b"\r\n" { b"\r\n" } else { b"\n" };
+        }
+        unterminated = term.is_empty();
+
+        added += write_added(&mut out, overlay, columns, record, newline, &mut applied)?;
+
+        if overlay.is_struck(record) {
+            // Terminator included, or the file grows a blank line where a
+            // record used to be.
+            dropped += 1;
+            record += 1;
+            continue;
+        }
+        match overlay.row(record) {
+            None => out.write_all(&line)?,
+            Some(edits) => {
+                let (rewritten, placed) = rewrite(body, edits, columns);
+                applied += placed;
+                out.write_all(&rewritten)?;
+                out.write_all(term)?;
+            }
+        }
+        record += 1;
+    }
+
+    // Records added after the last one in the file, which needs its own
+    // terminator putting back first if it never had one.
+    if !overlay.added_at(record).is_empty() {
+        if unterminated {
+            out.write_all(newline)?;
+        }
+        added += write_added(&mut out, overlay, columns, record, newline, &mut applied)?;
+    }
+    out.flush()?;
+
+    if record != expected_rows {
+        bail!(
+            "refusing to write: the file holds {record} records but the view has \
+             {expected_rows} — it may have changed on disk"
+        );
+    }
+    if applied != overlay.len() {
+        bail!(
+            "refusing to write: {} of {} edits had no key to land in (a record \
+             that does not go that deep)",
+            overlay.len() - applied,
+            overlay.len()
+        );
+    }
+    if added != overlay.added_count() {
+        bail!(
+            "refusing to write: {} of {} added records had nowhere to go",
+            overlay.added_count() - added,
+            overlay.added_count()
+        );
+    }
+    if dropped != overlay.struck_count() {
+        bail!(
+            "refusing to write: {} of {} deleted records were not found",
+            overlay.struck_count() - dropped,
+            overlay.struck_count()
+        );
+    }
+    Ok(())
+}
+
+/// The line ending at the end of `line`, empty when it has none.
+fn terminator(line: &[u8]) -> &[u8] {
+    if line.ends_with(b"\r\n") {
+        b"\r\n"
+    } else if line.ends_with(b"\n") {
+        b"\n"
+    } else {
+        b""
+    }
+}
+
+/// One record with its edited values spliced in, and how many of them landed.
+///
+/// The spans are found against the record as it was read and applied from the
+/// right, so replacing one value cannot move another out from under the next
+/// splice.
+fn rewrite(
+    body: &[u8],
+    edits: &BTreeMap<usize, String>,
+    columns: &[JsonColumn],
+) -> (Vec<u8>, usize) {
+    let mut splices: Vec<(std::ops::Range<usize>, String)> = Vec::new();
+    let mut appended: Vec<String> = Vec::new();
+
+    for (&col, value) in edits {
+        let Some(column) = columns.get(col) else {
+            continue;
+        };
+        let encoded = encode_json(value, column.kind);
+        match jsonl::locate(body, &column.path) {
+            Some(span) => splices.push((span, encoded)),
+            // A key the record does not have. One at the top level can simply
+            // be added; one further in would mean building the documents above
+            // it, which is a bigger decision than an edit — so it is refused
+            // and the write says so rather than inventing structure.
+            None if column.path.len() == 1 => {
+                appended.push(format!("{}:{}", json_string(&column.path[0]), encoded));
+            }
+            None => continue,
+        }
+    }
+
+    let placed = splices.len() + appended.len();
+    splices.sort_by_key(|(span, _)| span.start);
+
+    let mut out = Vec::with_capacity(body.len() + 64);
+    let mut at = 0usize;
+    for (span, encoded) in &splices {
+        if span.start < at {
+            continue; // overlapping, which nothing produces
+        }
+        out.extend_from_slice(&body[at..span.start]);
+        out.extend_from_slice(encoded.as_bytes());
+        at = span.end;
+    }
+    out.extend_from_slice(&body[at..]);
+
+    if !appended.is_empty()
+        && let Some((close, has_members)) = jsonl::insert_point(&out)
+    {
+        let mut addition = Vec::new();
+        for (i, member) in appended.iter().enumerate() {
+            if has_members || i > 0 {
+                addition.push(b',');
+            }
+            addition.extend_from_slice(member.as_bytes());
+        }
+        out.splice(close..close, addition);
+    }
+    (out, placed)
+}
+
+/// Records the overlay adds before `before`, written as documents of their
+/// own.
+fn write_added<W: Write>(
+    out: &mut W,
+    overlay: &Overlay,
+    columns: &[JsonColumn],
+    before: usize,
+    newline: &[u8],
+    applied: &mut usize,
+) -> Result<usize> {
+    let ids = overlay.added_at(before);
+    for &id in ids {
+        let cells = overlay.row(id);
+        let mut entries: Vec<(&[String], String)> = Vec::new();
+        if let Some(cells) = cells {
+            for (&col, value) in cells {
+                // A record does not carry a key it has nothing for, so an
+                // untouched cell is left out rather than written as null.
+                if value.is_empty() {
+                    continue;
+                }
+                let Some(column) = columns.get(col) else {
+                    continue;
+                };
+                entries.push((&column.path, encode_json(value, column.kind)));
+                *applied += 1;
+            }
+        }
+        // Counted as placed even where nothing was typed: an empty record is
+        // still the row that was added.
+        if let Some(cells) = cells {
+            *applied += cells.values().filter(|v| v.is_empty()).count();
+        }
+        entries.sort_by_key(|(path, _)| *path);
+        out.write_all(build(&entries).as_bytes())?;
+        out.write_all(newline)?;
+    }
+    Ok(ids.len())
+}
+
+/// A document built from paths and their encoded values: `err.code` and
+/// `err.detail` become one `err` holding both.
+fn build(entries: &[(&[String], String)]) -> String {
+    let mut out = String::from("{");
+    let mut at = 0usize;
+    while at < entries.len() {
+        let key = &entries[at].0[0];
+        let mut end = at;
+        while end < entries.len() && &entries[end].0[0] == key {
+            end += 1;
+        }
+        if at > 0 {
+            out.push(',');
+        }
+        out.push_str(&json_string(key));
+        out.push(':');
+        if entries[at].0.len() == 1 {
+            out.push_str(&entries[at].1);
+        } else {
+            let inner: Vec<(&[String], String)> = entries[at..end]
+                .iter()
+                .map(|(path, value)| (&path[1..], value.clone()))
+                .collect();
+            out.push_str(&build(&inner));
+        }
+        at = end;
+    }
+    out.push('}');
+    out
+}
+
+/// A typed value if the text will pass as one, and a string otherwise.
+///
+/// Nothing typed means nothing there, which JSON writes as `null` — the same
+/// thing plv draws as `·` and reads back as an empty cell.
+fn encode_json(value: &str, kind: JsonType) -> String {
+    if value.is_empty() {
+        return "null".to_string();
+    }
+    let number = jsonl::is_number(value);
+    match kind {
+        JsonType::Int if number && value.parse::<i64>().is_ok() => value.to_string(),
+        JsonType::Float if number => value.to_string(),
+        JsonType::Bool if value == "true" || value == "false" => value.to_string(),
+        _ => json_string(value),
+    }
+}
+
+/// A JSON string: quoted, with everything JSON requires escaped and nothing
+/// that it does not.
+fn json_string(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for c in value.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// A byte-at-a-time RFC 4180 scanner that passes its input straight through,
