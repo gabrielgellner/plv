@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.16.0] - 2026-09-08
+
+### Features
+
+- sort a JSONL file by holding it, as a delimited one is ([`4308877`](https://gitlab.com/gabrielgellner/plv/-/commit/43088777d4d9dea872f6b0dd53f77bdb57a3e254))
+
 ## [0.15.0] - 2026-09-08
 
 ### Features
@@ -207,6 +213,8 @@ All notable changes to this project will be documented in this file.
 ### Styling
 
 - fix clippy warnings ([`5cb0dba`](https://gitlab.com/gabrielgellner/plv/-/commit/5cb0dba5f5d4bc0be4d3d3b09fd1e7cd00ff7722))
+
+[0.16.0]: https://gitlab.com/gabrielgellner/plv/-/compare/v0.15.0...v0.16.0
 
 [0.15.0]: https://gitlab.com/gabrielgellner/plv/-/compare/v0.14.0...v0.15.0
 
