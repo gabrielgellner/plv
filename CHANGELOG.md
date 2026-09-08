@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.19.0] - 2026-09-08
+
+### Features
+
+- the cell window reads XML and HTML as documents ([`cc389c9`](https://gitlab.com/gabrielgellner/plv/-/commit/cc389c9d08a1eae496b95f7ed5760950b5212c58))
+
 ## [0.18.0] - 2026-09-08
 
 ### Bug Fixes
@@ -235,6 +241,8 @@ All notable changes to this project will be documented in this file.
 ### Styling
 
 - fix clippy warnings ([`5cb0dba`](https://gitlab.com/gabrielgellner/plv/-/commit/5cb0dba5f5d4bc0be4d3d3b09fd1e7cd00ff7722))
+
+[0.19.0]: https://gitlab.com/gabrielgellner/plv/-/compare/v0.18.0...v0.19.0
 
 [0.18.0]: https://gitlab.com/gabrielgellner/plv/-/compare/v0.17.1...v0.18.0
 
