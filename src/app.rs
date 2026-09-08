@@ -742,6 +742,7 @@ impl App {
         const VIEWS: &[(&str, &str)] = &[
             (":select a b", "Show only these columns"),
             (":hide a b", "Drop these columns"),
+            (":expand payload", "Lift a JSONL document into columns"),
             (":filter c > 10", "Keep matching rows; `~` is a regex"),
             (":filter a = x and b ~ y", "Conditions join with `and`"),
             (":sort a b-", "Sort by columns, `-` for descending"),
@@ -2357,6 +2358,30 @@ impl App {
                 | view::Command::Reset(None)
                 | view::Command::Reset(Some(view::Slot::Filter))
         );
+
+        // Expanding writes to no slot of the view: it changes which columns
+        // exist, which is the store's business. Handled here rather than in
+        // `View::apply`, which is about what is on show.
+        if let view::Command::Expand(cols) = &command {
+            let cols = cols.clone();
+            let sorted = !store.view.sort.is_empty();
+            let mut said = Vec::new();
+            for col in cols {
+                let Some(store) = &mut self.store else { break };
+                match store.expand(col) {
+                    Ok(note) => said.push(note),
+                    Err(e) => said.push(e.to_string()),
+                }
+            }
+            self.message = Some(said.join("; "));
+            // The held frame was built against the old schema, so a sorted
+            // view has to be rebuilt against the new one.
+            if sorted {
+                self.rebuild_view();
+            }
+            self.after_view_change(false)?;
+            return Ok(());
+        }
 
         // Asked before the key is recorded, so a refusal leaves the view as
         // it was rather than in an order nothing can produce.
@@ -5200,6 +5225,56 @@ mod tests {
             "the file's own bytes reached the window"
         );
         assert!(content.lines.len() > 1, "and were laid out as a document");
+    }
+
+    /// `:expand` typed on the line, the same path `:select` takes.
+    #[test]
+    fn expand_types_a_documents_keys_into_columns() {
+        let path = std::path::PathBuf::from("samples/log.jsonl");
+        let mut app = App::new(Some(path.clone()));
+        app.store = Some(Store::open_file(&path, 12).unwrap());
+        app.last_frame_width = 160;
+
+        command(&mut app, "reset select");
+        command(&mut app, "expand err");
+        let said = app.message.clone().unwrap();
+        assert!(said.contains("err expanded into"), "{said}");
+
+        let shown = shown_columns(&app);
+        assert!(shown.contains(&"err.code".to_string()), "{shown:?}");
+        assert!(shown.contains(&"err.retryable".to_string()), "{shown:?}");
+        assert!(
+            !shown.contains(&"err".to_string()),
+            "the parent gave up its place"
+        );
+
+        // Typed from what was inside it, so it filters as a number.
+        let store = app.store.as_ref().unwrap();
+        assert_eq!(store.schema.get("err.code"), Some(&DataType::Int64));
+    }
+
+    #[test]
+    fn expand_names_the_column_it_cannot_open() {
+        let path = std::path::PathBuf::from("samples/log.jsonl");
+        let mut app = App::new(Some(path.clone()));
+        app.store = Some(Store::open_file(&path, 12).unwrap());
+        app.last_frame_width = 160;
+
+        command(&mut app, "expand level");
+        assert!(
+            app.message
+                .clone()
+                .unwrap()
+                .contains("no documents in level"),
+            "{:?}",
+            app.message
+        );
+        command(&mut app, "expand nosuchkey");
+        assert!(
+            app.message.clone().unwrap().contains("no column"),
+            "{:?}",
+            app.message
+        );
     }
 
     /// The two views of a cell are independent: one covers, one displaces.

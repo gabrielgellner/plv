@@ -28,6 +28,13 @@ use regex::Regex;
 pub enum Command {
     Select(Vec<usize>),
     Hide(Vec<usize>),
+    /// Lift the documents in these columns out into columns of their own.
+    ///
+    /// Parsed and checked here like every other command — a column name is a
+    /// column name whoever is going to act on it — but it writes to no slot
+    /// of the view: it changes what columns *exist*, which is the store's
+    /// business, not a question of which of them are on show.
+    Expand(Vec<usize>),
     Filter(Filter),
     Sort(Vec<(usize, bool)>),
     Reset(Option<Slot>),
@@ -166,6 +173,10 @@ impl View {
                 }
                 self.select = Some(kept);
             }
+            // Not a slot of the view: `:expand` changes which columns exist,
+            // and the store answers it before the view is ever asked. Here so
+            // the match is exhaustive and the reason is written down.
+            Command::Expand(_) => {}
             Command::Filter(filter) => self.filter = Some(filter),
             Command::Sort(keys) => self.sort = keys,
             Command::Reset(None) => *self = Self::default(),
@@ -336,6 +347,7 @@ pub fn parse(line: &str, schema: &Schema) -> Result<Command, ParseError> {
         "select" if is_star(args) => Ok(Command::Reset(Some(Slot::Select))),
         "select" => Ok(Command::Select(columns(args, schema, verb, "select")?)),
         "hide" => Ok(Command::Hide(columns(args, schema, verb, "hide")?)),
+        "expand" => Ok(Command::Expand(columns(args, schema, verb, "expand")?)),
         "sort" => parse_sort(args, schema, verb),
         "filter" => parse_filter(args, schema, verb),
         "reset" => parse_reset(args),
