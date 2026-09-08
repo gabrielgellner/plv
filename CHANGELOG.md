@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.17.1] - 2026-09-08
+
+### Bug Fixes
+
+- a read-only file's help overlay names the commands it answers ([`43d795c`](https://gitlab.com/gabrielgellner/plv/-/commit/43d795ce7f8fac00a7786ec28bbf2474100b0e13))
+
 ## [0.17.0] - 2026-09-08
 
 ### Features
@@ -219,6 +225,8 @@ All notable changes to this project will be documented in this file.
 ### Styling
 
 - fix clippy warnings ([`5cb0dba`](https://gitlab.com/gabrielgellner/plv/-/commit/5cb0dba5f5d4bc0be4d3d3b09fd1e7cd00ff7722))
+
+[0.17.1]: https://gitlab.com/gabrielgellner/plv/-/compare/v0.17.0...v0.17.1
 
 [0.17.0]: https://gitlab.com/gabrielgellner/plv/-/compare/v0.16.0...v0.17.0
 
