@@ -294,7 +294,13 @@ impl App {
                 }
             } else {
                 match Store::open_file(&path, vp) {
-                    Ok(store) => self.store = Some(store),
+                    Ok(store) => {
+                        // What opening the file turned up — keys the table has
+                        // no room for, lines that were not records. Said once,
+                        // where every other refusal and remark is said.
+                        self.message = store.notes().map(str::to_string);
+                        self.store = Some(store);
+                    }
                     Err(e) => self.error = Some(e.to_string()),
                 }
             }
@@ -5154,6 +5160,46 @@ mod tests {
         );
         press(&mut app, 'r');
         assert!(!app.inspect.as_ref().unwrap().content.raw);
+    }
+
+    /// End to end on a real log: it opens, the common keys are the columns,
+    /// and `K` opens the nested one as the document it is.
+    #[test]
+    fn a_log_opens_and_its_nested_cells_are_documents() {
+        let path = std::path::PathBuf::from("samples/log.jsonl");
+        let mut app = App::new(Some(path.clone()));
+        app.store = Some(Store::open_file(&path, 12).unwrap());
+        app.last_frame_width = 120;
+
+        let store = app.store.as_ref().unwrap();
+        assert_eq!(store.row_count(), 10);
+        assert!(
+            store.notes().unwrap().contains("keys shown"),
+            "and says what it left out"
+        );
+
+        // Every key, then walk to `job`, which is a document.
+        command(&mut app, "reset select");
+        cell_mode(&mut app);
+        while app
+            .store
+            .as_ref()
+            .unwrap()
+            .column_info(app.cursor_col)
+            .is_some_and(|(name, _)| name != "job")
+        {
+            press(&mut app, 'l');
+        }
+        app.cursor_to(2).unwrap();
+
+        press(&mut app, 'K');
+        let content = &app.inspect.as_ref().unwrap().content;
+        assert_eq!(
+            content.format,
+            ui::cell::Format::Json,
+            "the file's own bytes reached the window"
+        );
+        assert!(content.lines.len() > 1, "and were laid out as a document");
     }
 
     /// The two views of a cell are independent: one covers, one displaces.

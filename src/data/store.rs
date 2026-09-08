@@ -10,6 +10,7 @@ use polars::prelude::*;
 use crate::data::budget;
 use crate::data::edit::{Cell, Overlay};
 use crate::data::index::{self, RowIndex};
+use crate::data::jsonl;
 use crate::data::lake_db::{self, LakeSource};
 use crate::data::loader;
 use crate::data::rows::{self, RowSet};
@@ -38,6 +39,12 @@ const SOURCE_ROW: &str = "__src__";
 enum Source {
     Lazy(LazyFrame),
     Lake(LakeQuery),
+    /// A JSONL file, parsed by plv rather than by Polars — see
+    /// [`crate::data::jsonl`]. There is no `LazyFrame` behind it: every page
+    /// is built from the byte span the row index points at, which is the
+    /// cheap path anyway, and the only one that keeps a nested value as the
+    /// document it was.
+    Json(PathBuf),
 }
 
 struct LakeQuery {
@@ -87,6 +94,9 @@ pub struct Store {
     /// tens of megabytes, and the row numbering across that seam is precisely
     /// where an off-by-one would hide.
     scan_bytes: Option<u64>,
+    /// What opening the file turned up that the user should be told once:
+    /// keys left out, lines that were not records.
+    notes: Option<String>,
     /// The whole sorted table, held in memory, carrying [`SOURCE_ROW`].
     ///
     /// Sorting cannot be lazy — nothing can know which row comes first
@@ -131,12 +141,16 @@ impl Store {
             row_index: None,
             scan_bytes: None,
             sorted: None,
+            notes: None,
         })
     }
 
     /// Open a store over a file, remembering the path so edits can be written
     /// back to it.
     pub fn open_file(path: &Path, viewport_rows: usize) -> Result<Self> {
+        if matches!(loader::detect_format(path), loader::FileFormat::JsonLines) {
+            return Self::open_jsonl(path, viewport_rows);
+        }
         // Only delimited text is editable. Parquet is genuinely typed, so a
         // one-cell change would mean rewriting the whole file against a schema.
         let separator = loader::separator(path)?;
@@ -161,6 +175,55 @@ impl Store {
         }
         store.current_view = store.fetch(0, viewport_rows)?;
         Ok(store)
+    }
+
+    /// Open a store over a JSONL file.
+    ///
+    /// One pass does everything: the row index and the key discovery read the
+    /// file together, so the column set is the file's true one rather than a
+    /// sample of it, and it is settled before the first frame is drawn —
+    /// unlike a reader that adds columns as it meets them and moves the table
+    /// sideways while you are reading.
+    fn open_jsonl(path: &Path, viewport_rows: usize) -> Result<Self> {
+        let mut scan = jsonl::Scan::new();
+        let index = RowIndex::build_lines(path, &mut |byte| scan.byte(byte))?;
+        let fields = scan.finish();
+
+        let schema = fields.schema();
+        if schema.is_empty() {
+            anyhow::bail!("no JSON objects in {}", path.display());
+        }
+        let view = View {
+            // Rare keys are reachable through `C` and `:select`; a table that
+            // opens two hundred columns wide has answered no question.
+            select: fields.shown(),
+            ..View::default()
+        };
+
+        let mut store = Self {
+            source: Source::Json(path.to_path_buf()),
+            schema,
+            total_rows: index.rows(),
+            row_offset: 0,
+            viewport_rows,
+            current_view: DataFrame::empty(),
+            view,
+            edit: None,
+            overlay: Overlay::new(),
+            filter_rows: None,
+            row_index: Some(std::sync::Arc::new(index)),
+            scan_bytes: None,
+            sorted: None,
+            notes: None,
+        };
+        store.notes = fields.notes();
+        store.current_view = store.fetch(0, viewport_rows)?;
+        Ok(store)
+    }
+
+    /// What the store wants said about the file when it opened, if anything.
+    pub fn notes(&self) -> Option<&str> {
+        self.notes.as_deref()
     }
 
     /// Open a store over one table or partition of a lake.
@@ -198,6 +261,7 @@ impl Store {
             row_index: None,
             scan_bytes: None,
             sorted: None,
+            notes: None,
         })
     }
 
@@ -438,7 +502,7 @@ impl Store {
             return self.apply_overlay(df, offset);
         }
         let df = match &self.source {
-            Source::Lazy(_) => {
+            Source::Lazy(_) | Source::Json(_) => {
                 // Which rows of the file this page shows: picked out by a
                 // filter, missing the ones deleted, or simply the next few in
                 // order when neither applies.
@@ -555,6 +619,15 @@ impl Store {
     /// nothing is composed on top — a sort or a projection changes what a row
     /// number means, so those go the lazy way.
     fn fetch_span(&self, first: usize, span: usize) -> Result<DataFrame> {
+        // A JSONL page is built here or nowhere: there is no frame to slice,
+        // and the parse can apply the projection itself, so a `:select` is no
+        // reason to leave this path the way it is for a delimited file.
+        if matches!(self.source, Source::Json(_)) {
+            return match self.indexed_span(first, span) {
+                Some(page) => page,
+                None => self.empty_page(),
+            };
+        }
         if self.view.sort.is_empty()
             && self.view.select.is_none()
             && let Some(page) = self.indexed_span(first, span)
@@ -591,19 +664,34 @@ impl Store {
     /// happens to be in those rows, and the types would change as you scroll.
     fn indexed_span(&self, offset: usize, height: usize) -> Option<Result<DataFrame>> {
         let index = self.row_index.as_ref()?;
-        let target = self.edit.as_ref()?;
+        let (path, records) = self.records()?;
         if offset >= index.rows() {
             return None;
         }
         let (first_row, from) = index.seek(offset);
         let to = index.end_of(offset + height);
+        // Only the columns on show are built for a JSONL page. A delimited
+        // page parses whole and is projected by the frame above it, which is
+        // why that path stands aside for a `:select` and this one need not.
+        let wanted = self.columns();
 
         Some((|| {
-            let bytes = index::read_span(&target.path, index, from, to)?;
-            let page = parse_span(bytes, &self.schema, target.separator)?;
+            let bytes = index::read_span(&path, index, from, to)?;
             // The span starts at a checkpoint, which is at or before the page.
-            Ok(page.slice((offset - first_row) as i64, height))
+            records.parse(bytes, &self.schema, &wanted, offset - first_row, height)
         })())
+    }
+
+    /// The file the rows are read out of and how its records are parsed, for
+    /// the two paths that read the file themselves: a page, and a scan.
+    fn records(&self) -> Option<(PathBuf, Records)> {
+        match &self.source {
+            Source::Json(path) => Some((path.clone(), Records::Json)),
+            _ => self
+                .edit
+                .as_ref()
+                .map(|target| (target.path.clone(), Records::Delimited(target.separator))),
+        }
     }
 
     /// Toggle sort direction on `col_idx`, or add it as a new ascending sort key.
@@ -663,6 +751,8 @@ impl Store {
                     }
                 });
             }
+            // Unreachable: `sort_blocked` refuses first, and callers ask.
+            Source::Json(_) => {}
             Source::Lake(query) => {
                 // A cloned handle shares the attached lake, so the background
                 // thread does not pay the ATTACH cost again.
@@ -699,6 +789,13 @@ impl Store {
     /// Asked *before* a sort key is recorded, so a refusal leaves the view as
     /// it was rather than in an order nothing can produce.
     pub fn sort_blocked(&self) -> Option<String> {
+        // A sort needs the whole table in an order nothing on disk has, and
+        // the JSONL path has no frame to sort — every page is built from the
+        // bytes the row index points at. Refused for now rather than paid for
+        // by re-reading the file per page.
+        if matches!(self.source, Source::Json(_)) {
+            return Some("sorting a jsonl file is not supported yet".to_string());
+        }
         if matches!(self.source, Source::Lazy(_)) && !self.sort_fits() {
             return Some(format!(
                 "{} rows across {} columns is more than there is memory to sort",
@@ -793,6 +890,11 @@ impl Store {
         if self.edit.is_none() {
             return Some(match self.source {
                 Source::Lake(_) => "lake tables are read-only",
+                // A JSONL edit means rewriting a record, which is a different
+                // piece of work from splicing a field: the value's bytes are
+                // known, but its type, its escaping and the shape of the line
+                // around it are the record's business.
+                Source::Json(_) => "jsonl files are read-only",
                 Source::Lazy(_) => "only csv, tsv, tab and txt files can be edited",
             });
         }
@@ -1140,7 +1242,7 @@ impl Store {
         tx: mpsc::Sender<Vec<usize>>,
     ) {
         match &self.source {
-            Source::Lazy(_) => self.search_lazy(pattern, col_name, tx),
+            Source::Lazy(_) | Source::Json(_) => self.search_lazy(pattern, col_name, tx),
             Source::Lake(query) => self.search_lake(query, pattern, col_name, tx),
         }
     }
@@ -1202,15 +1304,6 @@ impl Store {
     }
 
     fn search_lazy(&self, pattern: String, col_name: Option<String>, tx: mpsc::Sender<Vec<usize>>) {
-        // A held sort is both the frame on screen and much the faster thing to
-        // scan; without one, fall back to the lazy pipeline.
-        let (lf, total) = match &self.sorted {
-            Some(sorted) => (sorted.clone().lazy(), sorted.height()),
-            None => match self.effective_lf() {
-                Some(lf) => (lf, self.total_rows),
-                None => return,
-            },
-        };
         let schema = self.schema.clone();
         // Built inside the thread: an `Expr` is not `Send`.
         let build = {
@@ -1227,12 +1320,25 @@ impl Store {
         };
 
         // The indexed scan reads the file itself, so it can only stand in for
-        // the lazy one when the view has not changed what a row is.
-        let plain =
-            self.sorted.is_none() && self.view.sort.is_empty() && self.view.select.is_none();
+        // the lazy one when the view has not changed what a row is. A JSONL
+        // page is parsed whole for a scan whatever the view shows, and cannot
+        // be sorted at all, so a `:select` is no reason to stand aside.
+        let projected = self.view.select.is_some() && !matches!(self.source, Source::Json(_));
+        let plain = self.sorted.is_none() && self.view.sort.is_empty() && !projected;
         if plain && self.scan_indexed(tx.clone(), build).is_some() {
             return;
         }
+
+        // A held sort is both the frame on screen and much the faster thing to
+        // scan; without one, fall back to the lazy pipeline — which a JSONL
+        // file has none of, so for it the indexed scan is the only scan.
+        let (lf, total) = match &self.sorted {
+            Some(sorted) => (sorted.clone().lazy(), sorted.height()),
+            None => match self.effective_lf() {
+                Some(lf) => (lf, self.total_rows),
+                None => return,
+            },
+        };
         Self::scan_rows(lf, total, tx, move || match col_name {
             Some(name) => Some(matches_pattern(&name, &pattern)),
             None => schema
@@ -1259,9 +1365,10 @@ impl Store {
         F: FnOnce() -> Option<Expr> + Send + 'static,
     {
         let index = self.row_index.clone()?;
-        let target = self.edit.as_ref()?;
-        let path = target.path.clone();
-        let separator = target.separator;
+        let (path, records) = self.records()?;
+        // A predicate names source columns, so a scanned chunk is parsed
+        // whole however narrow the view is.
+        let wanted: Vec<usize> = (0..self.schema.len()).collect();
         let schema = self.schema.clone();
         let budget = self.scan_bytes.unwrap_or_else(budget::scan_bytes);
 
@@ -1281,7 +1388,8 @@ impl Store {
                 let Ok(bytes) = index::read_span(&path, &index, from, to) else {
                     break;
                 };
-                let Ok(chunk) = parse_span(bytes, &schema, separator) else {
+                // A scan wants the whole chunk, so it takes it from the top.
+                let Ok(chunk) = records.parse(bytes, &schema, &wanted, 0, usize::MAX) else {
                     break;
                 };
                 let Ok(hits) = chunk
@@ -1367,13 +1475,15 @@ impl Store {
             self.refresh()?;
             return Ok(None);
         };
-        let Source::Lazy(base) = &self.source else {
-            return Ok(None);
-        };
-
         // The scan runs on the base frame, so the indices it reports are the
         // file's own rows. That is what makes them usable as edit-buffer keys.
-        let lf = base.clone();
+        // A JSONL file has no frame: the indexed scan is the only scan, and
+        // there is nothing to fall back to.
+        let lf = match &self.source {
+            Source::Lazy(base) => Some(base.clone()),
+            Source::Json(_) => None,
+            Source::Lake(_) => return Ok(None),
+        };
         let schema = self.schema.clone();
         let (tx, rx) = mpsc::channel();
 
@@ -1389,6 +1499,13 @@ impl Store {
         // The index makes the scan linear; without one it re-reads from the
         // top of the file for every chunk.
         if self.scan_indexed(tx.clone(), predicate).is_none() {
+            let Some(lf) = lf else {
+                // Nothing is going to fill the set, so it must not be left
+                // looking like a filter that is still resolving.
+                self.filter_rows = None;
+                self.refresh()?;
+                return Ok(None);
+            };
             Self::scan_rows(lf, self.total_rows, tx, move || {
                 rows::predicate(&filter, &schema)
             });
@@ -1442,6 +1559,40 @@ fn match_rows(hits: &DataFrame) -> Vec<usize> {
         .unwrap_or_default()
 }
 
+/// How the bytes of a span become rows.
+///
+/// The one place the two file kinds differ once the index has said which bytes
+/// to read — everything above this treats them the same.
+#[derive(Clone, Copy)]
+enum Records {
+    Delimited(u8),
+    Json,
+}
+
+impl Records {
+    /// Rows `skip..skip + take` of a span, as the columns `wanted` names.
+    ///
+    /// A span begins at the checkpoint before the page, which can be a whole
+    /// stride earlier, so the window is named here rather than sliced off
+    /// afterwards: the JSONL reader can then walk past the records ahead of
+    /// the page instead of building them.
+    fn parse(
+        self,
+        bytes: Vec<u8>,
+        schema: &SchemaRef,
+        wanted: &[usize],
+        skip: usize,
+        take: usize,
+    ) -> Result<DataFrame> {
+        match self {
+            Records::Delimited(separator) => {
+                Ok(parse_span(bytes, schema, separator)?.slice(skip as i64, take))
+            }
+            Records::Json => jsonl::page(&bytes, schema, wanted, skip, take),
+        }
+    }
+}
+
 /// Parse a span of a delimited file that was read with its header in front.
 ///
 /// Given the schema plv already inferred, never left to infer its own: a chunk
@@ -1490,6 +1641,150 @@ mod tests {
     }
 
     const SAMPLE: &str = "name,count\na,1\nb,2\nc,3\nd,4\n";
+
+    /// A small log: every record has `ts`, `level` and `msg`, `err` is on the
+    /// one that failed, and `err` is a document rather than a value.
+    fn log_file(name: &str) -> PathBuf {
+        let mut text = String::new();
+        for i in 0..8 {
+            text.push_str(&format!(
+                "{{\"ts\":\"10:00:0{i}\",\"level\":\"info\",\"msg\":\"tick\",\"n\":{i}}}\n"
+            ));
+        }
+        text.push_str(
+            "{\"ts\":\"10:00:08\",\"level\":\"error\",\"msg\":\"boom\",\"n\":8,\"err\":{\"code\":500}}\n",
+        );
+        write_temp(name, &text)
+    }
+
+    #[test]
+    fn a_jsonl_file_opens_with_its_keys_as_columns() {
+        let store = Store::open_file(&log_file("log-open.jsonl"), 4).unwrap();
+        assert_eq!(store.total_rows, 9);
+        assert_eq!(
+            store
+                .schema
+                .iter_names()
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>(),
+            ["ts", "level", "msg", "n", "err"],
+            "most common first"
+        );
+        // `n` was whole numbers throughout, so it is a number and not text.
+        assert_eq!(store.schema.get_at_index(3).unwrap().1, &DataType::Int64);
+
+        // `err` is on one record in nine, which is under the share that gets
+        // shown — it is a column, it is simply not on screen.
+        assert_eq!(store.view.select, Some(vec![0, 1, 2, 3]));
+        assert!(store.notes().unwrap().contains("4 of 5 keys shown"));
+        assert_eq!(store.current_view.width(), 4);
+        assert_eq!(cell(&store.current_view, 2, 0).as_deref(), Some("tick"));
+    }
+
+    #[test]
+    fn a_jsonl_page_is_read_from_the_byte_offset_the_index_points_at() {
+        let mut store = Store::open_file(&log_file("log-page.jsonl"), 3).unwrap();
+        store.scroll_to_offset(6).unwrap();
+        assert_eq!(cell(&store.current_view, 0, 0).as_deref(), Some("10:00:06"));
+        assert_eq!(cell(&store.current_view, 3, 2).as_deref(), Some("8"));
+    }
+
+    /// The point of the whole exercise: a nested value reaches the cell as the
+    /// file's own bytes, so the cell window can open it as a document.
+    #[test]
+    fn a_nested_value_survives_to_the_cell_as_json() {
+        let mut store = Store::open_file(&log_file("log-nested.jsonl"), 10).unwrap();
+        // Show every key, the way `:reset select` does.
+        store.apply_view(View::default()).unwrap();
+        let err = store.schema.len() - 1;
+        let text = store.cell_text(8, err).unwrap();
+        assert_eq!(text, "{\"code\":500}");
+        assert!(crate::ui::json::reindent(&text).is_some());
+    }
+
+    /// A JSONL file has no lazy frame to fall back to, so the indexed scan is
+    /// the only scan — and `:filter` has to reach it.
+    #[test]
+    fn a_jsonl_file_filters_through_the_indexed_scan() {
+        let path = log_file("log-filter.jsonl");
+        let mut store = Store::open_file(&path, 4).unwrap();
+        store.view.filter = Some(
+            match crate::view::parse("filter level = error", &store.schema).unwrap() {
+                crate::view::Command::Filter(filter) => filter,
+                other => panic!("{other:?}"),
+            },
+        );
+        let rx = store.begin_filter().unwrap().expect("a scan was started");
+        while let Ok(batch) = rx.recv_timeout(std::time::Duration::from_secs(30)) {
+            if !store.extend_filter(batch).unwrap() {
+                break;
+            }
+        }
+        store.finish_filter().unwrap();
+
+        assert_eq!(store.row_count(), 1);
+        assert_eq!(store.source_row(0), Some(8), "the row it came from");
+        assert_eq!(cell(&store.current_view, 2, 0).as_deref(), Some("boom"));
+    }
+
+    /// A typed column is typed all the way to the view language: `n` was whole
+    /// numbers in every record, so it can be compared with `>`.
+    #[test]
+    fn a_number_key_can_be_filtered_as_a_number() {
+        let path = log_file("log-typed.jsonl");
+        let store = Store::open_file(&path, 4).unwrap();
+        assert!(
+            crate::view::parse("filter n > 6", &store.schema).is_ok(),
+            "an int column takes an int literal"
+        );
+        assert!(
+            crate::view::parse("filter n > abc", &store.schema).is_err(),
+            "and refuses one that is not"
+        );
+    }
+
+    /// The interesting page is one found by seeking to a checkpoint rather
+    /// than by counting from the top — which needs a file bigger than one
+    /// stride, and is exactly where an off-by-one in the line scan would hide.
+    #[test]
+    fn a_jsonl_page_past_a_checkpoint_lands_on_the_right_rows() {
+        use crate::data::index::STRIDE;
+
+        let rows = STRIDE + 100;
+        let mut text = String::with_capacity(rows * 24);
+        for i in 0..rows {
+            text.push_str(&format!("{{\"i\":{i},\"s\":\"r{i}\"}}\n"));
+        }
+        let path = write_temp("log-stride.jsonl", &text);
+        let mut store = Store::open_file(&path, 5).unwrap();
+        assert_eq!(store.total_rows, rows);
+
+        let last = rows - 5;
+        store.scroll_to_offset(last).unwrap();
+        assert_eq!(
+            cell(&store.current_view, 0, 0).as_deref(),
+            Some(&*last.to_string())
+        );
+        assert_eq!(
+            cell(&store.current_view, 1, 4).as_deref(),
+            Some(&*format!("r{}", rows - 1)),
+            "the last row of the file"
+        );
+
+        // And a page that straddles the checkpoint itself.
+        store.scroll_to_offset(STRIDE - 2).unwrap();
+        assert_eq!(
+            cell(&store.current_view, 0, 3).as_deref(),
+            Some(&*(STRIDE + 1).to_string())
+        );
+    }
+
+    #[test]
+    fn a_jsonl_file_is_read_only_and_cannot_be_sorted() {
+        let store = Store::open_file(&log_file("log-blocked.jsonl"), 4).unwrap();
+        assert_eq!(store.edit_blocked(), Some("jsonl files are read-only"));
+        assert!(store.sort_blocked().unwrap().contains("not supported yet"));
+    }
 
     /// Small fixtures never reach a second checkpoint, so the interesting
     /// case — a page found by seeking rather than by counting — needs a file
