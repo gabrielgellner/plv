@@ -1184,24 +1184,39 @@ impl Store {
         let written = target.written;
         let dst = dst.unwrap_or(&src).to_path_buf();
 
-        let stamp = match written {
+        // The index of the file just written comes back with the delimited
+        // write, because that write walked every record of it. Nothing else
+        // knows where the rows are now: an edit that changed a field's length
+        // moved every offset after it.
+        let (stamp, index) = match written {
             // plv always reads a header row, so record 0 is never data.
             Written::Delimited(separator) => {
-                writer::save(&src, &dst, separator, true, &self.overlay, self.total_rows)?
+                let saved =
+                    writer::save(&src, &dst, separator, true, &self.overlay, self.total_rows)?;
+                (saved.stamp, Some(saved.index))
             }
-            Written::Json => writer::save_json(
-                &src,
-                &dst,
-                &self.json_columns(),
-                &self.overlay,
-                self.total_rows,
-            )?,
+            Written::Json => (
+                writer::save_json(
+                    &src,
+                    &dst,
+                    &self.json_columns(),
+                    &self.overlay,
+                    self.total_rows,
+                )?,
+                None,
+            ),
         };
 
+        // Only when the file written is the file being read: `:w path` leaves
+        // this buffer describing the file it came from, index and all.
         if dst == src {
             self.overlay.clear();
             if let Some(target) = &mut self.edit {
                 target.stamp = stamp;
+            }
+            if let Some(index) = index {
+                self.total_rows = index.rows();
+                self.row_index = Some(std::sync::Arc::new(index));
             }
             self.reload()?;
         }
@@ -2135,6 +2150,85 @@ mod tests {
         store.expand(err).unwrap();
         let again = store.expand(err).unwrap_err().to_string();
         assert!(again.contains("already expanded"), "{again}");
+    }
+
+    /// After a write the view has to describe the file that was written, not
+    /// the one that was read: `save` clears the overlay, so a struck row that
+    /// is now gone from the file would otherwise spring back into the count.
+    #[test]
+    fn the_row_count_after_a_write_is_the_file_that_was_written() {
+        let path = write_temp("count-after-write.csv", "a,b\n1,2\n3,4\n5,6\n7,8\n");
+        let mut store = Store::open_file(&path, 10).unwrap();
+        assert_eq!(store.row_count(), 4);
+
+        store.delete_rows([1usize, 2]).unwrap();
+        store.save(None, false).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "a,b\n1,2\n7,8\n");
+        assert_eq!(store.row_count(), 2, "two rows left, and the view says so");
+        assert_eq!(cell(&store.current_view, 0, 1).as_deref(), Some("7"));
+
+        // And a second write off the new count writes the same file again.
+        store.save(None, false).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "a,b\n1,2\n7,8\n");
+    }
+
+    /// The silent half: an edit that changes a field's length moves every byte
+    /// offset after it, so the checkpoints have to be the new file's. Needs a
+    /// file past one stride, which is the only place a checkpoint other than
+    /// the first one exists.
+    #[test]
+    fn a_page_after_a_write_reads_from_the_new_offsets() {
+        use crate::data::index::STRIDE;
+
+        let rows = STRIDE + 100;
+        let mut csv = String::from("n,pad\n");
+        for i in 0..rows {
+            csv.push_str(&format!("{i},short\n"));
+        }
+        let path = write_temp("offsets-after-write.csv", &csv);
+        let mut store = Store::open_file(&path, 5).unwrap();
+
+        // An edit before the first checkpoint, changing how long the file is
+        // ahead of it.
+        store
+            .edit([((0, 1), "a good deal longer than short".to_string())])
+            .unwrap();
+        store.save(None, false).unwrap();
+
+        // A page past the checkpoint, which a stale offset would start in the
+        // middle of.
+        store.scroll_to_offset(rows - 5).unwrap();
+        assert_eq!(
+            cell(&store.current_view, 0, 0).as_deref(),
+            Some(&*(rows - 5).to_string())
+        );
+        assert_eq!(
+            cell(&store.current_view, 0, 4).as_deref(),
+            Some(&*(rows - 1).to_string()),
+            "the last row of the file"
+        );
+        assert_eq!(cell(&store.current_view, 1, 4).as_deref(), Some("short"));
+    }
+
+    /// `:w path` writes somewhere else and leaves this buffer describing the
+    /// file it came from — the index included.
+    #[test]
+    fn writing_elsewhere_leaves_the_buffer_describing_its_own_file() {
+        let path = write_temp("elsewhere-src.csv", "a,b\n1,2\n3,4\n");
+        let other = write_temp("elsewhere-dst.csv", "");
+        let mut store = Store::open_file(&path, 10).unwrap();
+        store.delete_rows([0usize]).unwrap();
+        store.save(Some(&other), false).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&other).unwrap(), "a,b\n3,4\n");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "a,b\n1,2\n3,4\n",
+            "the source is untouched"
+        );
+        assert_eq!(store.dirty(), 1, "so the deletion is still pending");
+        assert_eq!(store.row_count(), 1, "one row still struck out of two");
     }
 
     #[test]

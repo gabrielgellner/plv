@@ -234,6 +234,43 @@ impl RowIndex {
     }
 }
 
+/// A row index built while a file is *written*, rather than by reading it back.
+///
+/// A write already walks every record of its output — it is the thing putting
+/// the terminators there — so the index of the new file costs nothing to note
+/// on the way past. Reading it back to find out would mean a second full pass
+/// after every `:w`, which on a 28GB file is half a minute of nothing.
+#[derive(Default)]
+pub struct Building {
+    checkpoints: Vec<u64>,
+    rows: usize,
+}
+
+impl Building {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A data record was written, ending at byte `end` — which is where the
+    /// next one begins, and so what a checkpoint points at.
+    pub fn record(&mut self, end: u64) {
+        self.rows += 1;
+        if self.rows % STRIDE == 0 {
+            self.checkpoints.push(end);
+        }
+    }
+
+    pub fn finish(self, header: Vec<u8>, len: u64) -> RowIndex {
+        RowIndex {
+            checkpoints: with_first(self.checkpoints, &header, len),
+            rows: self.rows,
+            header,
+            len,
+            lines: false,
+        }
+    }
+}
+
 /// The offsets recorded above are the starts of rows `STRIDE`, `2*STRIDE`, …
 /// because row 0 begins where the header ends. Put that in front.
 fn with_first(mut checkpoints: Vec<u64>, header: &[u8], len: u64) -> Vec<u64> {

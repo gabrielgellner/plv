@@ -24,6 +24,7 @@ use anyhow::{Context, Result, bail};
 use std::collections::BTreeMap;
 
 use super::edit::Overlay;
+use super::index::{self, RowIndex};
 use super::jsonl;
 
 /// What a file looked like when plv opened it, so a write cannot clobber
@@ -61,10 +62,34 @@ pub fn save(
     has_header: bool,
     overlay: &Overlay,
     expected_rows: usize,
-) -> Result<Stamp> {
-    replace(src, dst, |input, output| {
-        splice(input, output, separator, has_header, overlay, expected_rows)
+) -> Result<Saved> {
+    let mut index = None;
+    let stamp = replace(src, dst, |input, output| {
+        index = Some(splice(
+            input,
+            output,
+            separator,
+            has_header,
+            overlay,
+            expected_rows,
+        )?);
+        Ok(())
+    })?;
+    Ok(Saved {
+        stamp,
+        index: index.expect("a successful splice built one"),
     })
+}
+
+/// What a write leaves behind: how the file looks now, and where its rows are.
+///
+/// The index describes the file that was *just written*, which is the only
+/// thing that can be said about it without reading it again — every edit that
+/// changed a field's length moved the offsets of everything after it.
+#[derive(Debug)]
+pub struct Saved {
+    pub stamp: Stamp,
+    pub index: RowIndex,
 }
 
 /// The same, for a JSONL file: `columns` says where each column's value lives
@@ -80,6 +105,11 @@ pub fn save_json(
         splice_json(input, output, columns, overlay, expected_rows)
     })
 }
+
+// A JSONL write builds no index: reloading one reads the file again whatever
+// happens, since the keys and their types are found by reading and an edit can
+// widen one. The delimited path has no such need, which is why the index is
+// worth noting on the way past there and not here.
 
 /// Build the new file beside `dst` and move it into place.
 ///
@@ -142,7 +172,7 @@ pub fn splice<R: BufRead, W: Write>(
     has_header: bool,
     overlay: &Overlay,
     expected_rows: usize,
-) -> Result<()> {
+) -> Result<RowIndex> {
     let mut splicer = Splicer::new(out, separator, has_header, overlay);
     loop {
         let chunk = src.fill_buf()?;
@@ -155,7 +185,7 @@ pub fn splice<R: BufRead, W: Write>(
         }
         src.consume(read);
     }
-    let (rows, applied, dropped, added) = splicer.finish()?;
+    let (rows, applied, dropped, added, index) = splicer.finish()?;
 
     if rows != expected_rows {
         bail!(
@@ -185,7 +215,7 @@ pub fn splice<R: BufRead, W: Write>(
             overlay.struck_count()
         );
     }
-    Ok(())
+    Ok(index)
 }
 
 /// One column of a JSONL file, as the writer needs it.
@@ -536,6 +566,14 @@ struct Splicer<'a, W: Write> {
     columns: usize,
     /// The line ending the file already uses, so added rows match it.
     newline: &'static [u8],
+    /// Bytes written so far, which is where the next record begins.
+    written: u64,
+    /// The header as it was copied through, kept so the index can hand it
+    /// back to a page read out of the middle of the new file.
+    header: Vec<u8>,
+    /// The index of the file being written, noted on the way past — see
+    /// [`index::Building`].
+    index: index::Building,
 }
 
 impl<'a, W: Write> Splicer<'a, W> {
@@ -559,6 +597,9 @@ impl<'a, W: Write> Splicer<'a, W> {
             added: 0,
             columns: 0,
             newline: b"\n",
+            written: 0,
+            header: Vec::new(),
+            index: index::Building::new(),
         }
     }
 
@@ -654,7 +695,11 @@ impl<'a, W: Write> Splicer<'a, W> {
             self.applied += 1;
             if !self.dropping {
                 let encoded = encode(value, self.separator);
-                self.out.write_all(encoded.as_bytes())?;
+                // Through `write_out` like everything else: it is the one
+                // place that counts what the new file is made of, and a
+                // replacement that went straight to the writer would leave
+                // every offset after it short by its own length.
+                self.write_out(encoded.as_bytes())?;
             }
         }
         Ok(())
@@ -681,6 +726,8 @@ impl<'a, W: Write> Splicer<'a, W> {
                 }
             }
             self.write_out(self.newline)?;
+            // An added row is a record of the new file like any other.
+            self.index.record(self.written);
             self.added += 1;
         }
         Ok(())
@@ -711,11 +758,18 @@ impl<'a, W: Write> Splicer<'a, W> {
             self.dropping = false;
             return Ok(());
         }
-        self.raw(eol)
+        self.raw(eol)?;
+        // A data record has just been written in full, so the next one starts
+        // here. Struck records return above and are not in the new file at
+        // all, which is exactly what the index should say about them.
+        if self.record > self.header_rows {
+            self.index.record(self.written);
+        }
+        Ok(())
     }
 
     /// Records seen, edits placed, rows dropped and rows added.
-    fn finish(mut self) -> Result<(usize, usize, usize, usize)> {
+    fn finish(mut self) -> Result<(usize, usize, usize, usize, RowIndex)> {
         if self.pending_quote {
             self.emit(b"\"")?;
             self.in_quotes = false;
@@ -731,6 +785,9 @@ impl<'a, W: Write> Splicer<'a, W> {
             self.begin_field()?;
             self.end_field();
             self.record += 1;
+            if self.record > self.header_rows {
+                self.index.record(self.written);
+            }
         }
 
         // Rows added after the last one in the file.
@@ -742,11 +799,14 @@ impl<'a, W: Write> Splicer<'a, W> {
             self.write_added(rows)?;
         }
         self.out.flush()?;
+        let written = self.written;
+        let header = std::mem::take(&mut self.header);
         Ok((
             self.record.saturating_sub(self.header_rows),
             self.applied,
             self.dropped,
             self.added,
+            self.index.finish(header, written),
         ))
     }
 
@@ -769,6 +829,14 @@ impl<'a, W: Write> Splicer<'a, W> {
 
     fn write_out(&mut self, bytes: &[u8]) -> Result<()> {
         self.out.write_all(bytes)?;
+        self.written += bytes.len() as u64;
+        // The header is whatever goes out before the first data record. Its
+        // terminator arrives after `record` has moved on, so it is not caught
+        // here — which is what the index wants: it keeps the header without
+        // one and puts a newline back itself.
+        if self.record < self.header_rows {
+            self.header.extend_from_slice(bytes);
+        }
         Ok(())
     }
 }
@@ -1162,11 +1230,42 @@ mod tests {
 
         let mut overlay = Overlay::new();
         overlay.set([((0, 1), "9".to_string())]);
-        let stamp = save(&path, &path, b',', true, &overlay, 1).unwrap();
+        let saved = save(&path, &path, b',', true, &overlay, 1).unwrap();
 
         assert_eq!(fs::read_to_string(&path).unwrap(), "a,b\n1,9\n");
-        assert!(stamp.still_matches(&path));
+        assert!(saved.stamp.still_matches(&path));
+        assert_eq!(saved.index.rows(), 1, "and it knows the file it wrote");
         assert!(!dir.join(".save.csv.plv-tmp").exists());
+    }
+
+    /// The index handed back has to be the one a reader would build from the
+    /// file — that is the whole claim, and it is what a byte miscounted
+    /// anywhere in the write would break.
+    #[test]
+    fn the_index_a_write_returns_describes_the_file_it_wrote() {
+        let dir = std::env::temp_dir().join("plv-writer-tests");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("index-after.csv");
+        fs::write(&path, "a,b\n1,2\n3,4\n5,6\n7,8\n").unwrap();
+
+        let mut overlay = Overlay::new();
+        // Each of the three things a write can do to a file's length.
+        overlay.set([((0, 1), "a much longer value".to_string())]);
+        overlay.delete([2], 4);
+        let id = overlay.add_row(1, 0, 4);
+        overlay.set([((id, 0), "new".to_string())]);
+
+        let saved = save(&path, &path, b',', true, &overlay, 4).unwrap();
+        let fresh = RowIndex::build(&path, b',').unwrap();
+
+        assert_eq!(saved.index.rows(), fresh.rows(), "records");
+        assert_eq!(
+            saved.index.end_of(fresh.rows()),
+            fresh.end_of(fresh.rows()),
+            "and the same number of bytes: a replacement written past the \
+             counter would leave every offset after it short"
+        );
+        assert_eq!(saved.index.header(), fresh.header());
     }
 
     #[test]
