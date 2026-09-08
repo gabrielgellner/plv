@@ -4,7 +4,7 @@ A terminal viewer and editor for CSV, TSV, JSONL, Parquet and [DuckLake](https:/
 
 - Supports CSV, tab-separated text, JSONL logs, Parquet, and DuckLake lakes
 - **Edits delimited text** — cells, blocks, whole rows — in a buffer, written with `:w`
-- **A view language** — `:select`, `:hide`, `:filter`, `:sort` — with Tab completion over the file's own column names
+- **A view language** — `:select`, `:hide`, `:filter`, `:sort`, `:expand` — with Tab completion over the file's own column names
 - **Column control** — pin columns to the left edge, hide one with a keystroke, or pick from a list
 - Works on files larger than memory: a 30GB CSV opens, pages anywhere, edits and writes back within about 60MB
 - Browse a lake's tables, partitions and snapshots — including time travel
@@ -129,7 +129,8 @@ Type a regex pattern after `/` and press `Enter`. In Row mode, search covers all
 
 CSV, TSV and `.txt` files can be edited. Parquet stays read-only — it is
 genuinely typed, so a one-cell change would mean rewriting the whole file
-against a schema — as do lake tables.
+against a schema — as do lake tables and JSONL, where an edit would mean
+rewriting a record rather than splicing a field.
 
 | Key | Action |
 |-----|--------|
@@ -182,10 +183,13 @@ undo step however many cells it touched.
 | `:filter count > 10` | Keep matching rows |
 | `:filter a = x and b ~ y` | Conditions join with `and`; `~` is a regex |
 | `:sort a b-` | Sort by columns; `-` reverses one |
+| `:expand payload` | Lift a JSONL document into columns (see below) |
 | `:reset [slot]` | Clear select, filter, sort, or all of them |
 
 A verb on its own puts its slot back, so `:select` shows every column again and
-`:sort` returns the file's own order.
+`:sort` returns the file's own order. `:expand` has no bare form: it changes
+which columns exist rather than which are on show, so there is nothing for it to
+put back — `-` hides a column it made.
 
 **Tab completes** against the verbs and the file's own column names — including
 the quoting, so `rel⇥` writes `"release date"`. Candidates appear in a panel
@@ -345,7 +349,8 @@ Lake tables are read through DuckDB's `ducklake` extension — DuckLake's own
 reference reader. That means what you see is the **logical** table: rows that
 DuckLake has inlined into the catalog database are included, delete files are
 applied, and schema evolution is handled by the format's implementation rather
-than by plv. CSV, TSV and Parquet files still go through Polars.
+than by plv. CSV, TSV and Parquet files still go through Polars, and JSONL
+through plv's own reader.
 
 Notes:
 
@@ -363,16 +368,17 @@ Notes:
 
 plv is built for files that do not fit in memory. Measured on a census extract:
 
-| | 28GB CSV, 272M rows | 800MB parquet, 842M rows | DuckLake, 1.14B rows |
-|---|---|---|---|
-| open | 31s | 55ms | 150ms |
-| page anywhere | 3–7ms | <1ms | 0.14–2.9s |
-| peak memory | 63MB | 126MB | 329MB |
+| | 28GB CSV, 272M rows | 800MB parquet, 842M rows | DuckLake, 1.14B rows | 62MB JSONL, 500k lines |
+|---|---|---|---|---|
+| open | 31s | 55ms | 150ms | 157ms |
+| page anywhere | 3–7ms | <1ms | 0.14–2.9s | 2–3ms |
+| peak memory | 63MB | 126MB | 329MB | 30MB |
 
 Opening a delimited file reads it once, to count the rows — and that pass also
 records where the rows are, so a page afterwards seeks to the nearest checkpoint
-instead of counting from the top. Parquet needs no such thing: it can already
-seek by row group.
+instead of counting from the top. A JSONL file is read the same way, and the
+same pass collects the file's keys, so its columns are exact rather than
+sampled. Parquet needs no such thing: it can already seek by row group.
 
 Sorting is the one operation that has to hold the table, since nothing can know
 which row comes first without reading them all. plv sorts once and keeps the
