@@ -4,6 +4,7 @@ A terminal viewer and editor for CSV, TSV, JSONL, Parquet and [DuckLake](https:/
 
 - Supports CSV, tab-separated text, JSONL logs, Parquet, and DuckLake lakes
 - **Edits delimited text and JSONL** — cells, blocks, whole rows — in a buffer, written with `:w`
+- **Reads a cell in a window** — `K` — with JSON, XML, HTML and markdown recognised and laid out
 - **Yanks to the system clipboard** as TSV, and takes a paste back from it — no clipboard library, and it works over SSH
 - **A view language** — `:select`, `:hide`, `:filter`, `:sort`, `:expand` — with Tab completion over the file's own column names
 - **Column control** — pin columns to the left edge, hide one with a keystroke, or pick from a list
@@ -55,6 +56,30 @@ Press `?` at any time for the key bindings of whatever screen you are on.
 | `?` | Show key bindings for the current screen |
 | `q` | Quit |
 
+Widening a column pushes the ones after it along and off the right edge, as a
+spreadsheet does, rather than squeezing everything to make room — `h` and `l`
+reach what went past. Widths are remembered for the session and belong to the
+column, so they survive `:select` reordering it; `z=` puts them all back.
+
+A wide table is read by scrolling sideways, and the column saying *which row
+this is* is the first to leave the screen. `zp` pins the cursor column to the
+left edge, where it stays while the rest scroll past it; `z|` unpins the lot.
+Pins need not be neighbours — pinning an id and a status brings two columns from
+opposite ends of the file into one view, which is the case the feature exists
+for. Like widths they belong to the column and survive a `:select`, and a pin
+the screen has no room for is refused rather than drawn, since a table with no
+room left to scroll in stops answering `h` and `l` with nothing to say why.
+
+Row numbers count from the cursor by default, the way nvim's hybrid
+`number` + `relativenumber` gutter does, so `3j` and `12G` can be read off
+rather than worked out. `#` switches to plain absolute numbering.
+
+`Ctrl+d` and `Ctrl+u` move the view and the cursor together, keeping the cursor
+at the same height in the window — as vim does, rather than walking the cursor
+to the edge first.
+
+## Reading a cell
+
 A column can only be made so wide, so there are two ways to see a value that
 does not fit. `K` — vim's "tell me about the thing under the cursor" — opens the
 cell in a window over the table: wrapped at word boundaries, titled with the
@@ -97,31 +122,8 @@ structure would be showing structure that is not there.
 `zk` is the other half: the same value in the strip above the status bar, two or
 three lines of it, staying on as the cursor moves so a column of long values can
 be read by walking down it. One is for reading a cell, the other for scanning a
-column of them.
-
-Newlines inside a quoted field are kept as the author wrote them by both.
-
-Widening a column pushes the ones after it along and off the right edge, as a
-spreadsheet does, rather than squeezing everything to make room — `h` and `l`
-reach what went past. Widths are remembered for the session and belong to the
-column, so they survive `:select` reordering it; `z=` puts them all back.
-
-A wide table is read by scrolling sideways, and the column saying *which row
-this is* is the first to leave the screen. `zp` pins the cursor column to the
-left edge, where it stays while the rest scroll past it; `z|` unpins the lot.
-Pins need not be neighbours — pinning an id and a status brings two columns from
-opposite ends of the file into one view, which is the case the feature exists
-for. Like widths they belong to the column and survive a `:select`, and a pin
-the screen has no room for is refused rather than drawn, since a table with no
-room left to scroll in stops answering `h` and `l` with nothing to say why.
-
-Row numbers count from the cursor by default, the way nvim's hybrid
-`number` + `relativenumber` gutter does, so `3j` and `12G` can be read off
-rather than worked out. `#` switches to plain absolute numbering.
-
-`Ctrl+d` and `Ctrl+u` move the view and the cursor together, keeping the cursor
-at the same height in the window — as vim does, rather than walking the cursor
-to the edge first.
+column of them. Newlines inside a quoted field are kept as the author wrote
+them by both.
 
 ## Selection modes
 

@@ -13,7 +13,8 @@
 ```bash
 cargo build                        # debug build
 cargo run -- path/to/file.csv      # run with a file
-cargo run -- path/to/file.parquet
+cargo run -- path/to/file.jsonl    # or .ndjson, .parquet, a .ducklake catalog
+cargo run -- samples/log.jsonl     # a small log to try things on
 cargo test                         # run tests
 cargo clippy                       # lint — must be clean before committing
 cargo build --release              # optimised build (LTO + strip)
