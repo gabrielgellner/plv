@@ -14,6 +14,7 @@ use ratatui::{
     widgets::Paragraph,
 };
 
+use crate::clipboard;
 use crate::complete::{self, Completion};
 use crate::data::Store;
 use crate::data::lake_db::{self, LakeDb};
@@ -733,7 +734,9 @@ impl App {
             ("dd / {n}dd", "Delete the row, or n rows"),
             ("o / O", "Open a new row below / above"),
             ("u / Ctrl+r", "Undo / redo"),
-            ("y / p", "Yank the cursor / paste at the cursor"),
+            ("y", "Yank, to the register and the system clipboard"),
+            ("p", "Paste the register at the cursor"),
+            ("", "Your terminal's paste key pastes from outside"),
             (
                 "Tab / Shift+Tab",
                 "While editing: commit, next / previous cell",
@@ -1141,13 +1144,57 @@ impl App {
             return Ok(());
         }
 
-        if let Event::Key(key) = event::read()?
-            && key.kind == KeyEventKind::Press
-            && let Err(e) = self.handle_key_event(key)
-        {
+        let outcome = match event::read()? {
+            Event::Key(key) if key.kind == KeyEventKind::Press => self.handle_key_event(key),
+            // What the terminal's own paste key pasted. plv never asks for the
+            // clipboard — reading OSC 52 back is disabled in most terminals —
+            // so this is the whole of the way in.
+            Event::Paste(text) => self.handle_paste(text),
+            _ => Ok(()),
+        };
+        if let Err(e) = outcome {
             self.error = Some(e.to_string());
         }
         Ok(())
+    }
+
+    /// Text arriving from outside, read as the block it is and put down where
+    /// `p` would have put it.
+    ///
+    /// Down the same path as an internal paste — the clipping at the last row
+    /// and column, the count of what fell off the edge — so there is one
+    /// answer to what pasting does, whichever side the block came from.
+    fn handle_paste(&mut self, text: String) -> anyhow::Result<()> {
+        // Into whatever is taking text, when something is. A paste while a
+        // command or a cell is being typed is meant for the line, not for the
+        // grid, and a line holds one line — so the breaks in a multi-line
+        // paste become spaces rather than being dropped or ending the edit.
+        if !matches!(self.mode, AppMode::Normal | AppMode::Picker) {
+            let flat = text.replace(['\n', '\r', '\t'], " ");
+            match self.mode {
+                AppMode::Edit => {
+                    let at = self.edit_byte_index(self.edit_cursor);
+                    self.edit_buf.insert_str(at, &flat);
+                    self.edit_cursor += flat.chars().count();
+                }
+                AppMode::Command => {
+                    self.command_buf.push_str(&flat);
+                    self.completion = None;
+                    self.completion_index = None;
+                }
+                AppMode::Search => self.search_buf.push_str(&flat),
+                _ => {}
+            }
+            return Ok(());
+        }
+        if matches!(self.mode, AppMode::Picker) {
+            return Ok(());
+        }
+        let block = clipboard::parse(&text);
+        if block.is_empty() {
+            return Ok(());
+        }
+        self.paste_block(&block)
     }
 
     /// Drain any pending search result batches from the background thread,
@@ -1880,7 +1927,15 @@ impl App {
             self.cursor_col = col;
             self.cursor_to(row)?;
         }
-        self.message = Some(format!("yanked {cells} cells"));
+        // And out to the system clipboard, so a block yanked here can be
+        // pasted into a spreadsheet or a second plv. A terminal that will not
+        // take it leaves the internal register untouched — the yank still
+        // happened, it just did not travel.
+        let shared = clipboard::copy(&clipboard::tsv(&self.register)).unwrap_or(false);
+        self.message = Some(match shared {
+            true => format!("yanked {cells} cells to the clipboard"),
+            false => format!("yanked {cells} cells"),
+        });
         Ok(())
     }
 
@@ -1895,6 +1950,16 @@ impl App {
             self.message = Some("nothing to paste".to_string());
             return Ok(());
         }
+        // Taken out of the register first: the block being written and the
+        // register are the same thing here, and the edit needs the store.
+        let block = std::mem::take(&mut self.register);
+        let result = self.paste_block(&block);
+        self.register = block;
+        result
+    }
+
+    /// Write `block` into the grid with its top-left at the cursor.
+    fn paste_block(&mut self, block: &[Vec<String>]) -> anyhow::Result<()> {
         if !self.ready_to_edit() {
             return Ok(());
         }
@@ -1906,7 +1971,7 @@ impl App {
 
         let mut edits = Vec::new();
         let mut clipped = 0usize;
-        for (down, row) in self.register.iter().enumerate() {
+        for (down, row) in block.iter().enumerate() {
             for (across, value) in row.iter().enumerate() {
                 let cell = (self.cursor_row + down, self.cursor_col + across);
                 if cell.0 > last_row || cell.1 > last_col {
@@ -4447,6 +4512,72 @@ mod tests {
         press(&mut app, 'j'); // extend down to row 2
         press(&mut app, 'y');
         assert_eq!(app.cursor_row, 1, "back to the anchor, not the far end");
+    }
+
+    /// Text from outside lands where `p` would put it, and goes through the
+    /// same clipping, so there is one answer to what pasting does.
+    #[test]
+    fn a_paste_from_the_terminal_lands_as_a_block() {
+        let (mut app, _) = app_with("extpaste.csv", "a,b,c\n1,2,3\n4,5,6\n7,8,9\n");
+        cell_mode(&mut app);
+        app.cursor_to(1).unwrap();
+        press(&mut app, 'l');
+
+        app.handle_paste("x\ty\nz\tw\n".to_string()).unwrap();
+        assert_eq!(shown(&app, 1, 1).as_deref(), Some("x"));
+        assert_eq!(shown(&app, 2, 1).as_deref(), Some("y"));
+        assert_eq!(shown(&app, 1, 2).as_deref(), Some("z"));
+        assert_eq!(app.message.as_deref(), Some("pasted 4 cells"));
+    }
+
+    #[test]
+    fn a_paste_wider_than_the_table_says_what_fell_off() {
+        let (mut app, _) = app_with("extclip.csv", "a,b\n1,2\n");
+        cell_mode(&mut app);
+        app.handle_paste("x\ty\tz".to_string()).unwrap();
+        assert_eq!(
+            app.message.as_deref(),
+            Some("pasted 2 cells, 1 past the edge")
+        );
+    }
+
+    /// A quoted cell comes back the cell it was, not two.
+    #[test]
+    fn a_paste_of_a_quoted_value_keeps_its_shape() {
+        let (mut app, _) = app_with("quotedpaste.csv", "a,b\n1,2\n");
+        cell_mode(&mut app);
+        app.handle_paste("\"one\ttwo\"\tplain".to_string()).unwrap();
+        assert_eq!(shown(&app, 0, 0).as_deref(), Some("one\ttwo"));
+        assert_eq!(shown(&app, 1, 0).as_deref(), Some("plain"));
+    }
+
+    /// An external paste is not a yank: whatever `y` put in the register is
+    /// still there afterwards.
+    #[test]
+    fn a_paste_from_outside_leaves_the_register_alone() {
+        let (mut app, _) = app_with("regkeep.csv", "a,b\n1,2\n3,4\n");
+        cell_mode(&mut app);
+        press(&mut app, 'y');
+        let yanked = app.register.clone();
+
+        app.handle_paste("outside".to_string()).unwrap();
+        assert_eq!(app.register, yanked);
+    }
+
+    /// A paste while a line is being typed is meant for the line.
+    #[test]
+    fn a_paste_into_a_prompt_goes_into_the_line() {
+        let (mut app, _) = app_with("promptpaste.csv", SAMPLE);
+        press(&mut app, ':');
+        app.handle_paste("select name".to_string()).unwrap();
+        assert_eq!(app.command_buf, "select name");
+
+        key(&mut app, KeyCode::Esc);
+        press(&mut app, '/');
+        // A line holds one line, so the breaks become spaces rather than
+        // ending the search.
+        app.handle_paste("two\nlines".to_string()).unwrap();
+        assert_eq!(app.search_buf, "two lines");
     }
 
     #[test]

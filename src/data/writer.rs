@@ -842,7 +842,12 @@ impl<'a, W: Write> Splicer<'a, W> {
 }
 
 /// Quote `value` if writing it bare would change the shape of the record.
-fn encode(value: &str, separator: u8) -> Cow<'_, str> {
+/// One field, quoted where the format requires it.
+///
+/// Shared with the clipboard, which puts a block on the wire as TSV: the two
+/// have to agree about when a value needs quotes, or a cell holding a tab
+/// would arrive somewhere else as two.
+pub fn encode(value: &str, separator: u8) -> Cow<'_, str> {
     let needs_quotes = value
         .bytes()
         .any(|b| b == separator || b == b'"' || b == b'\n' || b == b'\r');

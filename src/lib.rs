@@ -1,4 +1,5 @@
 pub mod app;
+pub mod clipboard;
 pub mod complete;
 pub mod data;
 pub mod lake;
