@@ -64,8 +64,8 @@ plv, and it covers the table rather than taking rows from it — closing it puts
 the screen back exactly as it was.
 
 A cell that is a **document** is shown as one: re-indented, coloured, and titled
-`note — json, 291 characters` or `body — html, 209 characters`. JSON, XML and
-HTML are recognised.
+`note — json, 291 characters` or `body — html, 209 characters`. JSON, XML, HTML
+and markdown are recognised.
 
 Detection is a real parse rather than a guess — a value is JSON only if it parses
 all the way to the end, and markup only if every tag closes in the right order,
@@ -74,6 +74,16 @@ its **own bytes** rather than rebuilt from a parsed model, so JSON's key order,
 number formatting and duplicate keys survive, and so do markup's attribute
 quoting and entities. `r` switches to the raw value and back, since the formatted
 view is an interpretation and the raw one is what gets edited and written.
+
+Markdown is the odd one: it was designed to be read as it is written, so there
+is nothing to re-indent and plv only says which parts are which — headings bold,
+fences in the colour code is drawn in, a bullet's dash out of the way of the
+words after it. **Every marker stays where it was**, drawn dim rather than
+hidden, so the text on screen is the text in the cell character for character.
+Its detection is the one judgement rather than a parse, since a paragraph is a
+valid markdown document: what is asked is whether there is structure worth
+drawing — a heading, a fence, a quote, or more than one list item. Getting that
+wrong costs a dim dash, because nothing is hidden either way.
 
 Markup has to be well-formed. Real HTML often is not — an unclosed `<p>`, an
 `<li>` left hanging — and those cells stay text, deliberately: a half-parsed

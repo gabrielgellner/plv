@@ -25,7 +25,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph, Widget},
 };
 
-use super::{Theme, json, markup, syntax};
+use super::{Theme, json, markdown, markup, syntax};
 
 /// Borders and a column of padding either side, which the value does not get
 /// to write in.
@@ -52,6 +52,7 @@ pub enum Format {
     /// XML or HTML, told apart by which of the two's rules the document
     /// needed — see [`markup::Flavour`].
     Markup(markup::Flavour),
+    Markdown,
 }
 
 impl Format {
@@ -61,6 +62,7 @@ impl Format {
             Format::Text => None,
             Format::Json => Some("json"),
             Format::Markup(flavour) => Some(flavour.label()),
+            Format::Markdown => Some("markdown"),
         }
     }
 }
@@ -90,11 +92,18 @@ impl Content {
         // value rather than a look at its first character — so nothing is
         // claimed on the strength of a `{` or a `<`. They cannot both
         // succeed: a JSON document does not begin with a tag.
+        // Markdown is asked last, and has to be: the other two are parses
+        // that a value either passes or does not, and this one is a judgement
+        // about whether there is structure worth drawing. A JSON document
+        // full of `*` would otherwise be claimed by the loosest test.
         let (format, document) = match json::reindent(value) {
             Some(document) => (Format::Json, Some(document)),
             None => match markup::reindent(value) {
                 Some((document, flavour)) => (Format::Markup(flavour), Some(document)),
-                None => (Format::Text, None),
+                None => match markdown::format(value) {
+                    Some(document) => (Format::Markdown, Some(document)),
+                    None => (Format::Text, None),
+                },
             },
         };
         let lines = match document {
@@ -740,6 +749,81 @@ mod tests {
         assert_eq!(xml.format, Format::Markup(markup::Flavour::Xml));
         assert!(title("note", "str", &xml).contains("xml,"));
         assert!(xml.switchable(), "and `r` gets back to the bytes");
+    }
+
+    #[test]
+    fn a_markdown_cell_is_marked_up_without_being_rewritten() {
+        let note = "## Deploy\n\n- rollback with `plv down`\n- **check** the queue";
+        let content = content(note);
+        assert_eq!(content.format, Format::Markdown);
+        assert!(title("note", "str", &content).contains("markdown,"));
+        assert_eq!(
+            text(&content.lines).join("\n"),
+            note,
+            "every character the cell holds is still on screen"
+        );
+    }
+
+    /// The text is the cell's, so what a reader actually gets is the
+    /// *styling* — which means it has to be checked, not assumed.
+    #[test]
+    fn a_heading_is_drawn_bold_and_its_hashes_are_not() {
+        let theme = Theme::catppuccin_mocha();
+        let area = Rect::new(0, 0, 40, 10);
+        let mut buf = Buffer::empty(area);
+        CellWindow {
+            name: "note",
+            dtype: "str",
+            content: &content("## Deploy\n- a\n- b"),
+            scroll: 0,
+            theme: &theme,
+        }
+        .render(area, &mut buf);
+
+        let row = (0..area.height)
+            .find(|&y| {
+                (0..area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    .contains("## Deploy")
+            })
+            .expect("the heading is on screen");
+        let at = |needle: char| {
+            (0..area.width)
+                .find(|&x| buf[(x, row)].symbol() == needle.to_string())
+                .expect("found")
+        };
+        let hash = at('#');
+        let word = at('D');
+        assert!(
+            buf[(word, row)]
+                .style()
+                .add_modifier
+                .contains(Modifier::BOLD),
+            "the heading's words are bold"
+        );
+        assert!(
+            !buf[(hash, row)]
+                .style()
+                .add_modifier
+                .contains(Modifier::BOLD),
+            "and its marker recedes rather than joining in"
+        );
+        assert_eq!(buf[(hash, row)].style().fg, Some(theme.syntax_punct));
+    }
+
+    /// The loosest test is asked last, or it would claim what the others
+    /// would have parsed.
+    #[test]
+    fn a_document_full_of_markers_is_still_the_document_it_is() {
+        let json = r##"{"note":"* not a bullet","body":"# not a heading"}"##;
+        assert_eq!(content(json).format, Format::Json);
+        let html = "<ul><li>* not a bullet</li><li># not a heading</li></ul>";
+        assert_eq!(
+            content(html).format,
+            Format::Markup(markup::Flavour::Xml),
+            "and markup is asked before markdown too"
+        );
     }
 
     /// Prose with an angle bracket in it is prose. A format is claimed only
