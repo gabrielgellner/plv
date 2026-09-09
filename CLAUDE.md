@@ -185,7 +185,7 @@ explanation cannot drift apart.
 
 **Keys.** `i`/`a`/`c` open a cell (caret at the front, at the end, or empty), `x`
 clears it, `u`/`Ctrl+r` undo and redo, `y`/`p` yank and paste through an internal
-register (no system clipboard). `v` starts a visual selection whose shape follows
+register. `v` starts a visual selection whose shape follows
 the `Tab` mode — whole rows, whole columns, or a rectangle. Over a selection `c`
 replaces every cell while `i` and `a` prepend and append to what is already
 there, following vim's blockwise `I` and `A`; those two read the block first, so
@@ -195,6 +195,38 @@ because a column-mode selection covers every row in the file.
 `:` opens an ex line: `:w`, `:w!`, `:w path`, `:q`, `:q!`, `:wq`, `:x`. Bare `q`
 and `:q` refuse while edits are unwritten. The status bar carries a `[+n]` count
 and edited cells render in red.
+
+## The clipboard (`src/clipboard.rs`)
+
+`y` puts the block on the **system clipboard** as TSV, and the terminal's own
+paste key puts one back — two directions, no dependency. A clipboard crate
+would mean linking platform windowing libraries and, on X11 and Wayland, a
+thread to keep the copied data alive after plv exits; it can also fail to build
+on a headless box, which is a bad trade for a viewer.
+
+Out is **OSC 52**, an escape sequence asking the terminal to set its clipboard,
+so it works over SSH where a native clipboard would be reaching for the wrong
+machine's. In is **bracketed paste** — a default crossterm feature, so
+`Event::Paste` arrives without asking for anything — which is the read half OSC
+52 does not reliably have, since terminals disable reading it back for the
+obvious reason. The cost is that the keys are asymmetric: `y` copies, but
+pasting in is the terminal's key rather than `p`.
+
+TSV because that is what a spreadsheet puts on the clipboard for a range and
+what it expects back, and fields are quoted by `writer::encode` — the same
+function the file writer uses, because the two have to agree about when a value
+needs quotes or a cell holding a tab arrives elsewhere as two. `clipboard::parse`
+is its inverse and a test round-trips a block through both.
+
+A paste goes through `App::paste_block`, the same path `p` takes, so the
+clipping at the last row and column and the count of what fell off the edge have
+one answer whichever side the block came from — and it leaves the register
+alone, since a paste is not a yank. A paste arriving while a `:` line, a `/`
+pattern or a cell is being typed goes into *that* instead, with newlines
+flattened to spaces: a line holds one line. Past `clipboard::MAX_BYTES` a yank
+is kept in the register and not sent, because a terminal that truncates the
+sequence leaves half a block on the clipboard with nothing about it looking
+wrong.
 
 ## The view language (`src/view.rs`)
 

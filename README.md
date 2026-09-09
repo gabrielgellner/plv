@@ -4,6 +4,7 @@ A terminal viewer and editor for CSV, TSV, JSONL, Parquet and [DuckLake](https:/
 
 - Supports CSV, tab-separated text, JSONL logs, Parquet, and DuckLake lakes
 - **Edits delimited text and JSONL** — cells, blocks, whole rows — in a buffer, written with `:w`
+- **Yanks to the system clipboard** as TSV, and takes a paste back from it — no clipboard library, and it works over SSH
 - **A view language** — `:select`, `:hide`, `:filter`, `:sort`, `:expand` — with Tab completion over the file's own column names
 - **Column control** — pin columns to the left edge, hide one with a keystroke, or pick from a list
 - Works on files larger than memory: a 30GB CSV opens, pages anywhere, edits and writes back within about 60MB
@@ -150,7 +151,8 @@ against a schema — as do lake tables.
 | `x` | Clear the cell |
 | `dd` / `{n}dd` | Delete the row, or n rows |
 | `o` / `O` | Open a new row below / above |
-| `y` / `p` | Yank the cursor / paste at the cursor |
+| `y` | Yank, to the register and the system clipboard |
+| `p` | Paste the register at the cursor |
 | `u` / `Ctrl+r` | Undo / redo |
 | `:w` `:w!` `:w path` | Write (force past a changed file / write elsewhere) |
 | `:q` `:q!` `:wq` | Quit (discarding / writing) |
@@ -160,6 +162,21 @@ position in the file, so memory follows the number of changes rather than the
 size of the file, `u` reaches all of it, and `q` refuses while anything is
 pending. The status bar carries a `[+n]` count and edited cells are drawn in
 red.
+
+**`y` reaches the system clipboard**, as TSV — which is what a spreadsheet puts
+on the clipboard when you copy a range, and what it expects to receive. Coming
+back the other way, your terminal's own paste key drops a block in at the
+cursor: plv reads it as TSV, so a range copied from a spreadsheet keeps its
+shape, and anything past the last row or column is dropped with a count rather
+than wrapping. `p` still pastes plv's own register.
+
+Neither direction needs a clipboard library. Going out is OSC 52, an escape
+sequence the terminal answers, so it works over SSH where a native clipboard
+would be reaching for the wrong machine's; coming in is bracketed paste, which
+is the terminal handing plv what you pasted. Yanks larger than 64kB are kept in
+the register but not sent, since a terminal that quietly truncates the sequence
+would leave half a block on the clipboard with nothing about it looking wrong.
+Inside tmux, `set -g set-clipboard on` is what lets the sequence through.
 
 **Writing splices bytes rather than re-serialising.** Only the fields you
 changed are replaced: quoting style, line endings, a BOM, a missing final
@@ -178,7 +195,7 @@ columns, or a rectangle.
 | `i` / `a` | Prepend / append text to every cell |
 | `x` | Clear the selected cells |
 | `d` | Delete the selected rows |
-| `y` | Yank the selection |
+| `y` | Yank the selection, to the clipboard as well |
 
 `v jjj a` then `kg` turns a column of `1 2 3` into `1kg 2kg 3kg`. A fill is one
 undo step however many cells it touched.
