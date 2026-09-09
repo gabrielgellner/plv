@@ -2,6 +2,7 @@ mod browser;
 pub mod cell;
 mod help;
 pub mod json;
+pub mod markdown;
 pub mod markup;
 mod panel;
 mod prompt;

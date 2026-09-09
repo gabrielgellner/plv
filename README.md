@@ -4,6 +4,7 @@ A terminal viewer and editor for CSV, TSV, JSONL, Parquet and [DuckLake](https:/
 
 - Supports CSV, tab-separated text, JSONL logs, Parquet, and DuckLake lakes
 - **Edits delimited text and JSONL** — cells, blocks, whole rows — in a buffer, written with `:w`
+- **Reads a cell in a window** — `K` — with JSON, XML, HTML and markdown recognised and laid out
 - **Yanks to the system clipboard** as TSV, and takes a paste back from it — no clipboard library, and it works over SSH
 - **A view language** — `:select`, `:hide`, `:filter`, `:sort`, `:expand` — with Tab completion over the file's own column names
 - **Column control** — pin columns to the left edge, hide one with a keystroke, or pick from a list
@@ -55,42 +56,6 @@ Press `?` at any time for the key bindings of whatever screen you are on.
 | `?` | Show key bindings for the current screen |
 | `q` | Quit |
 
-A column can only be made so wide, so there are two ways to see a value that
-does not fit. `K` — vim's "tell me about the thing under the cursor" — opens the
-cell in a window over the table: wrapped at word boundaries, titled with the
-column, its type and its size, and scrolled with `j`/`k`, `Ctrl+d`/`Ctrl+u` and
-`g`/`G`. It holds the keys while it is up, so `q` closes it rather than quitting
-plv, and it covers the table rather than taking rows from it — closing it puts
-the screen back exactly as it was.
-
-A cell that is a **document** is shown as one: re-indented, coloured, and titled
-`note — json, 291 characters` or `body — html, 209 characters`. JSON, XML and
-HTML are recognised.
-
-Detection is a real parse rather than a guess — a value is JSON only if it parses
-all the way to the end, and markup only if every tag closes in the right order,
-so prose with a `{` or a `<` in it stays prose. The document is re-indented from
-its **own bytes** rather than rebuilt from a parsed model, so JSON's key order,
-number formatting and duplicate keys survive, and so do markup's attribute
-quoting and entities. `r` switches to the raw value and back, since the formatted
-view is an interpretation and the raw one is what gets edited and written.
-
-Markup has to be well-formed. Real HTML often is not — an unclosed `<p>`, an
-`<li>` left hanging — and those cells stay text, deliberately: a half-parsed
-document drawn as a tree is a claim about where things nest, and getting that
-wrong is worse than not indenting at all. Void elements (`<br>`, `<img>`) are the
-exception, since closing themselves is their rule; needing that rule, or a bare
-or unquoted attribute, is what makes a document `html` rather than `xml`. An
-element holding text is left on one line — breaking prose apart to show
-structure would be showing structure that is not there.
-
-`zk` is the other half: the same value in the strip above the status bar, two or
-three lines of it, staying on as the cursor moves so a column of long values can
-be read by walking down it. One is for reading a cell, the other for scanning a
-column of them.
-
-Newlines inside a quoted field are kept as the author wrote them by both.
-
 Widening a column pushes the ones after it along and off the right edge, as a
 spreadsheet does, rather than squeezing everything to make room — `h` and `l`
 reach what went past. Widths are remembered for the session and belong to the
@@ -112,6 +77,53 @@ rather than worked out. `#` switches to plain absolute numbering.
 `Ctrl+d` and `Ctrl+u` move the view and the cursor together, keeping the cursor
 at the same height in the window — as vim does, rather than walking the cursor
 to the edge first.
+
+## Reading a cell
+
+A column can only be made so wide, so there are two ways to see a value that
+does not fit. `K` — vim's "tell me about the thing under the cursor" — opens the
+cell in a window over the table: wrapped at word boundaries, titled with the
+column, its type and its size, and scrolled with `j`/`k`, `Ctrl+d`/`Ctrl+u` and
+`g`/`G`. It holds the keys while it is up, so `q` closes it rather than quitting
+plv, and it covers the table rather than taking rows from it — closing it puts
+the screen back exactly as it was.
+
+A cell that is a **document** is shown as one: re-indented, coloured, and titled
+`note — json, 291 characters` or `body — html, 209 characters`. JSON, XML, HTML
+and markdown are recognised.
+
+Detection is a real parse rather than a guess — a value is JSON only if it parses
+all the way to the end, and markup only if every tag closes in the right order,
+so prose with a `{` or a `<` in it stays prose. The document is re-indented from
+its **own bytes** rather than rebuilt from a parsed model, so JSON's key order,
+number formatting and duplicate keys survive, and so do markup's attribute
+quoting and entities. `r` switches to the raw value and back, since the formatted
+view is an interpretation and the raw one is what gets edited and written.
+
+Markdown is the odd one: it was designed to be read as it is written, so there
+is nothing to re-indent and plv only says which parts are which — headings bold,
+fences in the colour code is drawn in, a bullet's dash out of the way of the
+words after it. **Every marker stays where it was**, drawn dim rather than
+hidden, so the text on screen is the text in the cell character for character.
+Its detection is the one judgement rather than a parse, since a paragraph is a
+valid markdown document: what is asked is whether there is structure worth
+drawing — a heading, a fence, a quote, or more than one list item. Getting that
+wrong costs a dim dash, because nothing is hidden either way.
+
+Markup has to be well-formed. Real HTML often is not — an unclosed `<p>`, an
+`<li>` left hanging — and those cells stay text, deliberately: a half-parsed
+document drawn as a tree is a claim about where things nest, and getting that
+wrong is worse than not indenting at all. Void elements (`<br>`, `<img>`) are the
+exception, since closing themselves is their rule; needing that rule, or a bare
+or unquoted attribute, is what makes a document `html` rather than `xml`. An
+element holding text is left on one line — breaking prose apart to show
+structure would be showing structure that is not there.
+
+`zk` is the other half: the same value in the strip above the status bar, two or
+three lines of it, staying on as the cursor moves so a column of long values can
+be read by walking down it. One is for reading a cell, the other for scanning a
+column of them. Newlines inside a quoted field are kept as the author wrote
+them by both.
 
 ## Selection modes
 

@@ -6,7 +6,7 @@
 //! they say what they found, and this turns it into something to draw.
 
 use ratatui::{
-    style::Style,
+    style::{Modifier, Style},
     text::{Line, Span},
 };
 
@@ -30,6 +30,13 @@ pub enum Kind {
     /// Ordinary text content, which is the document's prose rather than its
     /// structure and is drawn in the ordinary colour.
     Text,
+    /// A heading's text.
+    Heading,
+    /// Text a document marks as strong, or as emphasised.
+    Strong,
+    Emphasis,
+    /// Code: a span between backticks, or the body of a fence.
+    Code,
     /// Braces, brackets, commas, angle brackets — and the indentation, which
     /// is structure too.
     Punct,
@@ -66,6 +73,15 @@ pub fn lines(document: &[Vec<Piece>], theme: &Theme) -> Vec<Line<'static>> {
                             // nothing, so recognising a format never changes
                             // how the reading itself looks.
                             Kind::Text => Style::new(),
+                            // Weight and slant, not colour: what a document
+                            // marks as strong is not another kind of thing,
+                            // it is the same words said louder.
+                            Kind::Heading => Style::new()
+                                .fg(theme.syntax_key)
+                                .add_modifier(Modifier::BOLD),
+                            Kind::Strong => Style::new().add_modifier(Modifier::BOLD),
+                            Kind::Emphasis => Style::new().add_modifier(Modifier::ITALIC),
+                            Kind::Code => Style::new().fg(theme.syntax_string),
                             Kind::Name => Style::new().fg(theme.syntax_key),
                             Kind::Attr => Style::new().fg(theme.syntax_attr),
                             Kind::Str => Style::new().fg(theme.syntax_string),
