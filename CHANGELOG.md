@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.22.0] - 2026-09-09
+
+### Documentation
+
+- a sweep over everything the last nine releases added ([`414d301`](https://gitlab.com/gabrielgellner/plv/-/commit/414d301b233eaef2aae535af3d5ee557c0eaec01))
+
+### Features
+
+- the cell window reads markdown, and changes nothing ([`542e1e9`](https://gitlab.com/gabrielgellner/plv/-/commit/542e1e9fe958e784bc4008a59ab14ccbe0f15682))
+
 ## [0.21.0] - 2026-09-09
 
 ### Features
@@ -253,6 +263,8 @@ All notable changes to this project will be documented in this file.
 ### Styling
 
 - fix clippy warnings ([`5cb0dba`](https://gitlab.com/gabrielgellner/plv/-/commit/5cb0dba5f5d4bc0be4d3d3b09fd1e7cd00ff7722))
+
+[0.22.0]: https://gitlab.com/gabrielgellner/plv/-/compare/v0.21.0...v0.22.0
 
 [0.21.0]: https://gitlab.com/gabrielgellner/plv/-/compare/v0.20.0...v0.21.0
 
