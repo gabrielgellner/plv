@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.21.0] - 2026-09-09
+
+### Features
+
+- yank to the system clipboard, and take a paste back from it ([`42aac62`](https://gitlab.com/gabrielgellner/plv/-/commit/42aac6267fd6eb6806ab3f902f1ade8b7784c41a))
+
 ## [0.20.0] - 2026-09-08
 
 ### Features
@@ -247,6 +253,8 @@ All notable changes to this project will be documented in this file.
 ### Styling
 
 - fix clippy warnings ([`5cb0dba`](https://gitlab.com/gabrielgellner/plv/-/commit/5cb0dba5f5d4bc0be4d3d3b09fd1e7cd00ff7722))
+
+[0.21.0]: https://gitlab.com/gabrielgellner/plv/-/compare/v0.20.0...v0.21.0
 
 [0.20.0]: https://gitlab.com/gabrielgellner/plv/-/compare/v0.19.0...v0.20.0
 
