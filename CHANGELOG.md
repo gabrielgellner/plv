@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.24.0] - 2026-09-10
+
+### Features
+
+- the cell window searches the value it is showing ([`3941c76`](https://gitlab.com/gabrielgellner/plv/-/commit/3941c764d33cd095bb593ee39b48d6ecb154141f))
+
 ## [0.23.0] - 2026-09-10
 
 ### Features
@@ -269,6 +275,8 @@ All notable changes to this project will be documented in this file.
 ### Styling
 
 - fix clippy warnings ([`5cb0dba`](https://gitlab.com/gabrielgellner/plv/-/commit/5cb0dba5f5d4bc0be4d3d3b09fd1e7cd00ff7722))
+
+[0.24.0]: https://gitlab.com/gabrielgellner/plv/-/compare/v0.23.0...v0.24.0
 
 [0.23.0]: https://gitlab.com/gabrielgellner/plv/-/compare/v0.22.0...v0.23.0
 
