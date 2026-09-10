@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.23.0] - 2026-09-10
+
+### Features
+
+- a text column sorts by the numbers written in it ([`10d14bd`](https://gitlab.com/gabrielgellner/plv/-/commit/10d14bdd8450666964338611515d95ec5c70f07f))
+
 ## [0.22.0] - 2026-09-09
 
 ### Documentation
@@ -263,6 +269,8 @@ All notable changes to this project will be documented in this file.
 ### Styling
 
 - fix clippy warnings ([`5cb0dba`](https://gitlab.com/gabrielgellner/plv/-/commit/5cb0dba5f5d4bc0be4d3d3b09fd1e7cd00ff7722))
+
+[0.23.0]: https://gitlab.com/gabrielgellner/plv/-/compare/v0.22.0...v0.23.0
 
 [0.22.0]: https://gitlab.com/gabrielgellner/plv/-/compare/v0.21.0...v0.22.0
 
