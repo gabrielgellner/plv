@@ -24,6 +24,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Widget},
 };
+use regex::Regex;
 
 use super::{Theme, json, markdown, markup, syntax};
 
@@ -158,17 +159,41 @@ fn line_chars(line: &Line<'_>) -> usize {
 /// It works on styled lines and not on a string because by the time a value
 /// has been recognised as a document, its colours are part of what it says.
 pub fn wrap(lines: &[Line<'static>], width: u16) -> Vec<Line<'static>> {
+    wrapped(lines, width).0
+}
+
+/// Where a wrapped line came from: which of the value's own lines, and how
+/// far into it this piece begins.
+///
+/// It exists so a search can be run on the value and drawn on the screen.
+/// `indent` counts the hanging-indent spaces the wrap *added* at the front of
+/// a continuation — they are plv's, not the value's, so a character at
+/// wrapped position `indent + n` is character `start + n` of the source line.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Origin {
+    pub line: usize,
+    pub start: usize,
+    pub indent: usize,
+}
+
+/// [`wrap`], and where each line it produced came from.
+pub fn wrapped(lines: &[Line<'static>], width: u16) -> (Vec<Line<'static>>, Vec<Origin>) {
     let mut wrapper = Wrapper {
         width: (width as usize).max(1),
         indent: 0,
         out: Vec::new(),
+        origins: Vec::new(),
         current: Vec::new(),
         have: 0,
+        source: 0,
+        consumed: 0,
+        began: 0,
+        padding: 0,
     };
-    for line in lines {
-        wrapper.line(line);
+    for (nth, line) in lines.iter().enumerate() {
+        wrapper.line(nth, line);
     }
-    wrapper.out
+    (wrapper.out, wrapper.origins)
 }
 
 struct Wrapper {
@@ -176,12 +201,26 @@ struct Wrapper {
     /// What a continuation of the current line starts with.
     indent: usize,
     out: Vec<Line<'static>>,
+    origins: Vec<Origin>,
     current: Vec<Span<'static>>,
     have: usize,
+    /// Which of the value's lines is being wrapped.
+    source: usize,
+    /// Characters of it emitted so far — the value's own, so the hanging
+    /// indent the wrap adds is deliberately not counted.
+    consumed: usize,
+    /// What `consumed` was when the line being built started.
+    began: usize,
+    /// Hanging-indent characters at the front of the line being built.
+    padding: usize,
 }
 
 impl Wrapper {
-    fn line(&mut self, line: &Line<'static>) {
+    fn line(&mut self, nth: usize, line: &Line<'static>) {
+        self.source = nth;
+        self.consumed = 0;
+        self.began = 0;
+        self.padding = 0;
         // Half the window at most: past that the hanging indent is taking the
         // room it was meant to be clarifying.
         self.indent = leading_spaces(line).min(self.width / 2);
@@ -193,8 +232,20 @@ impl Wrapper {
             }
         }
         // Always, so an empty line in the value is still a line on screen.
+        self.emit();
+    }
+
+    /// Close the line being built, noting where in the value it came from.
+    fn emit(&mut self) {
         self.out.push(Line::from(std::mem::take(&mut self.current)));
+        self.origins.push(Origin {
+            line: self.source,
+            start: self.began,
+            indent: self.padding,
+        });
         self.have = 0;
+        self.began = self.consumed;
+        self.padding = 0;
     }
 
     fn chunk(&mut self, chunk: &str, style: Style) {
@@ -225,17 +276,204 @@ impl Wrapper {
     }
 
     fn push(&mut self, text: String, style: Style) {
-        self.have += text.chars().count();
+        let chars = text.chars().count();
+        self.have += chars;
+        self.consumed += chars;
         self.current.push(Span::styled(text, style));
     }
 
     fn wrap_here(&mut self) {
-        self.out.push(Line::from(std::mem::take(&mut self.current)));
-        self.have = 0;
+        self.emit();
         if self.indent > 0 {
-            self.push(" ".repeat(self.indent), Style::new());
+            // Padding, not value: it takes room on the line but stands for no
+            // character of the source, so `consumed` must not move.
+            self.have += self.indent;
+            self.padding = self.indent;
+            self.current
+                .push(Span::styled(" ".repeat(self.indent), Style::new()));
         }
     }
+}
+
+/// A piece of one match, as a range of a wrapped line — what actually gets
+/// drawn in the match colours.
+///
+/// **The pattern is matched against the value, not against the screen.** The
+/// wrap breaks lines at spaces, so searching what is drawn would mean `line
+/// 137` is found or not found depending on how wide the window happens to be,
+/// and a resize would silently change the answer. So the match is found in
+/// the value's own line and then *placed* on the wrapped lines that draw it.
+///
+/// Which is why a hit is a piece rather than the whole: a run broken across a
+/// wrap is drawn in two places and is still one match. `nth` says which match
+/// this is a piece of, so the footer can count matches while the renderer
+/// colours fragments, and `n` steps by the first.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Hit {
+    pub nth: usize,
+    pub line: usize,
+    /// Characters, not bytes: it is what the wrap counts and where a span is
+    /// cut, and the two must agree or a highlight lands beside its word.
+    pub start: usize,
+    pub end: usize,
+}
+
+/// The characters of a line, with its styling dropped — what a pattern is
+/// matched against.
+fn plain_text(line: &Line<'_>) -> String {
+    line.spans.iter().map(|span| &*span.content).collect()
+}
+
+/// One match, in the coordinates of the value's own lines.
+struct Match {
+    line: usize,
+    start: usize,
+    end: usize,
+}
+
+/// Every match of `regex` in `source` — the value's own lines — placed on the
+/// `wrapped` lines that draw them, which `origins` maps back.
+///
+/// An empty match is skipped rather than counted. A pattern like `x*` matches
+/// at every position, and a search reporting `1/4212` that never moves has
+/// answered nothing.
+pub fn find(
+    source: &[Line<'static>],
+    wrapped: &[Line<'static>],
+    origins: &[Origin],
+    regex: &Regex,
+) -> Vec<Hit> {
+    let mut found = Vec::new();
+    for (line, text) in source.iter().enumerate() {
+        let text = plain_text(text);
+        // One pass per line converting byte offsets to character ones, rather
+        // than one per match: a line of CJK or emoji would otherwise be walked
+        // from the start again for every hit on it.
+        let mut chars = text.char_indices().enumerate().peekable();
+        let mut char_at = |byte: usize| {
+            while let Some(&(nth, (at, _))) = chars.peek() {
+                if at >= byte {
+                    return nth;
+                }
+                chars.next();
+            }
+            text.chars().count()
+        };
+        for one in regex.find_iter(&text) {
+            if one.start() == one.end() {
+                continue;
+            }
+            found.push(Match {
+                line,
+                start: char_at(one.start()),
+                end: char_at(one.end()),
+            });
+        }
+    }
+    place(&found, wrapped, origins)
+}
+
+/// Cut each match into the pieces of it that fall on wrapped lines.
+///
+/// A match that the wrap broke lands on two lines and keeps one `nth`, so it
+/// is highlighted in both places and counted once.
+fn place(found: &[Match], wrapped: &[Line<'static>], origins: &[Origin]) -> Vec<Hit> {
+    let mut hits = Vec::new();
+    for (nth, one) in found.iter().enumerate() {
+        for (line, origin) in origins.iter().enumerate() {
+            if origin.line != one.line {
+                continue;
+            }
+            // What this wrapped line holds of its source line, as a range of
+            // that source line.
+            let held = line_chars(&wrapped[line]).saturating_sub(origin.indent);
+            let (from, to) = (origin.start, origin.start + held);
+            let (start, end) = (one.start.max(from), one.end.min(to));
+            if start >= end {
+                continue;
+            }
+            hits.push(Hit {
+                nth,
+                line,
+                start: origin.indent + (start - from),
+                end: origin.indent + (end - from),
+            });
+        }
+    }
+    hits
+}
+
+/// How many matches `hits` are pieces of.
+pub fn matches(hits: &[Hit]) -> usize {
+    hits.last().map_or(0, |hit| hit.nth + 1)
+}
+
+/// The wrapped line each match begins on, in order — what `n` steps between.
+/// A match broken by the wrap is one entry, at the line it starts on.
+pub fn match_lines(hits: &[Hit]) -> Vec<usize> {
+    let mut lines: Vec<usize> = Vec::with_capacity(matches(hits));
+    for hit in hits {
+        if hit.nth == lines.len() {
+            lines.push(hit.line);
+        }
+    }
+    lines
+}
+
+/// `line` with the parts of it that matched drawn as matches.
+///
+/// The value's own colouring is kept underneath — a highlight says *this is
+/// what you searched for*, not *this is a different kind of thing* — so only
+/// the background and foreground are replaced and the weight and slant a
+/// document gave a run survive being found.
+fn highlighted(
+    line: &Line<'static>,
+    hits: &[Hit],
+    current: Option<usize>,
+    theme: &Theme,
+) -> Line<'static> {
+    if hits.is_empty() {
+        return line.clone();
+    }
+    let found = Style::new().bg(theme.match_bg).fg(theme.match_fg);
+    let here = Style::new()
+        .bg(theme.cursor_bg)
+        .fg(theme.cursor_fg)
+        .add_modifier(Modifier::BOLD);
+
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(line.spans.len());
+    let mut at = 0;
+    for span in &line.spans {
+        // Cut this span wherever a match starts or ends inside it, and style
+        // each piece by whether it is in one.
+        let mut cuts: Vec<usize> = Vec::new();
+        let end = at + span.content.chars().count();
+        for hit in hits {
+            for edge in [hit.start, hit.end] {
+                if edge > at && edge < end {
+                    cuts.push(edge);
+                }
+            }
+        }
+        cuts.sort_unstable();
+        cuts.dedup();
+
+        let chars: Vec<char> = span.content.chars().collect();
+        let mut from = at;
+        for to in cuts.into_iter().chain(std::iter::once(end)) {
+            let text: String = chars[from - at..to - at].iter().collect();
+            let hit = hits.iter().find(|h| h.start <= from && to <= h.end);
+            let style = match hit {
+                Some(hit) if current == Some(hit.nth) => span.style.patch(here),
+                Some(_) => span.style.patch(found),
+                None => span.style,
+            };
+            spans.push(Span::styled(text, style));
+            from = to;
+        }
+        at = end;
+    }
+    Line::from(spans)
 }
 
 fn leading_spaces(line: &Line<'_>) -> usize {
@@ -262,7 +500,7 @@ fn leading_spaces(line: &Line<'_>) -> usize {
 /// screen, and the table around it is what says where the value came from.
 /// `title` is counted in, so a window is never too narrow to say what it is
 /// showing; a one-word value still gets a border that names its column.
-pub fn window(lines: &[Line<'static>], title: &str, area: Rect) -> (Rect, Vec<Line<'static>>) {
+pub fn window(lines: &[Line<'static>], title: &str, area: Rect) -> Layout {
     let longest = lines.iter().map(line_chars).max().unwrap_or(0);
 
     let widest = fraction(area.width, 9, 10).clamp(MIN_WIDTH.min(area.width), area.width);
@@ -271,10 +509,10 @@ pub fn window(lines: &[Line<'static>], title: &str, area: Rect) -> (Rect, Vec<Li
         .min(widest as usize)
         .max(MIN_WIDTH.min(area.width) as usize) as u16;
 
-    let wrapped = wrap(lines, width.saturating_sub(CHROME));
+    let (lines, origins) = wrapped(lines, width.saturating_sub(CHROME));
 
     let tallest = fraction(area.height, 4, 5).clamp(MIN_HEIGHT.min(area.height), area.height);
-    let height = (wrapped.len() + 2)
+    let height = (lines.len() + 2)
         .min(tallest as usize)
         .max(MIN_HEIGHT.min(area.height) as usize) as u16;
 
@@ -284,7 +522,19 @@ pub fn window(lines: &[Line<'static>], title: &str, area: Rect) -> (Rect, Vec<Li
         width,
         height,
     };
-    (rect, wrapped)
+    Layout {
+        rect,
+        lines,
+        origins,
+    }
+}
+
+/// Where the window sits and what goes in it — one answer, so the renderer,
+/// the scroll clamp and the search cannot disagree about how the value broke.
+pub struct Layout {
+    pub rect: Rect,
+    pub lines: Vec<Line<'static>>,
+    pub origins: Vec<Origin>,
 }
 
 /// `n * num / den`, in wide arithmetic — a terminal is never large enough for
@@ -361,13 +611,23 @@ pub struct CellWindow<'a> {
     /// First display line shown, counted in wrapped lines rather than in the
     /// value's own — what `j` moves is what is on screen.
     pub scroll: usize,
+    /// What the window's own `/` found, in reading order, and which of them
+    /// `n` last landed on. Worked out by the app layer, which is where the
+    /// pattern lives and where `n` moves.
+    pub hits: &'a [Hit],
+    pub current: Option<usize>,
+    /// The pattern itself, for the footer to say what is being stepped
+    /// through — a count with no word beside it does not say what was found.
+    pub pattern: Option<&'a str>,
     pub theme: &'a Theme,
 }
 
 impl Widget for CellWindow<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let ladder = titles(self.name, self.dtype, self.content);
-        let (popup, lines) = window(&self.content.lines, &ladder[0], area);
+        let Layout {
+            rect: popup, lines, ..
+        } = window(&self.content.lines, &ladder[0], area);
         if popup.width == 0 || popup.height == 0 {
             return;
         }
@@ -395,21 +655,56 @@ impl Widget for CellWindow<'_> {
                 self.content.format.label().unwrap_or("formatted")
             ),
         };
+        // What `/` found, said in the footer beside the position: which match
+        // of how many, and the pattern they are matches of. A bare `3/12`
+        // says how far through something the reader is without saying through
+        // what — and by the time it matters they have scrolled away from the
+        // prompt they typed it at.
+        //
+        // A pattern with nothing to show says so. Falling silent would leave
+        // "found nothing" and "never searched" looking the same, and the
+        // second is the one the reader will assume.
+        let found = match (self.pattern, matches(self.hits)) {
+            (None, _) => String::new(),
+            (Some(pattern), 0) => format!("   /{pattern} none"),
+            (Some(pattern), total) => format!(
+                "   /{pattern} {}/{total}",
+                self.current.map_or(0, |at| at + 1)
+            ),
+        };
+        // `n/N` is offered only where there is more than one match to step
+        // between, for the reason a lone sort key is drawn without its
+        // priority number: a next among one thing is the thing you are on.
+        let steps = if matches(self.hits) > 1 { " n/N" } else { "" };
         let footer = if lines.len() > rows {
             let (first, last, total) = (scroll + 1, (scroll + rows).min(lines.len()), lines.len());
             fitting(
                 &[
-                    format!(" {first}–{last} of {total}   j/k ^d/^u g/G{switch}   q close "),
-                    format!(" {first}–{last} of {total}   j/k{switch}   q close "),
+                    format!(
+                        " {first}–{last} of {total}{found}   j/k ^d/^u g/G   /{steps}{switch}   q close "
+                    ),
+                    format!(
+                        " {first}–{last} of {total}{found}   j/k   /{steps}{switch}   q close "
+                    ),
+                    format!(" {first}–{last} of {total}{found}   j/k   /   q close "),
+                    format!(" {first}–{last} of {total}{found} "),
                     format!(" {first}–{last} of {total} "),
                 ],
                 popup.width.saturating_sub(2),
             )
         } else {
+            // Nothing to scroll, so `/` is the only movement there is — and
+            // still worth offering, since a value that fits the window can
+            // still be one nobody wants to read all of.
+            let said = match found.trim_start() {
+                "" => String::new(),
+                text => format!("{text}   "),
+            };
             fitting(
                 &[
-                    format!(" {}   q close ", switch.trim_start()),
-                    " q close ".to_string(),
+                    format!(" {said}/{steps}{switch}   q close "),
+                    format!(" {said}/   q close "),
+                    " /   q close ".to_string(),
                     " q ".to_string(),
                 ],
                 popup.width.saturating_sub(2),
@@ -456,7 +751,25 @@ impl Widget for CellWindow<'_> {
             return;
         }
 
-        let shown: Vec<Line> = lines.into_iter().skip(scroll).take(rows).collect();
+        // Only the lines on screen are highlighted: the hits are already
+        // known for the whole value, and restyling the ones nobody is looking
+        // at would be paying for the document on every keypress, which is the
+        // cost `Content` exists to have paid once.
+        let shown: Vec<Line> = lines
+            .into_iter()
+            .enumerate()
+            .skip(scroll)
+            .take(rows)
+            .map(|(nth, line)| {
+                let on_line: Vec<Hit> = self
+                    .hits
+                    .iter()
+                    .copied()
+                    .filter(|hit| hit.line == nth)
+                    .collect();
+                highlighted(&line, &on_line, self.current, self.theme)
+            })
+            .collect();
         Paragraph::new(shown).render(text, buf);
     }
 }
@@ -489,12 +802,214 @@ mod tests {
             dtype: "str",
             content,
             scroll,
+            hits: &[],
+            current: None,
+            pattern: None,
             theme: &theme,
         }
         .render(area, &mut buf);
         (0..area.height)
             .map(|y| (0..area.width).map(|x| buf[(x, y)].symbol()).collect())
             .collect()
+    }
+
+    // ── Search ───────────────────────────────────────────────────────────
+
+    fn hits_in(value: &str, pattern: &str, width: u16) -> Vec<Hit> {
+        let content = content(value);
+        let (lines, origins) = wrapped(&content.lines, width);
+        find(
+            &content.lines,
+            &lines,
+            &origins,
+            &Regex::new(pattern).unwrap(),
+        )
+    }
+
+    #[test]
+    fn a_match_is_found_where_the_wrap_put_it() {
+        let hits = hits_in("alpha beta gamma delta", "delta", 12);
+        assert_eq!(hits.len(), 1);
+        // Not line 0: the value wrapped, and a match is a place on screen.
+        assert!(hits[0].line > 0, "{hits:?}");
+    }
+
+    #[test]
+    fn every_match_is_found_in_reading_order() {
+        let hits = hits_in("one two one two one", "one", 80);
+        assert_eq!(hits.len(), 3);
+        assert!(hits.windows(2).all(|w| w[0].start < w[1].start));
+    }
+
+    /// `x*` matches at every position between characters. Counting those
+    /// would report hundreds of matches that `n` cannot move between.
+    #[test]
+    fn an_empty_match_is_not_a_match() {
+        assert!(hits_in("abc", "x*", 80).is_empty());
+    }
+
+    /// The offsets are what the highlight is cut at, so they have to be in
+    /// the same units the spans are counted in.
+    #[test]
+    fn offsets_are_characters_and_not_bytes() {
+        let hits = hits_in("café note", "note", 80);
+        assert_eq!(hits.len(), 1);
+        assert_eq!((hits[0].start, hits[0].end), (5, 9));
+    }
+
+    /// **The width must not change the answer.** The pattern is matched
+    /// against the value, so a run the wrap broke is still found — drawn in
+    /// two pieces, counted as one match. Searching the screen instead would
+    /// mean a resize silently turned a match into nothing.
+    #[test]
+    fn a_match_broken_by_the_wrap_is_still_one_match() {
+        // Wrapped at 12, "gamma" cannot share a line with "alpha beta".
+        let narrow = hits_in("alpha beta gamma", "beta gamma", 12);
+        let wide = hits_in("alpha beta gamma", "beta gamma", 80);
+        assert_eq!(matches(&narrow), 1, "found across the break: {narrow:?}");
+        assert_eq!(matches(&wide), 1);
+        assert_eq!(narrow.len(), 2, "and drawn in both places");
+        assert_eq!(wide.len(), 1);
+        assert!(narrow.iter().all(|hit| hit.nth == 0));
+    }
+
+    /// The same pattern over the same value finds the same number of matches
+    /// however the window is sized. This is the property the whole placement
+    /// dance exists for.
+    #[test]
+    fn the_window_width_does_not_change_what_was_found() {
+        let value: String = (1..=60).map(|n| format!("line {n}. ")).collect();
+        let at = |width| matches(&hits_in(&value, "line 1[0-9]", width));
+        let wide = at(200);
+        assert_eq!(wide, 10, "line 10 through line 19");
+        for width in [14, 20, 33, 47, 80, 120] {
+            assert_eq!(at(width), wide, "at width {width}");
+        }
+    }
+
+    /// A hanging indent is plv's own, so it must not be counted as characters
+    /// of the value — a highlight would land that many columns to the left.
+    #[test]
+    fn a_hanging_indent_does_not_shift_the_highlight() {
+        let value = "    keep alpha beta gamma delta epsilon";
+        let hits = hits_in(value, "epsilon", 20);
+        assert_eq!(matches(&hits), 1);
+        let content = content(value);
+        let (lines, _) = wrapped(&content.lines, 20);
+        let hit = hits[0];
+        let drawn: String = text(&lines)[hit.line].chars().collect();
+        let at: String = drawn
+            .chars()
+            .skip(hit.start)
+            .take(hit.end - hit.start)
+            .collect();
+        assert_eq!(at, "epsilon", "in {drawn:?}");
+    }
+
+    #[test]
+    fn a_match_is_drawn_in_the_match_colours() {
+        let theme = Theme::catppuccin_mocha();
+        let content = content("alpha beta gamma");
+        let area = Rect::new(0, 0, 40, 8);
+        let hits = hits_in("alpha beta gamma", "beta", 36);
+        let mut buf = Buffer::empty(area);
+        CellWindow {
+            name: "note",
+            dtype: "str",
+            content: &content,
+            scroll: 0,
+            hits: &hits,
+            current: Some(0),
+            pattern: Some("beta"),
+            theme: &theme,
+        }
+        .render(area, &mut buf);
+
+        let found = (0..area.height).any(|y| {
+            (0..area.width).any(|x| {
+                buf[(x, y)].symbol() == "b" && buf[(x, y)].style().bg == Some(theme.cursor_bg)
+            })
+        });
+        assert!(found, "the current match is drawn as the current match");
+    }
+
+    /// The window's own colouring is what a document *is*; a highlight says
+    /// only that this is what was asked for. Losing the first to show the
+    /// second would make a found key stop looking like a key.
+    #[test]
+    fn a_highlight_keeps_the_styling_underneath_it() {
+        let theme = Theme::catppuccin_mocha();
+        let styled = Line::from(vec![Span::styled(
+            "deploy".to_string(),
+            Style::new().add_modifier(Modifier::BOLD),
+        )]);
+        let source = std::slice::from_ref(&styled);
+        let (lines, origins) = wrapped(source, 40);
+        let hits = find(source, &lines, &origins, &Regex::new("epl").unwrap());
+        let out = highlighted(&lines[0], &hits, Some(0), &theme);
+
+        let inside = out
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == "epl")
+            .expect("the match is a span of its own");
+        assert!(inside.style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(inside.style.bg, Some(theme.cursor_bg));
+    }
+
+    #[test]
+    fn the_footer_says_which_match_of_how_many() {
+        let theme = Theme::catppuccin_mocha();
+        let content = content("one two one two one");
+        let area = Rect::new(0, 0, 60, 8);
+        let hits = hits_in("one two one two one", "one", 56);
+        let mut buf = Buffer::empty(area);
+        CellWindow {
+            name: "note",
+            dtype: "str",
+            content: &content,
+            scroll: 0,
+            hits: &hits,
+            current: Some(1),
+            pattern: Some("one"),
+            theme: &theme,
+        }
+        .render(area, &mut buf);
+        let drawn: Vec<String> = (0..area.height)
+            .map(|y| (0..area.width).map(|x| buf[(x, y)].symbol()).collect())
+            .collect();
+        assert!(
+            drawn.iter().any(|line| line.contains("/one 2/3")),
+            "{drawn:#?}"
+        );
+    }
+
+    /// "Found nothing" and "never searched" must not look the same, or the
+    /// reader will read the first as the second and go on scrolling.
+    #[test]
+    fn a_pattern_that_matched_nothing_says_so() {
+        let theme = Theme::catppuccin_mocha();
+        let content = content("alpha beta");
+        let area = Rect::new(0, 0, 60, 8);
+        let mut buf = Buffer::empty(area);
+        CellWindow {
+            name: "note",
+            dtype: "str",
+            content: &content,
+            scroll: 0,
+            hits: &[],
+            current: None,
+            pattern: Some("zeta"),
+            theme: &theme,
+        }
+        .render(area, &mut buf);
+        let drawn: Vec<String> = (0..area.height)
+            .map(|y| (0..area.width).map(|x| buf[(x, y)].symbol()).collect())
+            .collect();
+        assert!(
+            drawn.iter().any(|line| line.contains("/zeta none")),
+            "{drawn:#?}"
+        );
     }
 
     #[test]
@@ -561,11 +1076,13 @@ mod tests {
     #[test]
     fn the_window_sizes_to_the_value_but_not_past_the_screen() {
         let area = Rect::new(0, 0, 80, 24);
-        let (small, _) = window(&plain("short"), " note ", area);
+        let Layout { rect: small, .. } = window(&plain("short"), " note ", area);
         assert_eq!(small.width, MIN_WIDTH, "a short value still gets a window");
         assert_eq!(small.height, MIN_HEIGHT);
 
-        let (big, lines) = window(&plain(&"x".repeat(10_000)), " note ", area);
+        let Layout {
+            rect: big, lines, ..
+        } = window(&plain(&"x".repeat(10_000)), " note ", area);
         assert!(big.width <= 72, "nine tenths of the width at most: {big:?}");
         assert!(big.height <= 19, "four fifths of the height: {big:?}");
         assert!(lines.len() > text_rows(big), "so it has to scroll");
@@ -577,7 +1094,7 @@ mod tests {
     fn the_window_is_never_narrower_than_what_it_has_to_say() {
         let content = content("hi");
         let title = title("a-long-column-name", "str", &content);
-        let (popup, _) = window(&content.lines, &title, Rect::new(0, 0, 80, 24));
+        let Layout { rect: popup, .. } = window(&content.lines, &title, Rect::new(0, 0, 80, 24));
         assert!(
             popup.width as usize >= title.chars().count() + 2,
             "{popup:?} for {title:?}"
@@ -587,7 +1104,7 @@ mod tests {
     #[test]
     fn the_window_is_centred() {
         let area = Rect::new(0, 0, 80, 24);
-        let (popup, _) = window(&plain("hello"), " note ", area);
+        let Layout { rect: popup, .. } = window(&plain("hello"), " note ", area);
         assert_eq!(popup.x, (area.width - popup.width) / 2);
         assert_eq!(popup.y, (area.height - popup.height) / 2);
     }
@@ -595,7 +1112,8 @@ mod tests {
     #[test]
     fn a_terminal_smaller_than_the_window_is_not_overflowed() {
         let area = Rect::new(0, 0, 10, 3);
-        let (popup, _) = window(&plain("a value that will not fit"), " note ", area);
+        let Layout { rect: popup, .. } =
+            window(&plain("a value that will not fit"), " note ", area);
         assert!(
             popup.width <= area.width && popup.height <= area.height,
             "{popup:?}"
@@ -637,7 +1155,9 @@ mod tests {
         let value: String = (1..=40).map(|n| format!("line{n}\n")).collect();
         let content = content(&value);
         let area = Rect::new(0, 0, 60, 14);
-        let (popup, lines) = window(&content.lines, &title("note", "str", &content), area);
+        let Layout {
+            rect: popup, lines, ..
+        } = window(&content.lines, &title("note", "str", &content), area);
         let rows = text_rows(popup);
         let bottom = (popup.y + popup.height - 1) as usize;
 
@@ -776,6 +1296,9 @@ mod tests {
             dtype: "str",
             content: &content("## Deploy\n- a\n- b"),
             scroll: 0,
+            hits: &[],
+            current: None,
+            pattern: None,
             theme: &theme,
         }
         .render(area, &mut buf);

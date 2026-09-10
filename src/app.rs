@@ -27,6 +27,7 @@ use crate::ui::{
 };
 use crate::view;
 use polars::prelude::DataType;
+use regex::Regex;
 
 enum AppMode {
     Normal,
@@ -131,6 +132,82 @@ struct Inspect {
     /// it while it is held: the cursor cannot move while the window is up, so
     /// the cell under it is fixed.
     content: ui::cell::Content,
+    /// What the window's own `/` is looking for, if anything.
+    hunt: Option<Hunt>,
+}
+
+/// A search inside the cell window.
+///
+/// **Its own, not the table's.** `/` out there moves the cursor between rows
+/// and leaves a state the status bar reports; borrowing it would mean closing
+/// the window changed which row you were on, and stepping off the end of a
+/// value would walk into the file. The two searches never meet: this one is
+/// created when the window opens a pattern and dies with the window.
+///
+/// The hits are counted in **wrapped** lines, so they are found where `draw`
+/// is — the only place that knows how the value broke — and stored back here
+/// for `n` and `N` to step through, exactly as the scroll's clamp is. The
+/// wrap depends on the width, so `at` records the width and the view they
+/// were found under, and they are looked for again when either changes.
+struct Hunt {
+    pattern: String,
+    regex: Regex,
+    /// The pieces of every match, for the renderer to colour. A run the wrap
+    /// broke is two pieces and one match.
+    hits: Vec<ui::cell::Hit>,
+    /// The line each match begins on — what `n` steps between, so a match
+    /// drawn in two places is stepped to once.
+    starts: Vec<usize>,
+    /// Which match `n` last landed on. `None` until the first frame has found
+    /// them, and where the pattern matched nothing.
+    current: Option<usize>,
+    /// `(width, raw)` the hits were found under, or `None` while they still
+    /// have to be. `r` changes the lines themselves, so it invalidates them
+    /// as surely as a resize does.
+    at: Option<(u16, bool)>,
+}
+
+impl Hunt {
+    fn new(pattern: String, regex: Regex) -> Self {
+        Self {
+            pattern,
+            regex,
+            hits: Vec::new(),
+            starts: Vec::new(),
+            current: None,
+            at: None,
+        }
+    }
+
+    /// Step to the next match, or the previous one, wrapping at either end.
+    /// Answers the line to put on screen.
+    ///
+    /// Which match it steps *from* depends on where the reader is looking.
+    /// While the one they are on is still on screen, `n` means the one after
+    /// it — the ordinary reading. Once they have scrolled away from it, `n`
+    /// means the next one from **here**, because the match they were on is no
+    /// longer where they are, and being sent back up the value to resume from
+    /// somewhere off screen is the surprising answer. It is `/`'s rule out in
+    /// the table, where the cursor plays the part the viewport plays here.
+    fn step(&mut self, top: usize, rows: usize, forward: bool) -> Option<usize> {
+        let total = self.starts.len();
+        if total == 0 {
+            return None;
+        }
+        let showing = |line: usize| line >= top && line < top + rows;
+        let at = match self.current.filter(|&at| showing(self.starts[at])) {
+            Some(at) if forward => (at + 1) % total,
+            Some(at) => (at + total - 1) % total,
+            None if forward => self.starts.partition_point(|&line| line < top) % total,
+            None => self
+                .starts
+                .iter()
+                .rposition(|&line| line < top)
+                .unwrap_or(total - 1),
+        };
+        self.current = Some(at);
+        Some(self.starts[at])
+    }
 }
 
 /// Which screen is in front: the lake catalog browser, or the data viewer.
@@ -653,8 +730,42 @@ impl App {
             return;
         };
         let title = ui::cell::title(&name, &dtype, &inspect.content);
-        let (popup, lines) = ui::cell::window(&inspect.content.lines, &title, area);
+        let layout = ui::cell::window(&inspect.content.lines, &title, area);
+        let (popup, lines) = (layout.rect, &layout.lines);
         let rows = ui::cell::text_rows(popup);
+
+        // The hits are found here for the reason the scroll is clamped here:
+        // this is the one place that knows how the value wrapped, and a match
+        // is a position in what is drawn. Found again only when the width or
+        // the view changed under them — otherwise a `j` would re-run the
+        // pattern over the whole document, which is the cost `Content` exists
+        // to have paid once.
+        let under = (popup.width, inspect.content.raw);
+        if let Some(inspect) = &mut self.inspect
+            && let Some(hunt) = &mut inspect.hunt
+            && hunt.at != Some(under)
+        {
+            hunt.hits = ui::cell::find(
+                &inspect.content.lines,
+                &layout.lines,
+                &layout.origins,
+                &hunt.regex,
+            );
+            hunt.starts = ui::cell::match_lines(&hunt.hits);
+            hunt.at = Some(under);
+            // A rewrap moves every line, so the hit `n` was on is not the one
+            // it was: land on the first from where the reader is rather than
+            // on a number that now points somewhere else.
+            hunt.current = None;
+            let top = inspect.scroll;
+            if let Some(line) = hunt.step(top, rows, true) {
+                inspect.scroll = line.saturating_sub(rows / 3);
+            }
+        }
+
+        let Some(inspect) = &self.inspect else {
+            return;
+        };
         let scroll = inspect.scroll.min(ui::cell::max_scroll(lines.len(), rows));
 
         if let Some(inspect) = &mut self.inspect {
@@ -665,12 +776,23 @@ impl App {
         let Some(inspect) = &self.inspect else {
             return;
         };
+        let (hits, current, pattern) = match &inspect.hunt {
+            Some(hunt) => (
+                hunt.hits.as_slice(),
+                hunt.current,
+                Some(hunt.pattern.as_str()),
+            ),
+            None => ([].as_slice(), None, None),
+        };
         frame.render_widget(
             CellWindow {
                 name: &name,
                 dtype: &dtype,
                 content: &inspect.content,
                 scroll,
+                hits,
+                current,
+                pattern,
                 theme: &self.theme,
             },
             area,
@@ -826,6 +948,9 @@ impl App {
             ("Ctrl+d / Ctrl+u", "Half a window"),
             ("Ctrl+f / Ctrl+b", "A whole window"),
             ("g / G", "First / last line"),
+            ("/", "Find in this value (regex)"),
+            ("n / N", "Next / previous match"),
+            ("", "Its own search: the table's is left alone"),
             ("r", "Raw ↔ formatted, where a format was recognised"),
             ("q / Esc / K", "Close"),
         ];
@@ -1369,6 +1494,21 @@ impl App {
             KeyCode::Enter => {
                 let raw = std::mem::take(&mut self.search_buf);
                 self.mode = AppMode::Normal;
+                // With the window up the pattern is for the value in it, not
+                // for the file: the window holds every key, so `/` reached
+                // here through it, and a search that moved the cursor
+                // underneath would change the row the window is showing.
+                if let Some(inspect) = &mut self.inspect {
+                    if raw.is_empty() {
+                        inspect.hunt = None;
+                        return Ok(());
+                    }
+                    match Regex::new(&raw) {
+                        Err(e) => self.message = Some(format!("Bad regex: {e}")),
+                        Ok(regex) => inspect.hunt = Some(Hunt::new(raw, regex)),
+                    }
+                    return Ok(());
+                }
                 if raw.is_empty() {
                     self.search_state = None;
                     self.search_rx = None;
@@ -1436,6 +1576,31 @@ impl App {
             KeyCode::Char('g') | KeyCode::Home => inspect.scroll = 0,
             KeyCode::Char('G') | KeyCode::End => inspect.scroll = usize::MAX,
             KeyCode::Char('q') | KeyCode::Char('K') | KeyCode::Esc => self.inspect = None,
+            // The window's own search. It borrows the `:`/`/` line's mode and
+            // buffer — one prompt, one place that draws it — and
+            // `handle_search_key` looks at whether the window is up to decide
+            // which of the two searches the pattern is for.
+            KeyCode::Char('/') if !ctrl => {
+                self.search_buf.clear();
+                self.mode = AppMode::Search;
+            }
+            // Stepping is counted from the top line on screen and not from
+            // the last hit, so scrolling away by hand and pressing `n` goes on
+            // from where the reader is looking.
+            KeyCode::Char('n') | KeyCode::Char('N') if !ctrl => {
+                let forward = key.code == KeyCode::Char('n');
+                let top = inspect.scroll;
+                let rows = inspect.rows.max(1);
+                if let Some(hunt) = &mut inspect.hunt
+                    && let Some(line) = hunt.step(top, rows, forward)
+                {
+                    // The hit is put a third of the way down rather than at
+                    // the very top: a match with nothing above it has lost
+                    // the run-up that says what it is part of. `zt` and `zz`
+                    // are the same argument, settled the same way.
+                    inspect.scroll = line.saturating_sub(rows / 3);
+                }
+            }
             // Back and forth between the bytes and what plv made of them. The
             // formatted view is an interpretation, and the raw value is the
             // one that gets edited and written, so it has to be reachable.
@@ -1708,6 +1873,7 @@ impl App {
                         scroll: 0,
                         rows: 0,
                         content: ui::cell::Content::new(&value, false, &self.theme),
+                        hunt: None,
                     });
                 }
             }
@@ -5284,6 +5450,211 @@ mod tests {
 
         press(&mut app, 'q');
         assert_eq!(drawn(&mut app, 60, 16), plain, "and the table is back");
+    }
+
+    /// `/` in the window searches the value, and the pattern is typed at the
+    /// same prompt every other search uses.
+    #[test]
+    fn slash_finds_inside_the_value() {
+        let mut app = windowed("cellfind.csv");
+        press(&mut app, 'K');
+        drawn(&mut app, 60, 16);
+
+        press(&mut app, '/');
+        assert!(
+            matches!(app.mode, AppMode::Search),
+            "the prompt is the same prompt"
+        );
+        typed(&mut app, "line 137");
+        key(&mut app, KeyCode::Enter);
+        assert!(matches!(app.mode, AppMode::Normal));
+
+        // The hits are found where the wrap is known, so a frame has to have
+        // been drawn before there are any.
+        drawn(&mut app, 60, 16);
+        let hunt = app.inspect.as_ref().unwrap().hunt.as_ref().unwrap();
+        assert_eq!(hunt.hits.len(), 1);
+        assert_eq!(hunt.current, Some(0));
+        assert!(
+            app.inspect.as_ref().unwrap().scroll > 0,
+            "and the window went to it"
+        );
+    }
+
+    /// The two searches are separate on purpose: the table's moves the cursor
+    /// between rows, and borrowing it would mean closing the window changed
+    /// which row you were on.
+    #[test]
+    fn the_windows_search_leaves_the_tables_alone() {
+        let mut app = windowed("cellfind2.csv");
+        let row = app.cursor_row;
+        press(&mut app, 'K');
+        drawn(&mut app, 60, 16);
+        press(&mut app, '/');
+        typed(&mut app, "line 3");
+        key(&mut app, KeyCode::Enter);
+        drawn(&mut app, 60, 16);
+
+        assert!(app.search_state.is_none(), "the table was not searched");
+        assert_eq!(app.cursor_row, row, "and did not move");
+        assert!(app.inspect.as_ref().unwrap().hunt.is_some());
+    }
+
+    #[test]
+    fn n_and_shift_n_step_through_the_matches() {
+        let mut app = windowed("cellstep.csv");
+        press(&mut app, 'K');
+        drawn(&mut app, 60, 16);
+        press(&mut app, '/');
+        typed(&mut app, "line 1[0-9][0-9]");
+        key(&mut app, KeyCode::Enter);
+        drawn(&mut app, 60, 16);
+
+        let hunt = app.inspect.as_ref().unwrap().hunt.as_ref().unwrap();
+        assert_eq!(hunt.starts.len(), 100, "line 100 through line 199");
+        // The window is 60 wide, so some of those runs are broken by the
+        // wrap: more pieces are drawn than there are matches to step between.
+        assert!(
+            hunt.hits.len() > hunt.starts.len(),
+            "{} pieces for {} matches",
+            hunt.hits.len(),
+            hunt.starts.len()
+        );
+
+        let first = app.inspect.as_ref().unwrap().scroll;
+        press(&mut app, 'n');
+        drawn(&mut app, 60, 16);
+        let second = app.inspect.as_ref().unwrap().scroll;
+        assert!(second > first, "n went forward: {first} -> {second}");
+
+        press(&mut app, 'N');
+        drawn(&mut app, 60, 16);
+        assert_eq!(
+            app.inspect.as_ref().unwrap().scroll,
+            first,
+            "and N came back"
+        );
+    }
+
+    /// While the match you are on is on screen, `n` is the one after it. Once
+    /// you have scrolled away, `n` is the next one from where you are looking
+    /// — being sent back up the value to resume from off screen is the
+    /// surprising answer.
+    #[test]
+    fn n_goes_on_from_where_the_reader_is_looking() {
+        let mut app = windowed("cellresume.csv");
+        press(&mut app, 'K');
+        drawn(&mut app, 60, 16);
+        press(&mut app, '/');
+        typed(&mut app, "line 1[0-9][0-9]");
+        key(&mut app, KeyCode::Enter);
+        drawn(&mut app, 60, 16);
+        let first = app.inspect.as_ref().unwrap().hunt.as_ref().unwrap().current;
+        assert_eq!(first, Some(0));
+
+        // Scroll a long way past it by hand, then step.
+        press(&mut app, 'G');
+        drawn(&mut app, 60, 16);
+        press(&mut app, 'n');
+        drawn(&mut app, 60, 16);
+        let after = app.inspect.as_ref().unwrap().hunt.as_ref().unwrap();
+        assert!(
+            after.current.unwrap() > 50,
+            "resumed from the end, not from match 1: {:?}",
+            after.current
+        );
+    }
+
+    /// Closing the window takes the search with it. It was a search of one
+    /// value, and there is no value any more.
+    #[test]
+    fn closing_the_window_ends_its_search() {
+        let mut app = windowed("cellend.csv");
+        press(&mut app, 'K');
+        drawn(&mut app, 60, 16);
+        press(&mut app, '/');
+        typed(&mut app, "line 2");
+        key(&mut app, KeyCode::Enter);
+        drawn(&mut app, 60, 16);
+        assert!(app.inspect.as_ref().unwrap().hunt.is_some());
+
+        press(&mut app, 'q');
+        press(&mut app, 'K');
+        drawn(&mut app, 60, 16);
+        assert!(
+            app.inspect.as_ref().unwrap().hunt.is_none(),
+            "a new window opens with no search"
+        );
+    }
+
+    /// An empty pattern clears the search, which is what `/` then Enter does
+    /// out in the table too.
+    #[test]
+    fn an_empty_pattern_clears_the_search() {
+        let mut app = windowed("cellclear.csv");
+        press(&mut app, 'K');
+        drawn(&mut app, 60, 16);
+        press(&mut app, '/');
+        typed(&mut app, "line 2");
+        key(&mut app, KeyCode::Enter);
+        drawn(&mut app, 60, 16);
+
+        press(&mut app, '/');
+        key(&mut app, KeyCode::Enter);
+        assert!(app.inspect.as_ref().unwrap().hunt.is_none());
+    }
+
+    #[test]
+    fn a_bad_pattern_is_reported_rather_than_swallowed() {
+        let mut app = windowed("cellbad.csv");
+        press(&mut app, 'K');
+        drawn(&mut app, 60, 16);
+        press(&mut app, '/');
+        typed(&mut app, "line [");
+        key(&mut app, KeyCode::Enter);
+
+        assert!(app.inspect.as_ref().unwrap().hunt.is_none());
+        assert!(
+            app.message.as_deref().unwrap_or_default().contains("regex"),
+            "{:?}",
+            app.message
+        );
+    }
+
+    /// `r` rebuilds the lines, so the hits describing the old ones are found
+    /// again rather than left pointing at rows that moved.
+    #[test]
+    fn switching_the_view_finds_the_matches_again() {
+        let json = r#"{""alpha"":4821,""beta"":[""a"",""b""]}"#;
+        let file = format!("id,note\n1,\"{json}\"\n");
+        let mut app = app_sized("cellrefind.csv", &file, 80);
+        cell_mode(&mut app);
+        press(&mut app, 'l');
+        press(&mut app, 'K');
+        drawn(&mut app, 80, 20);
+        press(&mut app, '/');
+        typed(&mut app, "beta");
+        key(&mut app, KeyCode::Enter);
+        drawn(&mut app, 80, 20);
+        let formatted = app
+            .inspect
+            .as_ref()
+            .unwrap()
+            .hunt
+            .as_ref()
+            .unwrap()
+            .hits
+            .clone();
+        assert_eq!(formatted.len(), 1);
+
+        press(&mut app, 'r');
+        drawn(&mut app, 80, 20);
+        let raw = app.inspect.as_ref().unwrap().hunt.as_ref().unwrap();
+        assert_eq!(raw.hits.len(), 1, "still found in the bytes");
+        assert!(
+            raw.at.is_some(),
+            "and found again under the view it is now in"
+        );
     }
 
     /// A JSON cell is shown as a document, and `r` gets back to the bytes.
