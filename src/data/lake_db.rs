@@ -104,6 +104,12 @@ impl LakeSource {
     }
 
     /// `SELECT * FROM …` with an optional ORDER BY, ready for LIMIT/OFFSET.
+    ///
+    /// A `VARCHAR` column is ordered by DuckDB's collation and not by
+    /// [`crate::data::natural`], which is a deliberate stop rather than an
+    /// oversight: a lake table is sorted by the database, page by page,
+    /// because it is the one source too large to hold — and a key plv
+    /// computes in memory is exactly what that path exists to avoid.
     fn ordered(&self, sort: &[(String, bool)]) -> String {
         let mut sql = format!("SELECT * FROM {}", self.relation());
         if !sort.is_empty() {

@@ -13,6 +13,7 @@ use crate::data::index::{self, RowIndex};
 use crate::data::jsonl;
 use crate::data::lake_db::{self, LakeSource};
 use crate::data::loader;
+use crate::data::natural;
 use crate::data::rows::{self, RowSet};
 use crate::data::writer::{self, Stamp};
 use crate::view::View;
@@ -20,6 +21,11 @@ use crate::view::View;
 /// The column a materialised sort carries to remember where each row came
 /// from in the file. Added before the sort, so it records the file's order.
 const SOURCE_ROW: &str = "__src__";
+
+/// Prefix of the throwaway columns a natural sort orders text by. They live
+/// between one `hstack` and one `drop_many` inside [`sort_naturally`] and are
+/// never in a frame anything else can see.
+const NATURAL_KEY: &str = "__nat__";
 
 /// A sorted frame is kept in memory, so there has to be a point past which it
 /// is not — and past which plv declines to sort at all. The size of that point
@@ -579,6 +585,15 @@ impl Store {
 
         let keys = self.sort_keys();
         if !keys.is_empty() {
+            // Byte order, where the held frame [`sort_naturally`] builds uses
+            // a natural one — the key it sorts by cannot be written as an
+            // expression, so there is nothing to put in a lazy plan. This
+            // path only ever draws the window between a sort being asked for
+            // and the frame arriving, which is already provisional: it
+            // carries no `__src__`, so `edit_blocked` answers "still sorting"
+            // for it, and a JSONL file spends the same window in the file's
+            // own order. Two orders that are both replaced by the same third
+            // one is a flicker; a page that stayed this way would be a bug.
             let (names, descending): (Vec<String>, Vec<bool>) =
                 keys.into_iter().map(|(name, asc)| (name, !asc)).unzip();
             lf = lf.sort(
@@ -969,26 +984,20 @@ impl Store {
     /// The row index goes on *before* the filter, so it records where each
     /// row came from rather than where it survived to; the filter goes on
     /// before the sort, matching the order the view language documents.
+    /// The sort itself is done here rather than in the lazy plan, because a
+    /// text column is ordered by [`natural::key`] and there is no way to say
+    /// that in an expression — the key is built over the collected column and
+    /// dropped again on the way out.
     fn materialise(
         base: LazyFrame,
         keys: &[(String, bool)],
         predicate: Option<Expr>,
     ) -> Result<DataFrame> {
-        let (names, descending): (Vec<String>, Vec<bool>) = keys
-            .iter()
-            .cloned()
-            .map(|(name, ascending)| (name, !ascending))
-            .unzip();
         let mut lf = base.with_row_index(SOURCE_ROW, None);
         if let Some(predicate) = predicate {
             lf = lf.filter(predicate);
         }
-        Ok(lf
-            .sort(
-                names,
-                SortMultipleOptions::default().with_order_descending_multi(descending),
-            )
-            .collect()?)
+        sort_naturally(lf.collect()?, keys)
     }
 
     /// Take the result of a sort.
@@ -1960,6 +1969,63 @@ fn sort_fits(rows: usize, columns: usize) -> bool {
     rows.saturating_mul(columns) <= budget::sort_cells()
 }
 
+/// Sort a collected frame by `keys`, ordering text columns by
+/// [`natural::key`] rather than byte by byte.
+///
+/// **The key is a column, not an expression**, because Polars' Rust lazy API
+/// has no way to say "order by this function of the value": the digit-run
+/// key cannot be written with the string expressions it does have. So the
+/// frame is collected first — which a held sort does anyway — the key built
+/// beside the column it orders, and dropped again before the frame is
+/// returned. Nothing above this ever sees it, and the value in the cell is
+/// untouched: this decides an order, not a type.
+///
+/// A key column is built only where it would change something, which
+/// [`natural::worth_keying`] answers in one pass without allocating. A
+/// column of dates, hashes or ids sorts the way it always did and pays for
+/// nothing.
+fn sort_naturally(df: DataFrame, keys: &[(String, bool)]) -> Result<DataFrame> {
+    let mut by: Vec<PlSmallStr> = Vec::with_capacity(keys.len());
+    let mut descending: Vec<bool> = Vec::with_capacity(keys.len());
+    let mut added: Vec<Column> = Vec::new();
+
+    for (nth, (name, ascending)) in keys.iter().enumerate() {
+        descending.push(!ascending);
+        let column = df.column(name.as_str())?;
+        // Only text has an order that byte comparison can get wrong. A
+        // numeric column is already ordered by what it counts.
+        let Ok(text) = column.str() else {
+            by.push(name.as_str().into());
+            continue;
+        };
+        if !natural::worth_keying(text.iter().flatten()) {
+            by.push(name.as_str().into());
+            continue;
+        }
+        // Keyed by position among the sort keys, so two keys on the same
+        // column — which the grammar allows — cannot collide.
+        let key_name = PlSmallStr::from(format!("{NATURAL_KEY}{nth}"));
+        by.push(key_name.clone());
+        added.push(
+            text.apply_values(|value| natural::key(value).into())
+                .into_series()
+                .with_name(key_name)
+                .into_column(),
+        );
+    }
+
+    let options = SortMultipleOptions::default().with_order_descending_multi(descending);
+    let names: Vec<&str> = by.iter().map(PlSmallStr::as_str).collect();
+    if added.is_empty() {
+        return Ok(df.sort(names, options)?);
+    }
+    // `hstack` appends, so dropping the keys again leaves the columns in the
+    // order they arrived in — which is the order the whole layer above
+    // counts positions in.
+    let sorted = df.hstack(&added)?.sort(names, options)?;
+    Ok(sorted.drop_many(added.iter().map(|column| column.name().clone())))
+}
+
 /// A column rendered as text and matched against a pattern — how `/` search
 /// reads every column, and how `~` reads one.
 fn matches_pattern(column: &str, pattern: &str) -> Expr {
@@ -2426,6 +2492,50 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(30))
             .expect("the sort produced a frame");
         store.adopt_sorted(df).unwrap();
+    }
+
+    /// The whole point, end to end: a text column of percentages comes out
+    /// in the order the percentages are in, not the order their first
+    /// characters are in.
+    #[test]
+    fn a_text_column_sorts_by_the_numbers_written_in_it() {
+        let path = write_temp(
+            "natural-sort.csv",
+            "album,share\na,100%\nb,9%\nc,0%\nd,23%\ne,\n",
+        );
+        let mut store = Store::open_file(&path, 10).unwrap();
+        sorted_by(&mut store, 1); // `share`
+
+        let shares: Vec<Option<String>> = (0..5).map(|r| cell(&store.current_view, 1, r)).collect();
+        assert_eq!(
+            shares,
+            [
+                None,
+                Some("0%".into()),
+                Some("9%".into()),
+                Some("23%".into()),
+                Some("100%".into())
+            ],
+            "and the blank stays grouped with the blanks"
+        );
+    }
+
+    /// The key is scaffolding and has to leave no trace: the page the viewer
+    /// draws counts columns by position, so one left behind would shift every
+    /// column after it.
+    #[test]
+    fn the_key_a_natural_sort_builds_is_not_a_column_afterwards() {
+        let path = write_temp("natural-drop.csv", "album,share\na,100%\nb,9%\n");
+        let mut store = Store::open_file(&path, 10).unwrap();
+        sorted_by(&mut store, 1);
+
+        let names: Vec<String> = store
+            .current_view
+            .columns()
+            .iter()
+            .map(|c| c.name().to_string())
+            .collect();
+        assert_eq!(names, ["album", "share"]);
     }
 
     #[test]

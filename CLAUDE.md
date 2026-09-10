@@ -36,6 +36,7 @@ src/
     store.rs      scroll state + data fetching (Polars or lake-backed)
     index.rs      where each row starts, so a page seeks instead of counting
     budget.rs     what this machine will let a sort or a filter hold
+    natural.rs    ordering a digit run by what it counts, not by its first character
     edit.rs       the edit buffer: a sparse overlay + undo history
     writer.rs     splice edits back into the file, byte-preserving
     lake_db.rs    DuckLake access via DuckDB's ducklake extension
@@ -357,6 +358,50 @@ lazy path reached 12.5GB resident in 45 seconds without producing a page; the
 refusal peaks at 125MB. `Store::sort_blocked()` is asked *before* a key is
 recorded, so a refusal leaves the view as it was. Lake tables sort through
 DuckDB, which spills, and are not capped.
+
+**A text column sorts by the numbers written in it.** Byte order puts `100%`
+before `23%` before `9%`, because the comparison stops at the first character
+and never gets as far as noticing that one of the three is a hundred — and the
+same goes for `file10` against `file2` and `v1.10` against `v1.9`. So
+`data/natural.rs` builds a key that emits every digit run behind a marker
+counting its digits, which makes byte order over the key the natural order over
+the value.
+
+It is **on by default rather than behind a flag**, because of *when* it differs
+from byte order: only where two digit runs reached by the same text are of
+different lengths. Runs of equal width — a hash, a zero-padded id, an ISO date,
+a uuid — compare identically either way, so the rows it moves are exactly the
+rows byte order was getting wrong, and there is nothing to weigh up at the
+prompt. `natural::worth_keying` asks that question over the column in one pass
+without allocating, so a date column pays for nothing. It asks it *per run
+position* and in **written** characters rather than significant digits: a date
+holds runs of 4, 2 and 2 within one value, and `01` against `12` is uneven as
+numbers and perfectly ordered as text.
+
+What it costs, measured over a held sort of 2M rows: a numeric column is
+untouched (108ms before, 111ms after); a text column that needs a key goes from
+146ms to 243ms; and a text column that does not — the zero-padded case — pays
+17ms for the pass that says so, 155ms to 172ms. The key column is transient,
+built between the `hstack` and the `drop_many` and never held, and the 128
+bytes a cell is budgeted at is already the worst case against a measured 35 to
+82, so it is not counted against `budget::sort_cells` separately.
+
+**It orders, it does not type.** The column stays text, `:filter share > 50`
+refuses it exactly as before, and the cell is drawn as the bytes it holds — the
+only thing that changed is which row comes first, which is a fact about the sort
+and not about the file. Reading `83%` as a number is a different feature and a
+much larger one.
+
+The key is a **column, not an expression**, because Polars' Rust lazy API has no
+way to say "order by this function of the value". `Store::materialise` collects
+first — which a held sort does anyway — then `sort_naturally` builds the key
+beside the column it orders and drops it again, so nothing above the store ever
+sees it. Two paths deliberately keep byte order and say so: the lazy pipeline in
+`effective_lf`, which only draws the window between a sort being asked for and
+the frame arriving (already provisional — it carries no `__src__`, and a JSONL
+file spends that same window in the file's own order), and a lake table, which
+is sorted by DuckDB page by page precisely because it is the one source too
+large to hold a key for.
 
 **The bounds come from `data/budget.rs`**, which asks the machine for its memory
 rather than assuming one: a quarter of it for a held sort, a twentieth for a
