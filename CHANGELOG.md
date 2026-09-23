@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.26.0] - 2026-09-23
+
+### Bug Fixes
+
+- name the repository for gh in the publish job ([`ecc9a71`](https://github.com/gabrielgellner/plv/commit/ecc9a717769ca119a3c585ae832ab1357cf0dc59))
+
+### Documentation
+
+- say how to install the prebuilt binary ([`eda5125`](https://github.com/gabrielgellner/plv/commit/eda51256e9d15ad80296baf89baab72817874c66))
+- cargo binstall, and move the pinned version on ([`b83072b`](https://github.com/gabrielgellner/plv/commit/b83072ba7ecb5c0b92ef4a4ee171a8ff6c62b68f))
+
+### Features
+
+- let cargo-binstall fetch the release tarball ([`e091db2`](https://github.com/gabrielgellner/plv/commit/e091db2a1c7ab51210d65356815fc0070f587b7d))
+
 ## [0.25.0] - 2026-09-23
 
 ### Miscellaneous
@@ -281,6 +296,8 @@ All notable changes to this project will be documented in this file.
 ### Styling
 
 - fix clippy warnings ([`5cb0dba`](https://github.com/gabrielgellner/plv/commit/5cb0dba5f5d4bc0be4d3d3b09fd1e7cd00ff7722))
+
+[0.26.0]: https://github.com/gabrielgellner/plv/compare/v0.25.0...v0.26.0
 
 [0.25.0]: https://github.com/gabrielgellner/plv/compare/v0.24.0...v0.25.0
 
