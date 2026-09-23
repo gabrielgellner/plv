@@ -465,7 +465,7 @@ target alongside a `SHA256SUMS` file:
 Set the two variables, then pull the binary straight out of the archive:
 
 ```bash
-VER=0.25.0
+VER=0.26.0
 TARGET=aarch64-apple-darwin    # see the table above
 BASE=https://github.com/gabrielgellner/plv/releases/download/v$VER
 
@@ -492,6 +492,15 @@ shasum -a 256 -c SHA256SUMS --ignore-missing   # sha256sum -c on Linux
 Linux builds are made on glibc 2.35 and need that or newer; there is no musl
 build. Windows is not built — nothing in plv is known to prevent it, it simply
 is not tested.
+
+### With cargo-binstall
+
+[cargo-binstall](https://github.com/cargo-bins/cargo-binstall) fetches the same
+release tarball and puts it where `cargo install` would, without the build:
+
+```
+cargo binstall plv
+```
 
 ### From crates.io
 
