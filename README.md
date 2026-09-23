@@ -450,24 +450,58 @@ take — the bounds come from the machine rather than being compiled in.
 
 ## Install
 
-From [crates.io](https://crates.io/crates/plv):
+### Prebuilt binary
+
+The fastest route, and it needs no Rust toolchain. Each
+[release](https://github.com/gabrielgellner/plv/releases) carries a tarball per
+target alongside a `SHA256SUMS` file:
+
+| Target | Machine |
+| --- | --- |
+| `aarch64-apple-darwin` | Apple Silicon Mac |
+| `x86_64-unknown-linux-gnu` | Intel/AMD Linux |
+| `aarch64-unknown-linux-gnu` | ARM Linux |
+
+Set the two variables, then pull the binary straight out of the archive:
+
+```bash
+VER=0.25.0
+TARGET=aarch64-apple-darwin    # see the table above
+BASE=https://github.com/gabrielgellner/plv/releases/download/v$VER
+
+mkdir -p ~/.local/bin
+curl -fsSL "$BASE/plv-$VER-$TARGET.tar.gz" \
+  | tar xz --strip-components=1 -C ~/.local/bin "plv-$VER-$TARGET/plv"
+
+plv --version
+```
+
+`--strip-components=1` is what takes the binary out on its own; the tarball also
+holds the README, CHANGELOG and LICENSE, which do not belong on your PATH. If
+the last line does not print a version, `~/.local/bin` is not on your PATH —
+add it, or extract somewhere that is.
+
+To check the download before trusting it:
+
+```bash
+curl -fsSLO "$BASE/plv-$VER-$TARGET.tar.gz"
+curl -fsSLO "$BASE/SHA256SUMS"
+shasum -a 256 -c SHA256SUMS --ignore-missing   # sha256sum -c on Linux
+```
+
+Linux builds are made on glibc 2.35 and need that or newer; there is no musl
+build. Windows is not built — nothing in plv is known to prevent it, it simply
+is not tested.
+
+### From crates.io
 
 ```
 cargo install plv
 ```
 
-This compiles DuckDB from source, so the first build takes a while.
-
-### Prebuilt binaries
-
-Each [release](https://github.com/gabrielgellner/plv/releases) carries tarballs
-for macOS arm64 and Linux x86_64/arm64, alongside a `SHA256SUMS` file. Windows
-is not built; nothing in plv is known to prevent it, it simply is not tested.
-
-```
-tar xzf plv-<version>-<target>.tar.gz
-./plv-<version>-<target>/plv --version
-```
+This **compiles from source**, DuckDB included, so expect it to take a while —
+`cargo install` builds rather than fetching a binary. The prebuilt above is the
+same program without the wait.
 
 ### From a checkout
 
