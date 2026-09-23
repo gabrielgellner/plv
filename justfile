@@ -55,7 +55,24 @@ bump version="":
     # Write full changelog (--tag sets the version for unreleased commits)
     git-cliff --tag "$NEXT" -o CHANGELOG.md
 
-    git add Cargo.toml Cargo.lock CHANGELOG.md
+    # The README's install example pins a version, because the checksum step
+    # needs a concrete one to verify against. It has to move with the bump or
+    # the docs describe the release before last. The line is checked for first:
+    # a substitution that quietly matched nothing would leave exactly the
+    # staleness this is here to prevent, and it would not show up until someone
+    # followed the instructions.
+    if ! grep -qE '^VER=[0-9]+\.[0-9]+\.[0-9]+$' README.md; then
+        echo "ERROR: no VER=x.y.z line found in README.md."
+        echo "The install example moved or changed shape; update this recipe."
+        exit 1
+    fi
+    # Written without sed -i, whose in-place flag takes an argument on BSD and
+    # not on GNU, so the one spelling would break on the other's machine.
+    TMP=$(mktemp)
+    sed -E "s/^VER=[0-9]+\.[0-9]+\.[0-9]+/VER=$VER/" README.md > "$TMP"
+    mv "$TMP" README.md
+
+    git add Cargo.toml Cargo.lock CHANGELOG.md README.md
     git commit -m "chore(release): $NEXT"
     git tag -a "$NEXT" -m "Release $NEXT"
 
