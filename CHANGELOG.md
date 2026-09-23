@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.25.0] - 2026-09-23
+
+### Miscellaneous
+
+- release from GitHub, and describe the crate for crates.io ([`0eaba47`](https://github.com/gabrielgellner/plv/commit/0eaba47829d11dce64ab88d1e40088d89af886d1))
+
 ## [0.24.0] - 2026-09-10
 
 ### Features
@@ -275,6 +281,8 @@ All notable changes to this project will be documented in this file.
 ### Styling
 
 - fix clippy warnings ([`5cb0dba`](https://github.com/gabrielgellner/plv/commit/5cb0dba5f5d4bc0be4d3d3b09fd1e7cd00ff7722))
+
+[0.25.0]: https://github.com/gabrielgellner/plv/compare/v0.24.0...v0.25.0
 
 [0.24.0]: https://github.com/gabrielgellner/plv/compare/v0.23.0...v0.24.0
 
