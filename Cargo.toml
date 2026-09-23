@@ -20,6 +20,17 @@ exclude = [
     "justfile",
 ]
 
+# cargo-binstall fetches the release tarball instead of compiling, which for
+# plv is the difference between a download and a DuckDB build. Its default
+# guesses at a URL do not match what the release workflow names — those put the
+# target before the version — so the layout is spelled out rather than left to
+# convention. The extension is written literally for the same reason: one less
+# template variable whose expansion has to be taken on trust.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ version }-{ target }.tar.gz"
+bin-dir = "{ name }-{ version }-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
 [dependencies]
 anyhow = "1.0.102"
 regex = "1"
