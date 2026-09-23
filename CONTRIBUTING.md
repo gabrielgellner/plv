@@ -6,7 +6,7 @@
 - [cargo-edit](https://github.com/killercup/cargo-edit) — adds `cargo set-version` (`cargo install cargo-edit`)
 - [just](https://github.com/casey/just) — task runner (`cargo install just` or `brew install just`)
 - [git-cliff](https://git-cliff.org/) — changelog generator (`cargo install git-cliff` or `brew install git-cliff`)
-- [glab](https://gitlab.com/gitlab-org/cli) — GitLab CLI, needed only for publishing releases (`brew install glab`)
+- [gh](https://cli.github.com/) — GitHub CLI, needed only for publishing releases (`brew install gh`)
 
 ## Development
 
@@ -84,7 +84,28 @@ Once satisfied:
 just release
 ```
 
-This pushes the branch and tag to GitLab and creates a GitLab release with the changelog section for this version as the release notes.
+This pushes the branch and tag to GitHub and creates a GitHub release with the
+changelog section for this version as the release notes.
+
+Pushing the tag also starts the `release` workflow, which builds binaries for
+macOS arm64 and Linux x86_64/arm64 and attaches them to that release along with
+a `SHA256SUMS` file. Watch it with `gh run watch`. The release exists as soon as
+`just release` returns; the binaries arrive when the builds finish, which takes
+a while because each one compiles the bundled DuckDB.
+
+### Publish to crates.io
+
+Separate from `just release`, and deliberately so: a GitHub release can be
+deleted and cut again, while a crates.io version is permanent — `cargo yank`
+only stops new dependents from resolving it.
+
+```bash
+just publish
+```
+
+It refuses unless `HEAD` is exactly on a tag, the tag matches the version in
+`Cargo.toml` and the working tree is clean, then asks you to type the version
+back before it publishes.
 
 ### Update your own copy
 

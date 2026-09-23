@@ -2,6 +2,23 @@
 name = "plv"
 version = "0.24.0"
 edition = "2024"
+rust-version = "1.95"
+authors = ["Gabriel Gellner <gabrielgellner@gmail.com>"]
+description = "A terminal viewer and editor for CSV, TSV, JSONL, Parquet and DuckLake data"
+documentation = "https://docs.rs/plv"
+repository = "https://github.com/gabrielgellner/plv"
+homepage = "https://github.com/gabrielgellner/plv"
+readme = "README.md"
+license = "MIT"
+keywords = ["csv", "parquet", "tui", "ducklake", "viewer"]
+categories = ["command-line-utilities", "visualization", "database"]
+exclude = [
+    ".cargo/",
+    ".github/",
+    "CLAUDE.md",
+    "cliff.toml",
+    "justfile",
+]
 
 [dependencies]
 anyhow = "1.0.102"

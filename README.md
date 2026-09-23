@@ -450,12 +450,32 @@ take — the bounds come from the machine rather than being compiled in.
 
 ## Install
 
+From [crates.io](https://crates.io/crates/plv):
+
+```
+cargo install plv
+```
+
+This compiles DuckDB from source, so the first build takes a while.
+
+### Prebuilt binaries
+
+Each [release](https://github.com/gabrielgellner/plv/releases) carries tarballs
+for macOS arm64 and Linux x86_64/arm64, alongside a `SHA256SUMS` file. Windows
+is not built; nothing in plv is known to prevent it, it simply is not tested.
+
+```
+tar xzf plv-<version>-<target>.tar.gz
+./plv-<version>-<target>/plv --version
+```
+
+### From a checkout
+
 ```
 cargo install --path .
 ```
 
-From a checkout, `just install` does the same and then prints which version
-landed on your PATH.
+`just install` does the same and then prints which version landed on your PATH.
 
 ## Build
 

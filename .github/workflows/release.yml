@@ -1,0 +1,116 @@
+# Builds release binaries when a vX.Y.Z tag is pushed, and attaches them to the
+# GitHub Release for that tag.
+#
+# Every target is built on its own native runner rather than cross-compiled.
+# plv bundles DuckDB, which is a C++ build: a cross-toolchain for it is a great
+# deal more to keep working than three runners that already have a compiler.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  # Lets you rehearse the whole matrix without cutting a tag. Nothing is
+  # uploaded on a manual run, because there is no release to upload it to.
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    # A release build is LTO plus the bundled DuckDB amalgamation; it is slow.
+    timeout-minutes: 90
+    strategy:
+      # One target failing should not cancel the others: a partial release is
+      # still worth having, and the log of the one that broke is what you want.
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-15
+          - target: x86_64-unknown-linux-gnu
+            # Deliberately not 24.04: the binary links the runner's glibc, and
+            # 22.04's 2.35 runs on distros that 24.04's 2.39 would shut out.
+            os: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        # --locked builds against the committed Cargo.lock, so the released
+        # binary is the one the tag describes rather than whatever resolves
+        # on the day the workflow ran.
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          name="plv-${version}-${{ matrix.target }}"
+          mkdir -p "dist/${name}"
+          cp "target/${{ matrix.target }}/release/plv" "dist/${name}/"
+          cp README.md LICENSE CHANGELOG.md "dist/${name}/"
+          tar -C dist -czf "dist/${name}.tar.gz" "${name}"
+          # shasum is on both macOS and Linux runners; sha256sum is not on macOS.
+          ( cd dist && shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256" )
+          echo "ARCHIVE=dist/${name}.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: plv-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    # Only a tag has a release to attach to; a workflow_dispatch run stops at
+    # having proved the matrix builds.
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Collect checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          ( cd dist && cat *.sha256 | sort -k2 > SHA256SUMS && rm -f *.sha256 )
+          ls -l dist
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Create the release if the tag has none yet, then upload. --clobber
+          # makes a re-run of the workflow replace the assets rather than fail
+          # on one that is already there.
+          gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1 \
+            || gh release create "${GITHUB_REF_NAME}" \
+                 --title "${GITHUB_REF_NAME}" --generate-notes
+          gh release upload "${GITHUB_REF_NAME}" dist/* --clobber
