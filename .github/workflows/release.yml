@@ -104,6 +104,11 @@ jobs:
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
+          # This job downloads artifacts and never checks the repo out, so gh
+          # has no git remote to infer the repository from and every call fails
+          # with "not a git repository". Naming it explicitly is cheaper than
+          # checking out a tree only to throw it away.
+          GH_REPO: ${{ github.repository }}
         shell: bash
         run: |
           set -euo pipefail
