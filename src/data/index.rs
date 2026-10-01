@@ -22,6 +22,8 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
+use super::loader;
+
 /// Rows between checkpoints. A page seeks to one and parses forward at most
 /// this many, so it trades a bounded read against a few bytes of index: at
 /// 272M rows this is roughly four thousand entries.
@@ -96,20 +98,28 @@ impl RowIndex {
     /// Scan `path`, counting records and noting where every [`STRIDE`]-th one
     /// begins.
     ///
-    /// Streams: it holds the index and a read buffer, nothing else.
+    /// Streams: it holds the index and a read buffer, nothing else. Comment
+    /// lines ahead of the header are stepped over, not scanned — see
+    /// [`loader::preamble`].
     pub fn build(path: &Path, separator: u8) -> Result<Self> {
-        let file = File::open(path).with_context(|| format!("cannot read {}", path.display()))?;
+        let preamble = loader::preamble(path, separator)?.bytes;
+        let mut file =
+            File::open(path).with_context(|| format!("cannot read {}", path.display()))?;
         let len = file.metadata()?.len();
+        file.seek(SeekFrom::Start(preamble))?;
         let mut reader = BufReader::with_capacity(1 << 20, file);
 
         let mut scan = Records::new(separator);
-        let mut position: u64 = 0;
+        let mut position: u64 = preamble;
         let mut header = Vec::new();
         let mut rows = 0usize;
         let mut checkpoints = Vec::new();
         // The first record is the header; data begins after it.
         let mut past_header = false;
         let mut started = false;
+        // Where row 0 begins. Noted rather than worked out from the header's
+        // length, which knows neither the preamble nor a `\r\n`.
+        let mut data_start = len;
 
         loop {
             let chunk = reader.fill_buf()?;
@@ -134,6 +144,7 @@ impl RowIndex {
                         }
                         started = false;
                         position = base + i as u64 + 1;
+                        data_start = position;
                         break;
                     }
                 }
@@ -167,7 +178,7 @@ impl RowIndex {
         }
 
         Ok(Self {
-            checkpoints: with_first(checkpoints, &header, len),
+            checkpoints: with_first(checkpoints, data_start),
             rows,
             header,
             len,
@@ -244,11 +255,18 @@ impl RowIndex {
 pub struct Building {
     checkpoints: Vec<u64>,
     rows: usize,
+    /// Where row 0 begins, once the header has been written.
+    start: Option<u64>,
 }
 
 impl Building {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The header has been written in full, and data begins at `at`.
+    pub fn begin(&mut self, at: u64) {
+        self.start.get_or_insert(at);
     }
 
     /// A data record was written, ending at byte `end` — which is where the
@@ -262,7 +280,8 @@ impl Building {
 
     pub fn finish(self, header: Vec<u8>, len: u64) -> RowIndex {
         RowIndex {
-            checkpoints: with_first(self.checkpoints, &header, len),
+            // A file that is nothing but a header has no data row to point at.
+            checkpoints: with_first(self.checkpoints, self.start.unwrap_or(len)),
             rows: self.rows,
             header,
             len,
@@ -273,17 +292,9 @@ impl Building {
 
 /// The offsets recorded above are the starts of rows `STRIDE`, `2*STRIDE`, …
 /// because row 0 begins where the header ends. Put that in front.
-fn with_first(mut checkpoints: Vec<u64>, header: &[u8], len: u64) -> Vec<u64> {
-    checkpoints.insert(0, header_end(header, len));
+fn with_first(mut checkpoints: Vec<u64>, data_start: u64) -> Vec<u64> {
+    checkpoints.insert(0, data_start);
     checkpoints
-}
-
-/// Byte offset of the first data row.
-fn header_end(header: &[u8], len: u64) -> u64 {
-    // The header was captured without its terminator; a file that is nothing
-    // but a header has no data row to point at.
-    let after = header.len() as u64 + 1;
-    after.min(len)
 }
 
 /// Tracks whether a byte ends a record, which needs enough of the grammar to
@@ -431,6 +442,10 @@ mod tests {
             ("quoted-separator", "a,b\n\"x,y\",z\np,q\n"),
             ("bare-quote-mid-field", "a,b\nab\"cd,x\ny,z\n"),
             ("empty-fields", "a,b,c\n,,\n1,,3\n"),
+            ("comment-preamble", "# about\n# this, file\na,b\n1,2\n3,4\n"),
+            ("comment-preamble-crlf", "# about\r\na,b\r\n1,2\r\n"),
+            ("hash-header", "#a,b\n1,2\n"),
+            ("hash-data-row", "a,b\n#1,2\n3,4\n"),
         ];
 
         for (label, contents) in cases {
@@ -456,6 +471,7 @@ mod tests {
                 contents.as_bytes(),
                 &mut Vec::new(),
                 b',',
+                loader::preamble(&path, b',').unwrap().bytes,
                 true,
                 &Overlay::new(),
                 index,
@@ -479,6 +495,18 @@ mod tests {
 
         let bytes = read_span(&path, &index, at, index.end_of(3)).unwrap();
         assert_eq!(String::from_utf8(bytes).unwrap(), "a,b\n1,2\n3,4\n5,6\n");
+    }
+
+    #[test]
+    fn a_page_after_a_preamble_starts_at_the_header() {
+        let path = write("preamble.csv", "# a note\r\na,b\r\n1,2\r\n3,4\r\n");
+        let index = RowIndex::build(&path, b',').unwrap();
+        assert_eq!(index.header(), b"a,b");
+        assert_eq!(index.rows(), 2);
+        assert_eq!(index.seek(0), (0, 15), "after the comment and `a,b\\r\\n`");
+
+        let bytes = read_span(&path, &index, 15, index.end_of(2)).unwrap();
+        assert_eq!(String::from_utf8(bytes).unwrap(), "a,b\n1,2\r\n3,4\r\n");
     }
 
     #[test]

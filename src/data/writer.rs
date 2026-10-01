@@ -26,6 +26,7 @@ use std::collections::BTreeMap;
 use super::edit::Overlay;
 use super::index::{self, RowIndex};
 use super::jsonl;
+use super::loader;
 
 /// What a file looked like when plv opened it, so a write cannot clobber
 /// changes made underneath it by something else.
@@ -64,11 +65,15 @@ pub fn save(
     expected_rows: usize,
 ) -> Result<Saved> {
     let mut index = None;
+    // Asked of the file being read, through the same function the reader and
+    // the index asked, so all three put the header on the same line.
+    let preamble = loader::preamble(src, separator)?.bytes;
     let stamp = replace(src, dst, |input, output| {
         index = Some(splice(
             input,
             output,
             separator,
+            preamble,
             has_header,
             overlay,
             expected_rows,
@@ -161,6 +166,10 @@ where
 
 /// Copy `src` to `out`, replacing the fields named by `overlay`.
 ///
+/// The first `preamble` bytes are comment lines ahead of the header (see
+/// [`loader::preamble`]); they are copied through untouched and are not
+/// records.
+///
 /// Fails without writing anything usable if the record count disagrees with
 /// `expected_rows`, or if an edit names a field its record does not have. Both
 /// mean plv and this parser read the file differently, and guessing at that
@@ -169,18 +178,31 @@ pub fn splice<R: BufRead, W: Write>(
     mut src: R,
     out: W,
     separator: u8,
+    preamble: u64,
     has_header: bool,
     overlay: &Overlay,
     expected_rows: usize,
 ) -> Result<RowIndex> {
     let mut splicer = Splicer::new(out, separator, has_header, overlay);
+    // Handled here rather than in `byte`, so the per-byte loop of a
+    // multi-gigabyte write does not test for it once per byte.
+    let mut passing = preamble;
+    if !has_header {
+        splicer.index.begin(preamble);
+    }
     loop {
         let chunk = src.fill_buf()?;
         if chunk.is_empty() {
             break;
         }
         let read = chunk.len();
-        for &byte in chunk {
+        let pass = passing.min(read as u64) as usize;
+        if pass > 0 {
+            splicer.out.write_all(&chunk[..pass])?;
+            splicer.written += pass as u64;
+            passing -= pass as u64;
+        }
+        for &byte in &chunk[pass..] {
             splicer.byte(byte)?;
         }
         src.consume(read);
@@ -759,6 +781,9 @@ impl<'a, W: Write> Splicer<'a, W> {
             return Ok(());
         }
         self.raw(eol)?;
+        if self.record == self.header_rows {
+            self.index.begin(self.written);
+        }
         // A data record has just been written in full, so the next one starts
         // here. Struck records return above and are not in the new file at
         // all, which is exactly what the index should say about them.
@@ -877,7 +902,7 @@ mod tests {
             overlay.set([(cell, value.to_string())]);
         }
         let mut out = Vec::new();
-        splice(input.as_bytes(), &mut out, separator, true, &overlay, rows)?;
+        splice(input.as_bytes(), &mut out, separator, 0, true, &overlay, rows)?;
         Ok(String::from_utf8(out).unwrap())
     }
 
@@ -1010,7 +1035,7 @@ mod tests {
         let mut overlay = Overlay::new();
         overlay.delete(struck.iter().copied(), usize::MAX);
         let mut out = Vec::new();
-        splice(input.as_bytes(), &mut out, b',', true, &overlay, rows).expect("splice failed");
+        splice(input.as_bytes(), &mut out, b',', 0, true, &overlay, rows).expect("splice failed");
         String::from_utf8(out).unwrap()
     }
 
@@ -1059,6 +1084,7 @@ mod tests {
             "name,count\na,1\nb,2\nc,3\n".as_bytes(),
             &mut out,
             b',',
+            0,
             true,
             &overlay,
             3,
@@ -1082,6 +1108,7 @@ mod tests {
             "name,count\na,1\nb,2\n".as_bytes(),
             &mut out,
             b',',
+            0,
             true,
             &overlay,
             2,
@@ -1095,7 +1122,7 @@ mod tests {
         let mut overlay = Overlay::new();
         overlay.delete([9], usize::MAX);
         let mut out = Vec::new();
-        let e = splice("a,b\n1,2\n".as_bytes(), &mut out, b',', true, &overlay, 1)
+        let e = splice("a,b\n1,2\n".as_bytes(), &mut out, b',', 0, true, &overlay, 1)
             .unwrap_err()
             .to_string();
         assert!(e.contains("deleted rows were not found"), "{e}");
@@ -1111,7 +1138,7 @@ mod tests {
             }
         }
         let mut out = Vec::new();
-        splice(input.as_bytes(), &mut out, b',', true, &overlay, rows).expect("splice failed");
+        splice(input.as_bytes(), &mut out, b',', 0, true, &overlay, rows).expect("splice failed");
         String::from_utf8(out).unwrap()
     }
 
@@ -1176,7 +1203,7 @@ mod tests {
             overlay.set([((id, 0), name.to_string())]);
         }
         let mut out = Vec::new();
-        splice(input.as_bytes(), &mut out, b',', true, &overlay, 1).unwrap();
+        splice(input.as_bytes(), &mut out, b',', 0, true, &overlay, 1).unwrap();
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "a,b\n1,2\none,\ntwo,\nthree,\n"
@@ -1201,6 +1228,7 @@ mod tests {
             "a,b\n1,2\n3,4\n".as_bytes(),
             &mut out,
             b',',
+            0,
             true,
             &overlay,
             2,
@@ -1224,6 +1252,30 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("no field to land in"), "{err}");
+    }
+
+    #[test]
+    fn a_comment_preamble_survives_a_write_and_the_new_index_agrees() {
+        let dir = std::env::temp_dir().join("plv-writer-preamble");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("notes.tsv");
+        let before = "# kept\r\n# as is, here\r\nname\tn\r\na\t1\r\nb\t2\r\n";
+        fs::write(&path, before).unwrap();
+
+        let mut overlay = Overlay::new();
+        overlay.set([((1, 1), "9".to_string())]);
+        let saved = save(&path, &path, b'\t', true, &overlay, 2).unwrap();
+
+        let after = fs::read_to_string(&path).unwrap();
+        assert_eq!(after, before.replace("b\t2", "b\t9"));
+        let fresh = RowIndex::build(&path, b'\t').unwrap();
+        assert_eq!(
+            saved.index.seek(0),
+            fresh.seek(0),
+            "row 0 is where a rescan puts it"
+        );
+        assert_eq!(saved.index.header(), fresh.header());
+        assert_eq!(saved.index.rows(), 2);
     }
 
     #[test]

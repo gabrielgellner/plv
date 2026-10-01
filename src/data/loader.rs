@@ -1,6 +1,6 @@
 use anyhow::Result;
 use polars::prelude::*;
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 
 pub enum FileFormat {
@@ -31,9 +31,11 @@ pub fn detect_format(path: &Path) -> FileFormat {
 pub fn load(path: &Path) -> Result<LazyFrame> {
     let pl_path = PlRefPath::try_from_path(path)?;
     match detect_format(path) {
-        FileFormat::Csv => Ok(delimited(pl_path, b',')?),
-        FileFormat::Tsv => Ok(delimited(pl_path, b'\t')?),
-        FileFormat::Text => Ok(delimited(pl_path, sniff_delimiter(&read_sample(path)?))?),
+        FileFormat::Csv | FileFormat::Tsv | FileFormat::Text => {
+            let separator = separator(path)?.expect("delimited text has a separator");
+            let skip = preamble(path, separator)?.lines;
+            Ok(delimited(pl_path, separator, skip)?)
+        }
         FileFormat::Parquet => Ok(LazyFrame::scan_parquet(pl_path, Default::default())?),
         // Never reached: `Store::open_file` sends JSONL down its own path
         // before asking for a frame.
@@ -58,8 +60,70 @@ pub fn separator(path: &Path) -> Result<Option<u8>> {
     }
 }
 
-fn delimited(path: PlRefPath, separator: u8) -> PolarsResult<LazyFrame> {
-    LazyCsvReader::new(path).with_separator(separator).finish()
+fn delimited(path: PlRefPath, separator: u8, skip_lines: usize) -> PolarsResult<LazyFrame> {
+    LazyCsvReader::new(path)
+        .with_separator(separator)
+        .with_skip_lines(skip_lines)
+        .finish()
+}
+
+/// The comment lines a delimited file opens with, ahead of its header.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Preamble {
+    /// Lines, for Polars, which skips them by counting newlines.
+    pub lines: usize,
+    /// Bytes, terminators included, for the index and the writer, which skip
+    /// them by offset.
+    pub bytes: u64,
+}
+
+/// Find the comment lines at the top of `path`.
+///
+/// Only a run at the very start counts, never a `#` line further down: past
+/// the header a line is a record, and one whose first field happens to begin
+/// with `#` is data. The reader, the row index and the writer all ask this
+/// one function, so the three cannot disagree about where the header is.
+pub fn preamble(path: &Path, separator: u8) -> Result<Preamble> {
+    let file = std::fs::File::open(path)?;
+    Ok(preamble_of(BufReader::new(file), separator)?)
+}
+
+/// The preamble is every line starting with `#` before the first line that
+/// does not — with one exception. When the last of them splits into as many
+/// fields as the line after it, it is the header written with a `#` in front,
+/// the way VCF and BED write `#chrom`, and it stays the header. A file that
+/// is nothing but `#` lines has no preamble: taking it all would leave no
+/// header at all.
+fn preamble_of(mut reader: impl BufRead, separator: u8) -> std::io::Result<Preamble> {
+    let mut found = Preamble::default();
+    let mut last = Vec::new();
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let read = reader.read_until(b'\n', &mut line)?;
+        if read == 0 {
+            return Ok(Preamble::default());
+        }
+        if line.starts_with(b"#") {
+            found.lines += 1;
+            found.bytes += read as u64;
+            std::mem::swap(&mut last, &mut line);
+            continue;
+        }
+        if found.lines > 0 {
+            let fields = count_unquoted(trim_eol(&line), separator);
+            if fields > 0 && count_unquoted(trim_eol(&last), separator) == fields {
+                found.lines -= 1;
+                found.bytes -= last.len() as u64;
+            }
+        }
+        return Ok(found);
+    }
+}
+
+fn trim_eol(line: &[u8]) -> &[u8] {
+    let line = line.strip_suffix(b"\n").unwrap_or(line);
+    line.strip_suffix(b"\r").unwrap_or(line)
 }
 
 /// How much of a file to look at when sniffing its delimiter.
@@ -91,7 +155,9 @@ fn sniff_delimiter(sample: &[u8]) -> u8 {
     let lines: Vec<&[u8]> = sample
         .split(|&b| b == b'\n')
         .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
-        .filter(|line| !line.is_empty())
+        // A comment says nothing about the delimiter, and prose in one would
+        // only spoil the count.
+        .filter(|line| !line.is_empty() && !line.starts_with(b"#"))
         .take(SAMPLE_LINES)
         .collect();
 
@@ -172,6 +238,61 @@ mod tests {
     #[test]
     fn windows_line_endings_do_not_break_counting() {
         assert_eq!(sniff_delimiter(b"a,b\r\n1,2\r\n"), b',');
+    }
+
+    #[test]
+    fn leading_comment_lines_are_skipped() {
+        let tsv = "# what this is\n# and why\n#\nname\tcount\na\t1\nb\t2\n";
+        for ext in ["tsv", "txt"] {
+            let df = load(&write_temp(ext, tsv)).unwrap().collect().unwrap();
+            assert_eq!(df.shape(), (2, 2), "{ext}");
+            assert_eq!(df.get_column_names(), ["name", "count"], "{ext}");
+        }
+    }
+
+    #[test]
+    fn the_preamble_is_the_leading_run_of_comments() {
+        let of = |text: &str| preamble_of(text.as_bytes(), b',').unwrap();
+        assert_eq!(of("a,b\n1,2\n"), Preamble::default(), "none");
+        assert_eq!(of("# note\na,b\n"), Preamble { lines: 1, bytes: 7 });
+        assert_eq!(
+            of("# one\r\n# two\r\na,b\r\n"),
+            Preamble {
+                lines: 2,
+                bytes: 14
+            },
+            "crlf counted in bytes"
+        );
+        assert_eq!(
+            of("a,b\n# 1,2\n"),
+            Preamble::default(),
+            "a # line after the header is a record"
+        );
+    }
+
+    #[test]
+    fn a_header_written_with_a_hash_stays_the_header() {
+        let of = |text: &str| preamble_of(text.as_bytes(), b'\t').unwrap();
+        // VCF and BED: the header is `#chrom`, and the comments above it are
+        // still comments.
+        assert_eq!(
+            of("## format 4\n#chrom\tpos\nchr1\t10\n"),
+            Preamble {
+                lines: 1,
+                bytes: 12
+            }
+        );
+        assert_eq!(of("#chrom\tpos\nchr1\t10\n"), Preamble::default());
+        assert_eq!(
+            of("# just\n# comments\n"),
+            Preamble::default(),
+            "nothing left"
+        );
+    }
+
+    #[test]
+    fn comments_do_not_sway_the_sniffer() {
+        assert_eq!(sniff_delimiter(b"# a, b, c\n# d\na;b\n1;2\n"), b';');
     }
 
     fn write_temp(ext: &str, contents: &str) -> std::path::PathBuf {
