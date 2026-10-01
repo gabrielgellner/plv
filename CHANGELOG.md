@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.27.0] - 2026-10-01
+
+### Features
+
+- read past a block of # comment lines above the header ([`e7ab283`](https://github.com/gabrielgellner/plv/commit/e7ab2834c06613c7d58125d2d266b514f6c7ad32))
+
+### Miscellaneous
+
+- move the README's pinned version with the bump ([`25e9f45`](https://github.com/gabrielgellner/plv/commit/25e9f45c1571d3ca4da2e9d353a0d0d705a2e0b8))
+
 ## [0.26.0] - 2026-09-23
 
 ### Bug Fixes
@@ -296,6 +306,8 @@ All notable changes to this project will be documented in this file.
 ### Styling
 
 - fix clippy warnings ([`5cb0dba`](https://github.com/gabrielgellner/plv/commit/5cb0dba5f5d4bc0be4d3d3b09fd1e7cd00ff7722))
+
+[0.27.0]: https://github.com/gabrielgellner/plv/compare/v0.26.0...v0.27.0
 
 [0.26.0]: https://github.com/gabrielgellner/plv/compare/v0.25.0...v0.26.0
 

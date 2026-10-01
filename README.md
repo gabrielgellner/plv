@@ -465,7 +465,7 @@ target alongside a `SHA256SUMS` file:
 Set the two variables, then pull the binary straight out of the archive:
 
 ```bash
-VER=0.26.0
+VER=0.27.0
 TARGET=aarch64-apple-darwin    # see the table above
 BASE=https://github.com/gabrielgellner/plv/releases/download/v$VER
 
