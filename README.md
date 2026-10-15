@@ -15,7 +15,7 @@ A terminal viewer and editor for CSV, TSV, JSONL, Parquet and [DuckLake](https:/
 ## Usage
 
 ```
-plv <file.csv>
+plv <file.csv>          # comma, or semicolon where the file uses it
 plv <file.tsv>          # also .tab; .txt sniffs its delimiter
 plv <file.jsonl>        # also .ndjson: one JSON object per line
 plv <file.parquet>

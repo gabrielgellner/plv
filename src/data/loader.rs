@@ -4,6 +4,8 @@ use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 
 pub enum FileFormat {
+    /// `.csv`. Usually commas, but a locale that writes decimals with a comma
+    /// (French, German, …) separates with semicolons, so the two are sniffed.
     Csv,
     /// Extension names tabs: `.tsv`, `.tab`.
     Tsv,
@@ -53,9 +55,9 @@ pub fn load(path: &Path) -> Result<LazyFrame> {
 /// splits records exactly where the read path did.
 pub fn separator(path: &Path) -> Result<Option<u8>> {
     match detect_format(path) {
-        FileFormat::Csv => Ok(Some(b',')),
+        FileFormat::Csv => Ok(Some(sniff(&read_sample(path)?, CSV_DELIMITERS, b','))),
         FileFormat::Tsv => Ok(Some(b'\t')),
-        FileFormat::Text => Ok(Some(sniff_delimiter(&read_sample(path)?))),
+        FileFormat::Text => Ok(Some(sniff(&read_sample(path)?, TEXT_DELIMITERS, b'\t'))),
         FileFormat::Parquet | FileFormat::JsonLines | FileFormat::Unknown => Ok(None),
     }
 }
@@ -129,8 +131,13 @@ fn trim_eol(line: &[u8]) -> &[u8] {
 /// How much of a file to look at when sniffing its delimiter.
 const SAMPLE_BYTES: u64 = 64 * 1024;
 
-/// Candidates, in the order ties are broken.
-const DELIMITERS: [u8; 4] = *b"\t,;|";
+/// Candidates for `.txt`, in the order ties are broken.
+const TEXT_DELIMITERS: &[u8] = b"\t,;|";
+
+/// Candidates for `.csv`. Semicolon goes first: a file that uses it writes its
+/// decimals with commas, so `1,5;2,3` can line up on commas as well, while a
+/// comma file with semicolons lined up on every line is not one anyone writes.
+const CSV_DELIMITERS: &[u8] = b";,";
 
 /// Lines to compare before deciding. The header alone can be misleading.
 const SAMPLE_LINES: usize = 5;
@@ -143,15 +150,17 @@ fn read_sample(path: &Path) -> Result<Vec<u8>> {
     Ok(sample)
 }
 
-/// Pick the field separator for a file whose extension doesn't name one.
+/// Pick the field separator for a file whose extension doesn't settle it,
+/// out of `candidates`.
 ///
 /// Counts each candidate outside double-quoted spans on the first few lines and
 /// keeps the one that occurs at least once and the *same* number of times on
 /// every line — that consistency is what separates a real delimiter from a
 /// character the text merely happens to contain. A sample that settles nothing
 /// (one line, no repeats, a stray delimiter inside a quoted field spanning a
-/// newline) falls back to a tab, which is what `.txt` usually means.
-fn sniff_delimiter(sample: &[u8]) -> u8 {
+/// newline) falls back to `fallback`: a tab for `.txt`, which is what it
+/// usually means, and a comma for `.csv`, which is what it says.
+fn sniff(sample: &[u8], candidates: &[u8], fallback: u8) -> u8 {
     let lines: Vec<&[u8]> = sample
         .split(|&b| b == b'\n')
         .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
@@ -161,8 +170,9 @@ fn sniff_delimiter(sample: &[u8]) -> u8 {
         .take(SAMPLE_LINES)
         .collect();
 
-    DELIMITERS
-        .into_iter()
+    candidates
+        .iter()
+        .copied()
         .find(|&delim| {
             let mut counts = lines.iter().map(|line| count_unquoted(line, delim));
             match counts.next() {
@@ -170,7 +180,7 @@ fn sniff_delimiter(sample: &[u8]) -> u8 {
                 None => false,
             }
         })
-        .unwrap_or(b'\t')
+        .unwrap_or(fallback)
 }
 
 /// Occurrences of `delim` in `line` that fall outside a quoted field. A doubled
@@ -190,6 +200,14 @@ fn count_unquoted(line: &[u8], delim: u8) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sniff_delimiter(sample: &[u8]) -> u8 {
+        sniff(sample, TEXT_DELIMITERS, b'\t')
+    }
+
+    fn sniff_csv(sample: &[u8]) -> u8 {
+        sniff(sample, CSV_DELIMITERS, b',')
+    }
 
     #[test]
     fn tab_separated_extensions_split_on_tabs() {
@@ -293,6 +311,53 @@ mod tests {
     #[test]
     fn comments_do_not_sway_the_sniffer() {
         assert_eq!(sniff_delimiter(b"# a, b, c\n# d\na;b\n1;2\n"), b';');
+    }
+
+    #[test]
+    fn semicolon_separated_csv_is_sniffed() {
+        let df = load(&write_temp("csv", "nom;prix\npomme;1,5\npoire;2,25\n"))
+            .unwrap()
+            .collect()
+            .unwrap();
+        assert_eq!(df.shape(), (2, 2));
+        assert_eq!(df.get_column_names(), ["nom", "prix"]);
+        assert_eq!(
+            df.column("prix").unwrap().str().unwrap().get(0),
+            Some("1,5"),
+            "the decimal comma stays inside the field"
+        );
+    }
+
+    #[test]
+    fn csv_sniffs_only_commas_and_semicolons() {
+        assert_eq!(sniff_csv(b"a,b\n1,2\n"), b',');
+        assert_eq!(sniff_csv(b"a;b\n1;2\n"), b';');
+        // A tab or a pipe is not what `.csv` means, whatever lines up.
+        assert_eq!(sniff_csv(b"a\tb\n1\t2\n"), b',');
+        assert_eq!(sniff_csv(b"a|b\n1|2\n"), b',');
+    }
+
+    #[test]
+    fn decimal_commas_do_not_beat_the_semicolon() {
+        // One decimal per line, header included: both line up, and the
+        // semicolon is the one that means it.
+        assert_eq!(sniff_csv(b"x,y;z\n1,5;a\n2,5;b\n"), b';');
+        // Decimal counts vary from line to line, so only `;` lines up.
+        assert_eq!(sniff_csv(b"a;b;c\n1,5;2,5;x\n3;4,0;y\n"), b';');
+        // A comma file with prose semicolons in it stays a comma file.
+        assert_eq!(sniff_csv(b"a,b\nx; y,1\nz,2\n"), b',');
+    }
+
+    #[test]
+    fn an_unsettled_csv_falls_back_to_comma() {
+        assert_eq!(sniff_csv(b"name\nalice\n"), b',');
+        assert_eq!(sniff_csv(b""), b',');
+    }
+
+    #[test]
+    fn the_write_path_is_told_the_sniffed_separator() {
+        let path = write_temp("csv", "a;b\n1,5;2\n");
+        assert_eq!(separator(&path).unwrap(), Some(b';'));
     }
 
     fn write_temp(ext: &str, contents: &str) -> std::path::PathBuf {
