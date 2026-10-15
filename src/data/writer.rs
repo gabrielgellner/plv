@@ -902,7 +902,15 @@ mod tests {
             overlay.set([(cell, value.to_string())]);
         }
         let mut out = Vec::new();
-        splice(input.as_bytes(), &mut out, separator, 0, true, &overlay, rows)?;
+        splice(
+            input.as_bytes(),
+            &mut out,
+            separator,
+            0,
+            true,
+            &overlay,
+            rows,
+        )?;
         Ok(String::from_utf8(out).unwrap())
     }
 
@@ -1122,9 +1130,17 @@ mod tests {
         let mut overlay = Overlay::new();
         overlay.delete([9], usize::MAX);
         let mut out = Vec::new();
-        let e = splice("a,b\n1,2\n".as_bytes(), &mut out, b',', 0, true, &overlay, 1)
-            .unwrap_err()
-            .to_string();
+        let e = splice(
+            "a,b\n1,2\n".as_bytes(),
+            &mut out,
+            b',',
+            0,
+            true,
+            &overlay,
+            1,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(e.contains("deleted rows were not found"), "{e}");
     }
 

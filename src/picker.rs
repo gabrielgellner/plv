@@ -269,7 +269,10 @@ mod tests {
         let mut picker = Picker::new(names(), vec![0, 1, 2, 3], BTreeSet::new());
         picker.show_only_cursor();
         assert_eq!(picker.selection().len(), 1);
-        assert!(picker.toggle_shown().is_err(), "and the last one still holds");
+        assert!(
+            picker.toggle_shown().is_err(),
+            "and the last one still holds"
+        );
     }
 
     #[test]

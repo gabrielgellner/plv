@@ -1155,7 +1155,10 @@ mod tests {
         let df = df! { "region" => ["east"], "q1" => ["1"] }.unwrap();
         let header = lines(&draw_sorted(&df, 60, &[(0, true)]))[1].clone();
         assert!(header.contains("region"), "{header}");
-        assert!(header.contains('▲'), "and still says it is sorted: {header}");
+        assert!(
+            header.contains('▲'),
+            "and still says it is sorted: {header}"
+        );
     }
 
     /// With the slack to grow into, the column takes the room for the whole
@@ -1166,7 +1169,10 @@ mod tests {
         let plain = lines(&draw_sorted(&df, 60, &[]))[1].clone();
         let sorted = lines(&draw_sorted(&df, 60, &[(0, true)]))[1].clone();
         assert!(!plain.contains('['), "unsorted has no indicator: {plain}");
-        assert!(sorted.contains("region ▲"), "one key, so no priority: {sorted}");
+        assert!(
+            sorted.contains("region ▲"),
+            "one key, so no priority: {sorted}"
+        );
     }
 
     /// A priority among one thing says nothing, so a lone key is just its
