@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.28.0] - 2026-10-15
+
+### Features
+
+- read semicolon-separated .csv files ([`6d604ea`](https://github.com/gabrielgellner/plv/commit/6d604ea7cb753a6ce3c81129d49a6a21dc098e27))
+
+### Styling
+
+- cargo fmt ([`3c7fe17`](https://github.com/gabrielgellner/plv/commit/3c7fe176bc9326714c9322788730c5d9a8a213be))
+
 ## [0.27.0] - 2026-10-01
 
 ### Features
@@ -306,6 +316,8 @@ All notable changes to this project will be documented in this file.
 ### Styling
 
 - fix clippy warnings ([`5cb0dba`](https://github.com/gabrielgellner/plv/commit/5cb0dba5f5d4bc0be4d3d3b09fd1e7cd00ff7722))
+
+[0.28.0]: https://github.com/gabrielgellner/plv/compare/v0.27.0...v0.28.0
 
 [0.27.0]: https://github.com/gabrielgellner/plv/compare/v0.26.0...v0.27.0
 
