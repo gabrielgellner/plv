@@ -161,10 +161,15 @@ publish:
 # branch you are not running should not silently change what `plv` means in
 # your shell.
 #
+# --locked for the reason `publish` and the release build use it: without it
+# `cargo install` ignores Cargo.lock and resolves every dependency afresh, which
+# builds something other than what was tested, and fails outright while a
+# dependency's only compatible versions are yanked (zip 6, under DuckDB).
+#
 # Install the working tree to ~/.cargo/bin and say what landed
 install:
     #!/usr/bin/env bash
     set -euo pipefail
-    cargo install --path .
+    cargo install --path . --locked
     echo ""
     echo "Now on PATH: $(plv --version) at $(command -v plv)"

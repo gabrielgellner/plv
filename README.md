@@ -505,17 +505,22 @@ cargo binstall plv
 ### From crates.io
 
 ```
-cargo install plv
+cargo install plv --locked
 ```
 
 This **compiles from source**, DuckDB included, so expect it to take a while —
 `cargo install` builds rather than fetching a binary. The prebuilt above is the
 same program without the wait.
 
+`--locked` builds against the dependency versions plv was released and tested
+with. Without it `cargo install` resolves them afresh, and that fails today:
+DuckDB's build needs `zip` 6, every release of which has been yanked, and only
+the lockfile still reaches it.
+
 ### From a checkout
 
 ```
-cargo install --path .
+cargo install --path . --locked
 ```
 
 `just install` does the same and then prints which version landed on your PATH.
