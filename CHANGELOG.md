@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.28.1] - 2026-10-16
+
+### Bug Fixes
+
+- install with --locked ([`26422bd`](https://github.com/gabrielgellner/plv/commit/26422bd1a669a2859aa49093c08c03d0e5799b26))
+
 ## [0.28.0] - 2026-10-15
 
 ### Features
@@ -316,6 +322,8 @@ All notable changes to this project will be documented in this file.
 ### Styling
 
 - fix clippy warnings ([`5cb0dba`](https://github.com/gabrielgellner/plv/commit/5cb0dba5f5d4bc0be4d3d3b09fd1e7cd00ff7722))
+
+[0.28.1]: https://github.com/gabrielgellner/plv/compare/v0.28.0...v0.28.1
 
 [0.28.0]: https://github.com/gabrielgellner/plv/compare/v0.27.0...v0.28.0
 
