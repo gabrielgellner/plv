@@ -15,7 +15,7 @@
 
 use std::borrow::Cow;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
 use std::time::SystemTime;
 
@@ -144,10 +144,8 @@ where
         output.flush()?;
         // Durable before the rename: a crash should leave either the old file
         // or the new one, never a truncated new one.
-        output
-            .into_inner()
-            .map_err(|e| e.into_error())?
-            .sync_all()?;
+        durable(&output.into_inner().map_err(|e| e.into_error())?)
+            .with_context(|| format!("cannot flush {} to disk", tmp.display()))?;
         Ok(())
     })();
 
@@ -162,6 +160,29 @@ where
     }
     fs::rename(&tmp, dst).with_context(|| format!("cannot replace {}", dst.display()))?;
     Stamp::of(dst)
+}
+
+/// Flush `file` to the device as far as its filesystem allows.
+///
+/// On macOS `sync_all` is `F_FULLFSYNC`, which a network mount (smbfs, and
+/// some NFS) refuses with `ENOTSUP` — and refusing the write over it would make
+/// a file on a NAS uneditable. A plain `fsync` is what such a mount can offer,
+/// so that is asked for instead: the durability is the server's to give, not
+/// ours, and the rename still keeps a failed write from touching the original.
+fn durable(file: &File) -> io::Result<()> {
+    match file.sync_all() {
+        #[cfg(target_os = "macos")]
+        Err(e) if e.raw_os_error() == Some(libc::ENOTSUP) => {
+            use std::os::fd::AsRawFd;
+            // SAFETY: the descriptor is owned by `file`, which outlives the call.
+            if unsafe { libc::fsync(file.as_raw_fd()) } == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        }
+        other => other,
+    }
 }
 
 /// Copy `src` to `out`, replacing the fields named by `overlay`.

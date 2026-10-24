@@ -2577,6 +2577,7 @@ dependencies = [
  "color-eyre",
  "crossterm 0.29.0",
  "duckdb",
+ "libc",
  "polars",
  "ratatui",
  "regex",
