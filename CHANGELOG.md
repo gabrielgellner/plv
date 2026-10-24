@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.28.2] - 2026-10-24
+
+### Bug Fixes
+
+- write files on SMB mounts ([`4760333`](https://github.com/gabrielgellner/plv/commit/47603334e71c0566e997767708584e1139145f67))
+
 ## [0.28.1] - 2026-10-16
 
 ### Bug Fixes
@@ -322,6 +328,8 @@ All notable changes to this project will be documented in this file.
 ### Styling
 
 - fix clippy warnings ([`5cb0dba`](https://github.com/gabrielgellner/plv/commit/5cb0dba5f5d4bc0be4d3d3b09fd1e7cd00ff7722))
+
+[0.28.2]: https://github.com/gabrielgellner/plv/compare/v0.28.1...v0.28.2
 
 [0.28.1]: https://github.com/gabrielgellner/plv/compare/v0.28.0...v0.28.1
 
