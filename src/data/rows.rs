@@ -109,15 +109,16 @@ pub fn predicate(filter: &Filter, schema: &Schema) -> Option<Expr> {
         .conditions
         .iter()
         .map(|condition| {
-            let (name, _) = schema.get_at_index(condition.column)?;
-            Some(one(col(name.as_str()), condition.op, &condition.value))
+            let (name, dtype) = schema.get_at_index(condition.column)?;
+            Some(one(name.as_str(), dtype, condition.op, &condition.value))
         })
         .collect::<Option<Vec<Expr>>>()?
         .into_iter()
         .reduce(Expr::and)
 }
 
-fn one(column: Expr, op: Op, value: &Value) -> Expr {
+fn one(name: &str, dtype: &DataType, op: Op, value: &Value) -> Expr {
+    let column = col(name);
     match value {
         // An empty literal asks for the cells with nothing in them, matching
         // how plv renders and writes an empty field everywhere else.
@@ -128,8 +129,7 @@ fn one(column: Expr, op: Op, value: &Value) -> Expr {
         // Regex reads the column as text, exactly as `/` search does, so it
         // works on a numeric column too.
         Value::Pattern(pattern) => {
-            let matches = column
-                .cast(DataType::String)
+            let matches = as_text(name, dtype)
                 .str()
                 .contains(lit(pattern.as_str()), false);
             if op == Op::NotMatches {
@@ -141,7 +141,63 @@ fn one(column: Expr, op: Op, value: &Value) -> Expr {
         Value::Number(n) => compare(column, op, lit(*n)),
         Value::Bool(b) => compare(column, op, lit(*b)),
         Value::Text(s) => compare(column, op, lit(s.as_str())),
+        Value::Moment { scalar, .. } => compare(column, op, lit(scalar.clone())),
     }
+}
+
+/// A column read as text — how `/` search reads every column, and how `~`
+/// reads one.
+///
+/// Most types cast, and the cast is what stays vectorised. A list, a duration
+/// and a few others have no cast to text in Polars, and a pattern that cannot
+/// read one column must not fail the whole scan, so those are rendered value
+/// by value the way the table draws them.
+pub fn as_text(name: &str, dtype: &DataType) -> Expr {
+    if casts_to_text(dtype) {
+        return col(name).cast(DataType::String);
+    }
+    col(name).map(
+        |column| text_column(&column),
+        |_, field| Ok(Field::new(field.name().clone(), DataType::String)),
+    )
+}
+
+/// A column of cells as text: the cast where there is one, else each value as
+/// the table draws it. Nulls stay null.
+pub fn text_column(column: &Column) -> PolarsResult<Column> {
+    if casts_to_text(column.dtype()) {
+        return column.cast(&DataType::String);
+    }
+    let series = column.as_materialized_series().rechunk();
+    let text: StringChunked = series
+        .iter()
+        .map(|value| match value {
+            AnyValue::Null => None,
+            value => Some(value.str_value().into_owned()),
+        })
+        .collect();
+    Ok(text.with_name(column.name().clone()).into_column())
+}
+
+/// Whether `dtype` reads as text through a cast. Named rather than
+/// asked of Polars: a cast of no values succeeds whatever the type, so only
+/// the data could answer, and a type left off this list is merely rendered
+/// the slower way, never wrongly.
+fn casts_to_text(dtype: &DataType) -> bool {
+    dtype.is_primitive_numeric()
+        || matches!(
+            dtype,
+            DataType::Boolean
+                | DataType::String
+                | DataType::Binary
+                | DataType::Decimal(..)
+                | DataType::Date
+                | DataType::Datetime(..)
+                | DataType::Time
+                | DataType::Categorical(..)
+                | DataType::Enum(..)
+                | DataType::Null
+        )
 }
 
 fn compare(column: Expr, op: Op, value: Expr) -> Expr {
