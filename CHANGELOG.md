@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.28.3] - 2026-10-29
+
+### Bug Fixes
+
+- open parquet files of every column type ([`848dcca`](https://github.com/gabrielgellner/plv/commit/848dcca22dd082c22d3af8bb76c923ec174f6664))
+
 ## [0.28.2] - 2026-10-24
 
 ### Bug Fixes
@@ -328,6 +334,8 @@ All notable changes to this project will be documented in this file.
 ### Styling
 
 - fix clippy warnings ([`5cb0dba`](https://github.com/gabrielgellner/plv/commit/5cb0dba5f5d4bc0be4d3d3b09fd1e7cd00ff7722))
+
+[0.28.3]: https://github.com/gabrielgellner/plv/compare/v0.28.2...v0.28.3
 
 [0.28.2]: https://github.com/gabrielgellner/plv/compare/v0.28.1...v0.28.2
 
