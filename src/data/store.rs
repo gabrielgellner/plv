@@ -27,16 +27,6 @@ const SOURCE_ROW: &str = "__src__";
 /// never in a frame anything else can see.
 const NATURAL_KEY: &str = "__nat__";
 
-/// A sorted frame is kept in memory, so there has to be a point past which it
-/// is not — and past which plv declines to sort at all. The size of that point
-/// comes from [`budget`], which asks the machine rather than assuming one.
-///
-/// Falling back to a lazy sort was the obvious kindness and is the wrong one.
-/// Polars has to read and rank every row either way, so a lazy sort of a table
-/// that does not fit does not degrade, it just fails slowly: measured against
-/// an 842M-row census parquet, the lazy path reached **12.5GB resident in 45
-/// seconds** without producing a page. Refusing is the honest answer.
-///
 /// Where a store's rows come from.
 ///
 /// CSV and Parquet are read lazily by Polars. Lake tables go through DuckDB's
@@ -861,10 +851,10 @@ impl Store {
 
     /// Rebuild whatever the current sort needs, off the main thread.
     ///
-    /// For a frame that fits, that is the whole sorted table: paying one full
-    /// read once instead of one per page. Past the cap, and for lake tables,
-    /// it stays the old first-page fetch — the sort is redone per page, which
-    /// is slow but works.
+    /// For a file, that is the whole sorted table: paying one full read once
+    /// instead of one per page. A sort past the cap never reaches here, since
+    /// `sort_blocked` refuses it first. A lake table is the exception: DuckDB
+    /// sorts it page by page, so what comes back is the first page.
     pub fn resort(&mut self) -> mpsc::Receiver<DataFrame> {
         let (tx, rx) = mpsc::channel();
         self.sorted = None;
@@ -979,8 +969,6 @@ impl Store {
 
     /// Sort the whole frame, carrying the file's row numbers through it.
     ///
-    /// The row index goes on *before* the sort, so it records where each row
-    /// came from rather than where it ended up.
     /// The row index goes on *before* the filter, so it records where each
     /// row came from rather than where it survived to; the filter goes on
     /// before the sort, matching the order the view language documents.
@@ -1003,8 +991,8 @@ impl Store {
     /// Take the result of a sort.
     ///
     /// A frame carrying [`SOURCE_ROW`] is the whole sorted table and is kept;
-    /// anything else is one page, fetched the old way because the table was
-    /// too big to hold.
+    /// anything else is a lake table's first page, sorted by DuckDB, which
+    /// sorts each page as it is asked for rather than holding the table.
     pub fn adopt_sorted(&mut self, df: DataFrame) -> Result<()> {
         if df.column(SOURCE_ROW).is_ok() {
             self.sorted = Some(df);
@@ -1279,8 +1267,9 @@ impl Store {
     }
 
     /// Re-open the file after writing to it, in case an edit changed a
-    /// column's inferred type. The row count cannot have changed: a value
-    /// containing a newline is quoted, so it stays one record.
+    /// column's inferred type. The row count and the index are not read
+    /// again: `save` has already adopted the ones the writer counted on its
+    /// way through, which is what a deleted or added row needs.
     fn reload(&mut self) -> Result<()> {
         let Some(target) = &self.edit else {
             return Ok(());
@@ -1791,7 +1780,6 @@ impl Store {
     }
 
     /// Take a batch of matching rows from the scan.
-    /// Take a batch of matching rows from the scan.
     ///
     /// Returns whether the scan is still wanted: once the set is as large as
     /// the budget allows, it keeps what it has and the caller drops the
@@ -1955,6 +1943,16 @@ fn parse_span(bytes: Vec<u8>, schema: &SchemaRef, separator: u8) -> Result<DataF
 
 /// Whether a table of this shape can be sorted at all: whether holding it
 /// would fit the memory budget.
+///
+/// A sorted frame is kept in memory, so there has to be a point past which it
+/// is not — and past which plv declines to sort at all. The size of that point
+/// comes from [`budget`], which asks the machine rather than assuming one.
+///
+/// Falling back to a lazy sort was the obvious kindness and is the wrong one.
+/// Polars has to read and rank every row either way, so a lazy sort of a table
+/// that does not fit does not degrade, it just fails slowly: measured against
+/// an 842M-row census parquet, the lazy path reached **12.5GB resident in 45
+/// seconds** without producing a page. Refusing is the honest answer.
 fn sort_fits(rows: usize, columns: usize) -> bool {
     rows.saturating_mul(columns) <= budget::sort_cells()
 }

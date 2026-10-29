@@ -1,7 +1,7 @@
 //! Pending cell edits: the buffer between a keystroke and `:w`.
 //!
-//! plv reads lazily — only the visible rows are ever materialized — so there is
-//! no `DataFrame` to mutate. Edits live here instead, as a sparse overlay keyed
+//! plv reads lazily — a page holds only the rows on screen — so there is no
+//! `DataFrame` to mutate. Edits live here instead, as a sparse overlay keyed
 //! by position in the *source* file, stamped onto each page as it is rendered
 //! and spliced into the file on write. Memory is proportional to the number of
 //! edits, not to the size of the file.

@@ -735,8 +735,8 @@ impl Widget for DataTable<'_> {
                     };
                     // Call out an unwritten edit, so the state of the buffer is
                     // visible in the grid and not only as a count in the status
-                    // bar. Foreground only, so it layers over the cursor and the
-                    // alternating row backgrounds rather than replacing them.
+                    // bar. Foreground only, so it layers over the cursor and
+                    // selection backgrounds rather than replacing them.
                     let cs = if self.edited.contains(&(ri, ci)) {
                         cs.fg(self.theme.edited_fg).add_modifier(Modifier::BOLD)
                     } else {
