@@ -344,10 +344,10 @@ pub fn parse(line: &str, schema: &Schema) -> Result<Command, ParseError> {
     // A verb with nothing after it undoes itself. `:select` is where the hand
     // goes to put the columns back, and no other reading of it is useful —
     // selecting nothing is refused anyway.
-    if args.is_empty() {
-        if let Some(slot) = slot_of(verb.text) {
-            return Ok(Command::Reset(Some(slot)));
-        }
+    if args.is_empty()
+        && let Some(slot) = slot_of(verb.text)
+    {
+        return Ok(Command::Reset(Some(slot)));
     }
 
     match verb.text {
