@@ -115,7 +115,7 @@ enum EditStart {
 ///
 /// The height is captured by `draw` rather than worked out by the key
 /// handler, because how tall the window is depends on how the value wrapped,
-/// which depends on how wide it is — all of it settled by `ui::cell_window`
+/// which depends on how wide it is — all of it settled by `ui::cell::window`
 /// at layout time. A key pressed before the first frame simply moves by a
 /// line.
 struct Inspect {
@@ -248,8 +248,9 @@ pub struct App {
     /// Where a visual selection started, as `(absolute row, column index)`.
     /// Absolute, so scrolling the anchor off screen does not move it.
     visual_anchor: Option<(usize, usize)>,
-    /// The yank register: a block of cell text, rows outermost. Internal to
-    /// plv — nothing is exchanged with the system clipboard.
+    /// The yank register: a block of cell text, rows outermost. `y` also
+    /// sends it to the system clipboard, but `p` reads it back from here: a
+    /// paste from the clipboard arrives through the terminal instead.
     register: Vec<Vec<String>>,
     edit_buf: String,
     /// Caret position in `edit_buf`, counted in characters.

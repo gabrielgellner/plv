@@ -341,14 +341,14 @@ impl LakeDb {
         })
     }
 
-    /// A second handle on the same attached lake, for a background thread.
-    /// Sharing the attachment avoids paying the ~20ms ATTACH cost again.
     /// The attachment itself, for a caller that wants to ask its own
     /// question of the lake.
     pub fn conn(&self) -> &Connection {
         &self.conn
     }
 
+    /// A second handle on the same attached lake, for a background thread.
+    /// Sharing the attachment avoids paying the ~20ms ATTACH cost again.
     pub fn try_clone(&self) -> Result<Connection> {
         Ok(self.conn.try_clone()?)
     }

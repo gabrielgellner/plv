@@ -1,4 +1,4 @@
-//! Writing pending edits back to a delimited text file.
+//! Writing pending edits back to a delimited text or JSONL file.
 //!
 //! An edit is a *text* edit. The file on disk is untyped; the types plv shows
 //! come from Polars' inference over it. So the write path never re-serializes
