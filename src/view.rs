@@ -18,7 +18,8 @@
 use std::fmt::Write as _;
 use std::ops::Range;
 
-use polars::prelude::{DataType, Schema};
+use chrono::{NaiveDate, NaiveDateTime, NaiveTime, TimeZone as _, Timelike};
+use polars::prelude::{DataType, Scalar, Schema, TimeUnit};
 use regex::Regex;
 
 /// A parsed, schema-checked command. Columns are indices: names are resolved
@@ -123,6 +124,12 @@ pub enum Value {
     Bool(bool),
     Text(String),
     Pattern(Regex),
+    /// A date, a time or a moment, held as the column's own type so the
+    /// comparison needs no cast — and kept as typed for showing back.
+    Moment {
+        text: String,
+        scalar: Scalar,
+    },
     /// An empty literal. plv treats an absent field and an empty one as the
     /// same thing everywhere else — it renders both as `·` and writes both back
     /// as empty — so `= ""` asks for the cells with nothing in them.
@@ -236,6 +243,7 @@ impl Value {
             Value::Bool(b) => b.to_string(),
             Value::Text(s) => s.clone(),
             Value::Pattern(r) => r.as_str().to_string(),
+            Value::Moment { text, .. } => text.clone(),
             Value::Empty => "\"\"".to_string(),
         }
     }
@@ -546,7 +554,7 @@ fn resolve_value(
         return Ok(Value::Empty);
     }
 
-    if dtype.is_integer() || dtype.is_float() {
+    if dtype.is_numeric() {
         return token.text.parse::<f64>().map(Value::Number).map_err(|_| {
             ParseError::new(
                 format!(
@@ -573,7 +581,113 @@ fn resolve_value(
             )),
         };
     }
+    if let Some(form) = moment_form(dtype) {
+        return moment(dtype, token.text)
+            .map(|scalar| Value::Moment {
+                text: token.text.to_string(),
+                scalar,
+            })
+            .map_err(|why| {
+                ParseError::new(
+                    why.unwrap_or_else(|| {
+                        format!(
+                            "{:?} is not {form}, and column {column:?} is {dtype}",
+                            token.text
+                        )
+                    }),
+                    token.span.clone(),
+                )
+            });
+    }
+    if !matches!(
+        dtype,
+        DataType::String | DataType::Categorical(..) | DataType::Enum(..) | DataType::Null
+    ) {
+        // A list, a duration, a struct, bytes: there is no literal to write
+        // one as, and a text one would get past here only to fail the scan.
+        return Err(ParseError::new(
+            format!("column {column:?} is {dtype}, so it can only be matched with ~ or \"\""),
+            token.span.clone(),
+        ));
+    }
     Ok(Value::Text(token.text.to_string()))
+}
+
+/// How a literal for a temporal column is written, for the message that says
+/// it was not.
+fn moment_form(dtype: &DataType) -> Option<&'static str> {
+    match dtype {
+        DataType::Date => Some("a date (YYYY-MM-DD)"),
+        DataType::Datetime(..) => Some("a date and time (YYYY-MM-DD HH:MM:SS)"),
+        DataType::Time => Some("a time (HH:MM:SS)"),
+        _ => None,
+    }
+}
+
+/// Read a literal as a value of a temporal column.
+///
+/// Parsed here rather than cast by Polars: its string casts take only some of
+/// the forms it prints, and say so on stderr — over the TUI. A moment in a
+/// zoned column is read as the wall time the column shows, which is the time
+/// in its zone. `Err(None)` is a literal that did not parse; `Err(Some(_))`
+/// one that parsed but names no single moment.
+fn moment(dtype: &DataType, text: &str) -> Result<Scalar, Option<String>> {
+    match dtype {
+        DataType::Date => {
+            let date = NaiveDate::parse_from_str(text, "%Y-%m-%d").map_err(|_| None)?;
+            let days = (date - NaiveDate::default()).num_days();
+            Ok(Scalar::new_date(i32::try_from(days).map_err(|_| None)?))
+        }
+        DataType::Datetime(unit, zone) => {
+            let wall = date_time(text).ok_or(None)?;
+            let instant = match zone {
+                None => wall.and_utc(),
+                Some(zone) => zone
+                    .to_chrono()
+                    .map_err(|e| Some(e.to_string()))?
+                    .from_local_datetime(&wall)
+                    .single()
+                    .ok_or_else(|| Some(format!("{text:?} is not one moment in {zone}")))?
+                    .to_utc(),
+            };
+            let value = match unit {
+                TimeUnit::Milliseconds => Some(instant.timestamp_millis()),
+                TimeUnit::Microseconds => Some(instant.timestamp_micros()),
+                TimeUnit::Nanoseconds => instant.timestamp_nanos_opt(),
+            };
+            let value =
+                value.ok_or_else(|| Some(format!("{text:?} is out of range for {dtype}")))?;
+            Ok(Scalar::new_datetime(value, *unit, zone.clone()))
+        }
+        DataType::Time => {
+            let time = ["%H:%M:%S%.f", "%H:%M"]
+                .iter()
+                .find_map(|form| NaiveTime::parse_from_str(text, form).ok())
+                .ok_or(None)?;
+            let nanos = i64::from(time.num_seconds_from_midnight()) * 1_000_000_000
+                + i64::from(time.nanosecond());
+            Ok(Scalar::new_time(nanos))
+        }
+        _ => Err(None),
+    }
+}
+
+/// A date and time as `:filter` takes one: a space or a `T` between them,
+/// seconds and their fraction optional, and a bare date meaning midnight.
+fn date_time(text: &str) -> Option<NaiveDateTime> {
+    [
+        "%Y-%m-%d %H:%M:%S%.f",
+        "%Y-%m-%dT%H:%M:%S%.f",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%dT%H:%M",
+    ]
+    .iter()
+    .find_map(|form| NaiveDateTime::parse_from_str(text, form).ok())
+    .or_else(|| {
+        NaiveDate::parse_from_str(text, "%Y-%m-%d")
+            .ok()?
+            .and_hms_opt(0, 0, 0)
+    })
 }
 
 fn resolve_column(token: &Token<'_>, schema: &Schema) -> Result<usize, ParseError> {
@@ -763,6 +877,63 @@ mod tests {
                 .message
                 .contains("cannot be ordered")
         );
+    }
+
+    /// Columns only a typed file can have: a parquet brings its dates and
+    /// lists with it.
+    fn typed(line: &str) -> Result<Command, ParseError> {
+        let zone = polars::prelude::TimeZone::opt_try_new(Some("Europe/Paris"))
+            .unwrap()
+            .unwrap();
+        let schema = Schema::from_iter([
+            (PlSmallStr::from_static("day"), DataType::Date),
+            (
+                PlSmallStr::from_static("at"),
+                DataType::Datetime(TimeUnit::Microseconds, Some(zone)),
+            ),
+            (PlSmallStr::from_static("when"), DataType::Time),
+            (
+                PlSmallStr::from_static("tags"),
+                DataType::List(Box::new(DataType::String)),
+            ),
+        ]);
+        parse(line, &schema)
+    }
+
+    #[test]
+    fn a_temporal_column_takes_a_literal_of_its_own_kind() {
+        for line in [
+            "filter day > 2024-01-01",
+            "filter at >= 2024-03-31",
+            r#"filter at < "2024-03-31 01:59:59.5""#,
+            "filter at = 2024-03-31T12:00",
+            "filter when < 09:30",
+            "filter when = 09:30:15.25",
+        ] {
+            assert!(typed(line).is_ok(), "{line}: {:?}", typed(line).err());
+        }
+
+        let e = typed("filter day > 2024-13-01").unwrap_err();
+        assert!(e.message.contains("is not a date (YYYY-MM-DD)"), "{e}");
+        assert_eq!(&"filter day > 2024-13-01"[e.span.clone()], "2024-13-01");
+        let e = typed("filter when > noon").unwrap_err();
+        assert!(e.message.contains("is not a time (HH:MM:SS)"), "{e}");
+    }
+
+    /// 02:30 never happened in Paris on the day the clocks went forward, and
+    /// guessing which moment was meant would answer a question nobody asked.
+    #[test]
+    fn a_wall_time_its_zone_skipped_is_refused() {
+        let e = typed(r#"filter at > "2024-03-31 02:30""#).unwrap_err();
+        assert!(e.message.contains("not one moment in Europe/Paris"), "{e}");
+    }
+
+    #[test]
+    fn a_column_with_no_literal_is_matched_and_not_compared() {
+        let e = typed("filter tags = a").unwrap_err();
+        assert!(e.message.contains("can only be matched with ~"), "{e}");
+        assert!(typed("filter tags ~ a").is_ok());
+        assert!(typed(r#"filter tags = """#).is_ok());
     }
 
     #[test]

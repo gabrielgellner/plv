@@ -1089,8 +1089,8 @@ impl Store {
             return None;
         }
         let column = self.current_view.columns().get(col)?;
-        let text = column.cast(&DataType::String).ok()?;
-        Some(text.str().ok()?.get(local).unwrap_or("").to_string())
+        let text = rows::text_column(&column.slice(local as i64, 1)).ok()?;
+        Some(text.str().ok()?.get(0).unwrap_or("").to_string())
     }
 
     /// Everything pending: cells edited and rows deleted.
@@ -1597,13 +1597,7 @@ impl Store {
             let schema = schema.clone();
             let pattern = pattern.clone();
             let col_name = col_name.clone();
-            move || match col_name {
-                Some(name) => Some(matches_pattern(&name, &pattern)),
-                None => schema
-                    .iter_names()
-                    .map(|name| matches_pattern(name.as_str(), &pattern))
-                    .reduce(Expr::or),
-            }
+            move || search_predicate(&schema, col_name.as_deref(), &pattern)
         };
 
         // The indexed scan reads the file itself, so it can only stand in for
@@ -1626,12 +1620,8 @@ impl Store {
                 None => return,
             },
         };
-        Self::scan_rows(lf, total, tx, move || match col_name {
-            Some(name) => Some(matches_pattern(&name, &pattern)),
-            None => schema
-                .iter_names()
-                .map(|name| matches_pattern(name.as_str(), &pattern))
-                .reduce(Expr::or),
+        Self::scan_rows(lf, total, tx, move || {
+            search_predicate(&schema, col_name.as_deref(), &pattern)
         });
     }
 
@@ -2026,11 +2016,21 @@ fn sort_naturally(df: DataFrame, keys: &[(String, bool)]) -> Result<DataFrame> {
     Ok(sorted.drop_many(added.iter().map(|column| column.name().clone())))
 }
 
+/// What `/` asks of a row: that the one column, or any column, matches.
+fn search_predicate(schema: &Schema, column: Option<&str>, pattern: &str) -> Option<Expr> {
+    match column {
+        Some(name) => Some(matches_pattern(name, schema.get(name)?, pattern)),
+        None => schema
+            .iter()
+            .map(|(name, dtype)| matches_pattern(name.as_str(), dtype, pattern))
+            .reduce(Expr::or),
+    }
+}
+
 /// A column rendered as text and matched against a pattern — how `/` search
 /// reads every column, and how `~` reads one.
-fn matches_pattern(column: &str, pattern: &str) -> Expr {
-    col(column)
-        .cast(DataType::String)
+fn matches_pattern(column: &str, dtype: &DataType, pattern: &str) -> Expr {
+    rows::as_text(column, dtype)
         .str()
         .contains(lit(pattern), false)
 }
@@ -2993,5 +2993,162 @@ mod tests {
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), SAMPLE);
         assert_eq!(store.dirty(), 1, ":w path does not save the source file");
+    }
+    /// A parquet file carries its types with it, so every type Polars has is
+    /// one a file can arrive with — and each was once an error or a panic at
+    /// open, because the dtype was not compiled in (issue #1).
+    fn every_dtype(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join("plv-store-tests").join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let base = df!(
+            "n" => [1i64, 2],
+            "f" => [1.5f64, 2.25],
+            "s" => ["a", "b"],
+            "bin" => [&b"ab"[..], &b"cd"[..]],
+        )
+        .unwrap();
+        let utc = Some(TimeZone::UTC);
+        let mut df = base
+            .lazy()
+            .select([
+                col("n").cast(DataType::Int8).alias("i8"),
+                col("n").cast(DataType::Int16).alias("i16"),
+                col("n").cast(DataType::UInt8).alias("u8"),
+                col("n").cast(DataType::UInt16).alias("u16"),
+                col("n").cast(DataType::Int128).alias("i128"),
+                col("f").cast(DataType::Decimal(10, 2)).alias("dec"),
+                (col("n") * lit(19_723i64))
+                    .cast(DataType::Date)
+                    .alias("date"),
+                (col("n") * lit(1_704_110_400_000_000i64))
+                    .cast(DataType::Datetime(TimeUnit::Microseconds, None))
+                    .alias("ts"),
+                (col("n") * lit(1_704_110_400_000_000i64))
+                    .cast(DataType::Datetime(TimeUnit::Microseconds, utc))
+                    .alias("tz"),
+                (col("n") * lit(3_600_000_000_000i64))
+                    .cast(DataType::Time)
+                    .alias("time"),
+                (col("n") * lit(3_600_000_000i64))
+                    .cast(DataType::Duration(TimeUnit::Microseconds))
+                    .alias("dur"),
+                as_struct(vec![col("n"), col("s")]).alias("rec"),
+                concat_list([col("n"), col("n")]).unwrap().alias("list"),
+                col("bin"),
+                col("s")
+                    .cast(DataType::from_categories(Categories::global()))
+                    .alias("cat"),
+            ])
+            .collect()
+            .unwrap();
+        ParquetWriter::new(std::fs::File::create(&path).unwrap())
+            .finish(&mut df)
+            .unwrap();
+        path
+    }
+
+    #[test]
+    fn a_parquet_file_of_every_type_opens_and_reads_as_text() {
+        let path = every_dtype("every-dtype-open.parquet");
+        let store = Store::open_file(&path, 4).unwrap();
+        let text: Vec<String> = (0..store.column_count())
+            .map(|c| store.cell_text(0, c).unwrap())
+            .collect();
+        assert_eq!(
+            text,
+            [
+                "1",
+                "1",
+                "1",
+                "1",
+                "1",
+                "1.50",
+                "2024-01-01",
+                "2024-01-01 12:00:00.000000",
+                "2024-01-01 12:00:00.000000+00:00",
+                "01:00:00",
+                "1h",
+                "{1,\"a\"}",
+                "[1, 1]",
+                "ab",
+                "a",
+            ]
+        );
+    }
+
+    #[test]
+    fn every_type_sorts() {
+        let path = every_dtype("every-dtype-sort.parquet");
+        let mut store = Store::open_file(&path, 4).unwrap();
+        for c in 0..store.column_count() {
+            let name = store.column_info(c).unwrap().0;
+            if store.sort_blocked().is_some() {
+                panic!("{name}: {:?}", store.sort_blocked());
+            }
+            sorted_by(&mut store, c);
+            sorted_by(&mut store, c);
+            store.clear_sort().unwrap();
+        }
+    }
+
+    fn search(store: &Store, pattern: &str, column: Option<&str>) -> Vec<usize> {
+        let (tx, rx) = mpsc::channel();
+        store.search_async(pattern.into(), column.map(str::to_string), tx);
+        rx.iter().flatten().collect()
+    }
+
+    /// `/` reads every column as text, so one column it cannot read must not
+    /// take the whole search down with it.
+    #[test]
+    fn every_type_can_be_searched() {
+        let path = every_dtype("every-dtype-search.parquet");
+        let store = Store::open_file(&path, 4).unwrap();
+        assert_eq!(search(&store, "^b$", None), [1]);
+        assert_eq!(search(&store, "2h", Some("dur")), [1]);
+        assert_eq!(search(&store, r"\[2, 2\]", Some("list")), [1]);
+    }
+
+    fn filtered(store: &mut Store, line: &str) -> Vec<usize> {
+        store.view.filter = Some(match crate::view::parse(line, &store.schema) {
+            Ok(crate::view::Command::Filter(filter)) => filter,
+            other => panic!("{line}: {other:?}"),
+        });
+        let rx = store.begin_filter().unwrap().expect("a scan was started");
+        while let Ok(batch) = rx.recv_timeout(std::time::Duration::from_secs(30)) {
+            if !store.extend_filter(batch).unwrap() {
+                break;
+            }
+        }
+        store.finish_filter().unwrap();
+        (0..store.row_count())
+            .map(|r| store.source_row(r).unwrap())
+            .collect()
+    }
+
+    /// What the prompt accepts, the scan can run: none of these may get past
+    /// `view::parse` only to fail inside a collect.
+    #[test]
+    fn every_type_filters_on_what_the_prompt_accepts() {
+        let path = every_dtype("every-dtype-filter.parquet");
+        let mut store = Store::open_file(&path, 4).unwrap();
+        for (line, rows) in [
+            ("filter u8 > 1", &[1][..]),
+            ("filter i128 = 2", &[1]),
+            ("filter dec >= 2.25", &[1]),
+            ("filter date > 2024-01-01", &[1]),
+            ("filter date = 2024-01-01", &[0]),
+            ("filter ts < \"2024-01-01 12:00:01\"", &[0]),
+            ("filter ts > 2024-01-01T12:00", &[1]),
+            ("filter ts > 2024-01-02", &[1]),
+            ("filter tz = \"2024-01-01 12:00:00\"", &[0]),
+            ("filter time >= 02:00", &[1]),
+            ("filter cat = b", &[1]),
+            ("filter list ~ 2", &[1]),
+            ("filter dur ~ 1h", &[0]),
+            ("filter rec ~ b", &[1]),
+            ("filter bin ~ cd", &[1]),
+        ] {
+            assert_eq!(filtered(&mut store, line), rows, "{line}");
+        }
     }
 }

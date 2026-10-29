@@ -438,7 +438,16 @@ still written by `:w`, it just has nowhere on screen to be marked.
 Grammar, deliberately closed: `~` and `!~` are regex and read any column as text
 (as `/` search does); other comparisons require a literal matching the column's
 type; an empty literal `""` means the cells with nothing in them, matching how
-plv renders and writes empty fields elsewhere. Conditions join with `and` only —
+plv renders and writes empty fields elsewhere. A date, datetime or time column
+takes `2024-01-01`, `"2024-01-01 12:00"` or `09:30`, parsed by plv into a value
+of the column's own type rather than cast by Polars, whose string casts accept
+only some of the forms it prints and warn about it on stderr, over the TUI. A
+zoned column reads the literal as wall time in its zone, since that is what the
+table shows, and a time the zone skipped or repeated is refused rather than
+guessed. A list, struct, duration or bytes column has no literal at all and
+says so: only `~` and `""` reach it. "Any column as text" is `rows::as_text`,
+which casts where Polars has a cast and otherwise draws each value the way the
+table does — one column without a cast used to make `/` find nothing at all. Conditions join with `and` only —
 no `or` and no parentheses, because precedence cannot be introduced later
 without changing what already-written commands mean.
 
@@ -471,9 +480,12 @@ that quietly stops reads as the whole list.
 
 The features plv needs are not in the default set and are named explicitly —
 `lazy` and `parquet` for the readers, `strings` and `regex` for what `/` and
-`:filter ~` ask of a column:
+`:filter ~` ask of a column, and `dtype-full` with `timezones` because a parquet
+file brings its own types. Polars only knows the types it was compiled with: a
+`UInt8` column was an error at open and a `Decimal` one a panic, and a zoned
+datetime panics as it is drawn without `timezones`:
 ```toml
-polars = { version = "0.55.2", features = ["lazy", "parquet", "strings", "regex"] }
+polars = { version = "0.55.2", features = ["lazy", "parquet", "strings", "regex", "dtype-full", "timezones"] }
 ```
 
 Key API differences from older polars:
