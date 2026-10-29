@@ -162,7 +162,7 @@ impl RowIndex {
                     rows += 1;
                     started = false;
                     // Row 0 begins where the header ends, added once at the end.
-                    if rows % STRIDE == 0 {
+                    if rows.is_multiple_of(STRIDE) {
                         checkpoints.push(base + (from + i) as u64 + 1);
                     }
                 }
@@ -219,7 +219,7 @@ impl RowIndex {
                 if byte == b'\n' {
                     rows += 1;
                     started = false;
-                    if rows % STRIDE == 0 {
+                    if rows.is_multiple_of(STRIDE) {
                         checkpoints.push(position + i as u64 + 1);
                     }
                 } else {
@@ -273,7 +273,7 @@ impl Building {
     /// next one begins, and so what a checkpoint points at.
     pub fn record(&mut self, end: u64) {
         self.rows += 1;
-        if self.rows % STRIDE == 0 {
+        if self.rows.is_multiple_of(STRIDE) {
             self.checkpoints.push(end);
         }
     }

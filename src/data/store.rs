@@ -2694,7 +2694,11 @@ mod tests {
                 "page at {offset} began on the wrong row"
             );
             let note = cell(&store.current_view, 1, 0).unwrap();
-            let expected = if landed % 7 == 0 { "a,b" } else { "plain" };
+            let expected = if landed.is_multiple_of(7) {
+                "a,b"
+            } else {
+                "plain"
+            };
             assert_eq!(note, expected, "row {landed} came back with the wrong note");
         }
     }
@@ -2799,8 +2803,8 @@ mod tests {
         store.edit([((0, 1), "9.5".to_string())]).unwrap();
         assert_eq!(store.current_view.columns()[1].dtype(), &DataType::Float64);
         assert_eq!(cell(&store.current_view, 1, 0).as_deref(), Some("9.5"));
-        for row in 1..3 {
-            assert_eq!(cell(&store.current_view, 1, row), before[row], "row {row}");
+        for (row, was) in before.iter().enumerate().skip(1) {
+            assert_eq!(&cell(&store.current_view, 1, row), was, "row {row}");
         }
     }
 
