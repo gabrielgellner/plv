@@ -1,7 +1,9 @@
 # Checks every pull request, and every push to main, before it can be merged.
 #
-# The job's name is what branch protection requires by, so renaming it means
-# updating the required check on main as well — or nothing will merge.
+# The job's name is what branch protection would require it by. It is not a
+# required check yet — the first runs are to see what a warm cache costs — but
+# once it is, renaming the job means updating main's protection as well, or
+# nothing will merge.
 name: ci
 
 on:

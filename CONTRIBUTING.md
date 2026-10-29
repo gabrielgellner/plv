@@ -30,8 +30,8 @@ cannot be force-pushed or deleted. Work on a branch named for its type
 `Closes #<n>` in the pull request closes the issue when it merges.
 
 Every pull request, and every push to `main`, runs the `ci` workflow
-(`.github/workflows/ci.yml`). Its `check` job is a required status check, so a
-pull request cannot merge until it passes:
+(`.github/workflows/ci.yml`). Its `check` job reports on the pull request; it
+is not a required check yet, so look for green before merging:
 
 ```bash
 cargo fmt --check
