@@ -1,0 +1,50 @@
+# Checks every pull request, and every push to main, before it can be merged.
+#
+# The job's name is what branch protection requires by, so renaming it means
+# updating the required check on main as well — or nothing will merge.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# A new push to a pull request makes the run for the old one worthless.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: check
+    runs-on: ubuntu-latest
+    # The first run builds the bundled DuckDB from source; the cache makes the
+    # ones after it a fraction of that.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      # Stable rather than pinned, matching what the release builds use. A new
+      # stable can bring a new lint that fails here on a branch that did not
+      # cause it; that is the point at which to fix it, not a reason to pin.
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --check
+
+      # --locked for the reason the release build uses it: check what the
+      # committed Cargo.lock describes, not whatever resolves today.
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --locked
