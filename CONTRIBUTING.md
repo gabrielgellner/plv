@@ -16,9 +16,39 @@ cargo run -- path/to/file.csv      # run with a file
 cargo run -- path/to/file.jsonl    # or .ndjson, .parquet, a .ducklake catalog
 cargo run -- samples/log.jsonl     # a small log to try things on
 cargo test                         # run tests
-cargo clippy                       # lint — must be clean before committing
+cargo fmt                          # format — CI runs `cargo fmt --check`
+cargo clippy --all-targets         # lint — CI fails on any warning
 cargo build --release              # optimised build (LTO + strip)
 ```
+
+## Pull requests and CI
+
+`main` is protected: every change reaches it through a pull request, and it
+cannot be force-pushed or deleted. Work on a branch named for its type
+(`fix/…`, `feat/…`, `docs/…`, `chore/…`); a branch for an issue is made with
+`gh issue develop <n> --checkout --name fix/<n>-…`, which links the two, and
+`Closes #<n>` in the pull request closes the issue when it merges.
+
+Every pull request, and every push to `main`, runs the `ci` workflow
+(`.github/workflows/ci.yml`). Its `check` job reports on the pull request; it
+is not a required check yet, so look for green before merging:
+
+```bash
+cargo fmt --check
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --locked
+```
+
+Run the same three before pushing and CI holds no surprises. `--locked` checks
+what the committed `Cargo.lock` describes; if it fails there, the lock file is
+out of date with `Cargo.toml` and needs committing. The toolchain is the latest
+stable, so a new Rust release can bring a new lint that fails a branch which
+did not cause it: fix it there, in its own `chore:` commit.
+
+Merge with a merge commit rather than a squash or a rebase. Its subject follows
+the branch's type, `fix: merge fix/1-parquet-dtypes — what it does`, and the
+changelog skips it in favour of the branch's own commits, which is why their
+types matter (below).
 
 ## Commit style
 
@@ -83,6 +113,12 @@ Once satisfied:
 ```bash
 just release
 ```
+
+Cut a release from an up-to-date `main` with every pull request for it merged.
+The `chore(release)` commit is pushed straight to `main` rather than through a
+pull request: branch protection lets an admin bypass it, and the release
+depends on that, since the tag has to point at the commit that names its
+version.
 
 This pushes the branch and tag to GitHub and creates a GitHub release with the
 changelog section for this version as the release notes.
